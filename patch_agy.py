@@ -64,12 +64,12 @@ Challenges Across Architectures, OSes, and Go Releases:
      (`"teamwork_preview"`, `"enable-teamwork-subagent"`, `"enable-owl-slash-command"`)
      and tracing relative call instructions (`BL` on ARM64, `CALL` on x86_64).
 
-4. Mid-Function / Split-Block Labels in `pclntab`:
-   - In ELF PIE binaries, some `pclntab` entries point to internal jump targets
-     rather than function entry points.
-   - Solution: The patcher scans backward to locate the true Go function prologue:
-     * ARM64: Stack-split check `ldr x16, [x28, #16]` (`0xF9400B90`) or post-`RET`.
-     * x86_64: Stack-split check `cmp rsp, [r14+0x10]` (`0x49 0x3B 0x66 0x10`) or post-`RET`.
+4. Go Function Entry Points in `pclntab`:
+   - Go's `pclntab` function table (`ftab`) entries map directly to true function
+     entry points. ELF PIE binaries are anchored by discovering the `runtime.text`
+     entry point in the text section.
+   - Pclntab candidates are collected and filtered by `max(nfunc)` to select the main
+     binary table over any embedded helpers (e.g., WebM recorder).
 
 5. Builtin Subagent Allowed List Registration (`config.builtinSubagents`):
    - When the LLM invokes a subagent (such as `DeepInvestigator` under `/boost`),
@@ -85,24 +85,24 @@ Challenges Across Architectures, OSes, and Go Releases:
      only `["self", "research"]`, causing `findAgentByName` to reject invocations:
      `subagent "DeepInvestigator" not found or not allowed to be invoked`.
    - Solution: By intercepting the indirect call sites to `fp.IsEnabled` inside
-     `builtinSubagents` (using Go ABI calling conventions: `blr x3` -> `mov w0, #1`
-     on ARM64, and `callq *%rdx` -> `mov $1, %al` on x86_64) for non-browser flags
-     (string len 24), we unlock `DeepInvestigator`, `DeepCoder`, and `teamwork_preview`
-     while keeping the unstable browser agent safely disabled.
+     `builtinSubagents` for non-browser flags (string len 24), we unlock `DeepInvestigator`,
+     `DeepCoder`, and `teamwork_preview` while keeping the unstable browser agent safely disabled.
+     Calls are patched using `mov w0, #1` on ARM64 and `movl $1, %eax` + NOPs on x86_64
+     to ensure clean 64-bit return registers.
 
 Patching Architecture:
 ----------------------
 Instead of fragile, brute-force patching of dozens of closures, this patcher targets
-EXACTLY 4 stable, semantic entry points:
+stable, semantic entry points and registry calls:
   [1] `slashcommands.hasBuiltinAgents`:
-      Discovered by tracing the call inside the `"teamwork_preview"` closure.
-      Patching this returns `true` for all restricted slash commands (/boost, /teamwork-preview).
-  [2] `builtin/agents` Teamwork Subagent Predicate:
-      Discovered by tracing the `"enable-teamwork-subagent"` string reference to its prologue.
-  [3] `builtin/agents` Owl Subagent Predicate 1 (DeepCoder):
-      Discovered by tracing the first `"enable-owl-slash-command"` reference to its prologue.
-  [4] `builtin/agents` Owl Subagent Predicate 2 (DeepInvestigator):
-      Discovered by tracing the second `"enable-owl-slash-command"` reference to its prologue.
+      Central permission check unlocking restricted slash commands (/boost, /teamwork-preview).
+  [2] `cortex/config/config.SubagentToolsEnabled`:
+      Master tools switch unlocking `invoke_subagent`, `define_subagent`, and `manage_subagents`.
+  [3] `builtin/agents` Teamwork Subagent Predicate (`enable-teamwork-subagent`).
+  [4] `builtin/agents` Owl Subagent Predicate 1 (DeepCoder).
+  [5] `builtin/agents` Owl Subagent Predicate 2 (DeepInvestigator).
+  [6] `cortex/core/components/config/config.builtinSubagents`:
+      Runtime registration call sites patched to permit allowed subagent invocations.
 
 Usage:
 ------
@@ -202,8 +202,10 @@ class MachO:
 
     def va_to_offset(self, va: int):
         """Translates a virtual memory address to a physical file byte offset."""
+        if va is None:
+            return None
         for vmaddr, vmsize, fileoff, filesize in self.segments:
-            if vmaddr <= va < vmaddr + vmsize:
+            if filesize > 0 and vmaddr <= va < vmaddr + min(vmsize, filesize):
                 return fileoff + (va - vmaddr)
         return None
 
@@ -287,8 +289,10 @@ class ELF:
 
     def va_to_offset(self, va: int):
         """Translates an ELF virtual address to a file offset using PT_LOAD headers."""
+        if va is None:
+            return None
         for vaddr, memsz, offset, filesz in self.segments:
-            if vaddr <= va < vaddr + memsz:
+            if filesz > 0 and vaddr <= va < vaddr + filesz:
                 return offset + (va - vaddr)
         return None
 
@@ -334,9 +338,11 @@ class PE:
 
     def va_to_offset(self, va: int):
         """Translates a PE virtual address (ImageBase + RVA) to physical file offset."""
+        if va is None:
+            return None
         rva = va - self.image_base
         for vaddr, vsize, raw_ptr, raw_size in self.sections:
-            if vaddr <= rva < vaddr + vsize:
+            if raw_size > 0 and vaddr <= rva < vaddr + min(vsize, raw_size):
                 return raw_ptr + (rva - vaddr)
         return None
 
@@ -413,7 +419,7 @@ class GoPclnTab:
         # Go 1.20+: 0xFFFFFFF1 (\xf1\xff\xff\xff)
         # Go 1.18-1.19: 0xFFFFFFF0 (\xf0\xff\xff\xff)
         magics = [b"\xf1\xff\xff\xff", b"\xf0\xff\xff\xff"]
-        pcln_off = None
+        candidates = []
         for m in magics:
             idx = self.data.find(m)
             while idx != -1:
@@ -421,14 +427,15 @@ class GoPclnTab:
                     magic, pad, minLC, ptrSize, nfunc = struct.unpack("<IHBBQ", self.data[idx : idx + 16])
                     # Validate standard header constraints (64-bit pointers, reasonable function count)
                     if minLC in (1, 2, 4) and ptrSize == 8 and 1000 < nfunc < 500000:
-                        pcln_off = idx
-                        break
+                        candidates.append((nfunc, idx))
                 idx = self.data.find(m, idx + 4)
-            if pcln_off is not None:
-                break
 
-        if pcln_off is None:
+        if not candidates:
             raise ValueError("Could not locate Go runtime.pclntab in binary.")
+
+        # Pick the candidate with the maximum function count to ensure the main Go binary
+        # pclntab is selected over any embedded helper binaries (e.g. WebM recorder).
+        _, pcln_off = max(candidates, key=lambda c: c[0])
 
         # Go 1.20+ Header layout (72 bytes):
         # uint32 magic, uint16 pad, uint8 minLC, uint8 ptrSize, uint64 nfunc,
@@ -573,14 +580,19 @@ class GoPclnTab:
         Instead, their registration closures load the command name and immediately
         call a single shared function: `slashcommands.hasBuiltinAgents(ctx, name)`.
         
-        Rather than patching 4 different closures (which may be inlined or point to
-        internal jump targets in ELF PIE builds), this method:
-        1. Finds the closure referencing "teamwork_preview", "DeepCoder", or "DeepInvestigator".
-        2. Disassembles forward to find the relative call instruction (`BL` on ARM64, `CALL` on x86_64).
-        3. Follows the relative branch to resolve the exact gatekeeper address.
+        Strategy:
+        1. Prioritize direct symbol lookup in pclntab for `slashcommands.hasBuiltinAgents`.
+           Go pclntab symbol entries point directly to the true function entry.
+        2. Fallback to tracing relative call instructions from slash command registration closures.
         
         Result: Unlocks ALL restricted slash commands simultaneously with ZERO collateral damage.
         """
+        # 1. Prioritize direct symbol lookup in pclntab (exact entry point)
+        for name, va in self.funcs.items():
+            if name.endswith("slashcommands.hasBuiltinAgents"):
+                return va
+
+        # 2. Fallback to tracing relative call instructions from registration closures
         slash_pkg = "google3/third_party/jetski/cortex/slashcommands"
         is_arm64 = self.container.arch == "arm64"
         decoder = self.decode_arm64_string_refs if is_arm64 else self.decode_x86_string_refs
@@ -615,66 +627,14 @@ class GoPclnTab:
                                     disp32 = struct.unpack("<i", chunk[j + 1 : j + 5])[0]
                                     rip = va + j + 5
                                     return rip + disp32
-        # Fallback to direct symbol lookup in pclntab if call tracing fails
-        for name, va in self.funcs.items():
-            if name.endswith("slashcommands.hasBuiltinAgents"):
-                return va
         return None
 
-    def resolve_function_entry(self, va: int):
+    def resolve_function_entry(self, va: int) -> int:
         """
-        Ensures a candidate address points to a genuine Go function prologue.
-        
-        Reverse Engineering Discovery:
-        ------------------------------
-        In optimized ELF PIE binaries, some pclntab symbols point to internal basic
-        blocks or loop headers instead of function entries. Writing `mov x0, 1; ret`
-        at an internal label skips caller stack deallocation (`ldr x30, [sp], #N`)
-        and triggers `SIGSEGV` or memory corruption.
-        
-        This method checks for the standard Go compiler stack-split prologue:
-        - ARM64: `ldr x16, [x28, #16]` (`0xF9400B90`) where X28 holds the `g` pointer.
-        - x86_64: `cmp rsp, [r14+0x10]` (`0x49 0x3B 0x66 0x10`) where R14 holds `g`.
-        
-        If the current instruction is not a prologue, it scans backward up to 300 bytes
-        to locate the real entry point, or the byte immediately following the preceding `RET`.
+        Bypassed: Go pclntab ftab entries already point directly to function entry points.
+        Backward scanning is unnecessary and misidentified large-frame functions on x86_64
+        (e.g. builtinSubagents shifted by -46 bytes into morestack slow-path).
         """
-        off = self.container.va_to_offset(va)
-        if off is None:
-            return va
-
-        if self.container.arch == "arm64":
-            inst = struct.unpack("<I", self.data[off : off + 4])[0]
-            if inst == 0xF9400B90:  # ldr x16, [x28, #16]
-                return va
-            for step in range(4, 300, 4):
-                prev_off = off - step
-                if prev_off < 0:
-                    break
-                p_inst = struct.unpack("<I", self.data[prev_off : prev_off + 4])[0]
-                if p_inst == 0xF9400B90:
-                    return va - step
-                if p_inst == 0xD65F03C0:  # ret
-                    cur = prev_off + 4
-                    # Skip alignment NOPs (0x1F2003D5) or UDF traps (0x00000000)
-                    while cur < off and self.data[cur : cur + 4] in (b"\x1f\x20\x03\xd5", b"\x00\x00\x00\x00"):
-                        cur += 4
-                    return va - (off - cur)
-        elif self.container.arch == "x86_64":
-            if self.data[off : off + 4] == b"\x49\x3b\x66\x10":  # cmp rsp, [r14+0x10]
-                return va
-            for step in range(1, 300):
-                prev_off = off - step
-                if prev_off < 0:
-                    break
-                if self.data[prev_off : prev_off + 4] == b"\x49\x3b\x66\x10":
-                    return va - step
-                if self.data[prev_off] == 0xC3:  # ret
-                    cur = prev_off + 1
-                    # Skip NOPs (0x90) or INT3 traps (0xCC)
-                    while cur < off and self.data[cur] in (0x90, 0xCC):
-                        cur += 1
-                    return va - (off - cur)
         return va
 
     def find_subagent_tools_gatekeeper(self):
@@ -803,7 +763,7 @@ class GoPclnTab:
         the allowed subagents registry used by CalculateAllowedSubagents.
         """
         for name, va in self.funcs.items():
-            if name.endswith("core/components/config/config.builtinSubagents"):
+            if name.endswith("builtinSubagents"):
                 return va
         return None
 
@@ -894,18 +854,16 @@ def patch_binary(input_path: str, output_path: str):
 
     # 1. Central Slash Commands Gatekeeper (unlocks /boost, /teamwork-preview, /browser, /browser-vision)
     gatekeeper_va = pclntab.find_slash_gatekeeper()
-    if gatekeeper_va:
-        resolved_va = pclntab.resolve_function_entry(gatekeeper_va)
-        targets_to_patch.append(("Slash commands gatekeeper (hasBuiltinAgents)", resolved_va))
-        seen_vas.add(resolved_va)
+    assert gatekeeper_va is not None, "Could not locate slash commands gatekeeper (hasBuiltinAgents)."
+    targets_to_patch.append(("Slash commands gatekeeper (hasBuiltinAgents)", gatekeeper_va))
+    seen_vas.add(gatekeeper_va)
 
     # 2. Subagent Tools Gatekeeper (SubagentToolsEnabled - unlocks invoke_subagent, define_subagent, manage_subagents)
     subagent_tools_va = pclntab.find_subagent_tools_gatekeeper()
-    if subagent_tools_va:
-        resolved_va = pclntab.resolve_function_entry(subagent_tools_va)
-        if resolved_va not in seen_vas:
-            targets_to_patch.append(("Subagent tools gatekeeper (SubagentToolsEnabled)", resolved_va))
-            seen_vas.add(resolved_va)
+    assert subagent_tools_va is not None, "Could not locate subagent tools gatekeeper (SubagentToolsEnabled)."
+    if subagent_tools_va not in seen_vas:
+        targets_to_patch.append(("Subagent tools gatekeeper (SubagentToolsEnabled)", subagent_tools_va))
+        seen_vas.add(subagent_tools_va)
 
     # 3. Builtin Subagent Predicates (teamwork-subagent, DeepCoder, DeepInvestigator)
     subagent_targets = pclntab.find_subagent_predicates()
@@ -933,17 +891,42 @@ def patch_binary(input_path: str, output_path: str):
     # Patches the runtime registry so invoke_subagent permits DeepInvestigator,
     # DeepCoder, and teamwork_preview, while keeping browser disabled.
     builtin_subagents_va = pclntab.find_builtin_subagents()
-    if builtin_subagents_va:
-        resolved_subagents_va = pclntab.resolve_function_entry(builtin_subagents_va)
-        call_offsets = pclntab.find_subagent_feature_calls(resolved_subagents_va)
-        if container.arch == "arm64":
-            call_patch = bytes.fromhex("20008052")  # mov w0, #1
-        else:
-            call_patch = bytes.fromhex("b001")      # mov $1, %al
-        print(f"[*] Identified {len(call_offsets)} builtinSubagents feature check calls to patch in {hex(resolved_subagents_va)}:")
+    assert builtin_subagents_va is not None, "Could not locate config.builtinSubagents in binary."
+    call_offsets = pclntab.find_subagent_feature_calls(builtin_subagents_va)
+    assert len(call_offsets) >= 3, (
+        f"Expected at least 3 builtinSubagents feature check calls to patch in {hex(builtin_subagents_va)}, "
+        f"found {len(call_offsets)}"
+    )
+    print(f"[*] Identified {len(call_offsets)} builtinSubagents feature check calls to patch in {hex(builtin_subagents_va)}:")
+    if container.arch == "arm64":
+        call_patch = bytes.fromhex("20008052")  # mov w0, #1
         for call_off in call_offsets:
             print(f"    - Subagent feature call: FileOffset={hex(call_off)}")
             data[call_off : call_off + len(call_patch)] = call_patch
+    else:
+        # x86_64: Replace `movl $0x18, %ecx` + `callq *%rdx` with `movl $1, %eax` + NOPs
+        # to guarantee full 64-bit register cleanliness (setting RAX = 1 and clearing upper bits).
+        # If preceding `movl $0x18, %ecx` is absent, safely NOP the call and NOP the following
+        # conditional jump (je) within 64 bytes to guarantee the true branch is taken.
+        for call_off in call_offsets:
+            pre = data[max(0, call_off - 16) : call_off]
+            mov_idx = pre.rfind(b"\xb9\x18\x00\x00\x00")
+            if mov_idx != -1:
+                mov_off = max(0, call_off - 16) + mov_idx
+                span = (call_off + 2) - mov_off
+                patch = b"\xb8\x01\x00\x00\x00" + b"\x90" * (span - 5)
+                print(f"    - Subagent feature call: FileOffset={hex(mov_off)} (span {span} bytes: mov eax, 1 + nops)")
+                data[mov_off : mov_off + span] = patch
+            else:
+                # Safe jump NOPing fallback: NOP the call instruction (2 bytes) and NOP the downstream
+                # JE opcode (0x74) within 64 bytes so the subagent registration branch always executes.
+                data[call_off : call_off + 2] = b"\x90\x90"
+                post = data[call_off + 2 : min(len(data), call_off + 64)]
+                je_idx = post.find(b"\x74")
+                assert je_idx != -1, f"Could not find conditional jump (je) following call at {hex(call_off)}"
+                je_off = call_off + 2 + je_idx
+                data[je_off : je_off + 2] = b"\x90\x90"
+                print(f"    - Subagent feature call: FileOffset={hex(call_off)} (NOPed call and JE at {hex(je_off)})")
 
     # For Windows PE binaries, strip the invalid Authenticode signature
     if isinstance(container, PE):
