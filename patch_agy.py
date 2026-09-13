@@ -38,19 +38,25 @@ Challenges Across Architectures, OSes, and Go Releases:
    Every format requires mapping Virtual Addresses (VAs) used by Go's runtime
    tables to physical file offsets.
 
-2. Go Linker Optimizations & Identical Code Folding (ICF):
-   - On Linux ELF PIE builds, Go's linker aggressively inlines tiny functions and
-     merges identical code blocks (ICF).
-   - Trap / Pitfall: When a function like `config.SubagentToolsEnabled` is inlined,
-     its body disappears, but `runtime.pclntab` may still map the symbol to the
-     `RET` instruction of the preceding function (`config.GetAgentScriptReroute`).
-     Overwriting 8 bytes at that location clobbers the adjacent function's second
-     epilogue branch, skipping stack frame cleanup and causing infinite spin loops
-     or segfaults.
-   - Solution: Never patch inlined/folded stub symbols. Patch the central gatekeeper
-     and verify that every patch target begins with a genuine function prologue.
+2. Go Linker Layout & ELF runtime.text Base:
+   - On Linux ELF PIE builds, C runtime startup stubs (crt1.o) precede Go code
+     in the `.text` section by 0xb0 (176) bytes.
+   - Using the ELF section's `sh_addr` directly as `text_start` shifts every
+     symbol VA by -0xb0, causing function lookups to point into adjacent
+     epilogues or return stubs.
+   - Solution: In ELF binaries, scan forward from `.text` for the first Go stack
+     prologue to determine the exact `runtime.text` base address.
 
-3. Volatile Closure Numbering (`func1` .. `funcN`):
+3. Subagent Tools Gatekeeper (`cortex/config/config.SubagentToolsEnabled`):
+   - In addition to the slash command gatekeeper and subagent closures,
+     `SubagentToolsEnabled` must return `true`.
+   - When false, `cortex/core/components/config.getBaselineConfig` omits
+     `invoke_subagent`, `define_subagent`, and `manage_subagents` from the tool
+     definitions sent to the LLM, and `builtinSubagents` immediately returns empty.
+   - Patching this function injects the subagent tools into the model's schema
+     and enables end-to-end multi-agent delegation.
+
+4. Volatile Closure Numbering (`func1` .. `funcN`):
    - Go names anonymous closures sequentially (`agents.init.func7`, etc.).
    - If upstream source code changes (adding/removing a single closure), the numbers
      shift. Hardcoded symbol names or offsets break on virtually every update.
@@ -64,6 +70,25 @@ Challenges Across Architectures, OSes, and Go Releases:
    - Solution: The patcher scans backward to locate the true Go function prologue:
      * ARM64: Stack-split check `ldr x16, [x28, #16]` (`0xF9400B90`) or post-`RET`.
      * x86_64: Stack-split check `cmp rsp, [r14+0x10]` (`0x49 0x3B 0x66 0x10`) or post-`RET`.
+
+5. Builtin Subagent Allowed List Registration (`config.builtinSubagents`):
+   - When the LLM invokes a subagent (such as `DeepInvestigator` under `/boost`),
+     `InvokeSubagentHandler.findAgentByName` validates the requested agent name
+     against `CalculateAllowedSubagents`.
+   - `CalculateAllowedSubagents` relies on `config.builtinSubagents`, which
+     queries `FeatureProvider.IsEnabled` for:
+     * `enable-browser-subagent-v2` (browser)
+     * `enable-teamwork-subagent` (teamwork_preview)
+     * `enable-owl-slash-command` (DeepCoder)
+     * `enable-owl-slash-command` (DeepInvestigator)
+   - If these feature flags are disabled on the server, `builtinSubagents` returns
+     only `["self", "research"]`, causing `findAgentByName` to reject invocations:
+     `subagent "DeepInvestigator" not found or not allowed to be invoked`.
+   - Solution: By intercepting the indirect call sites to `fp.IsEnabled` inside
+     `builtinSubagents` (using Go ABI calling conventions: `blr x3` -> `mov w0, #1`
+     on ARM64, and `callq *%rdx` -> `mov $1, %al` on x86_64) for non-browser flags
+     (string len 24), we unlock `DeepInvestigator`, `DeepCoder`, and `teamwork_preview`
+     while keeping the unstable browser agent safely disabled.
 
 Patching Architecture:
 ----------------------
@@ -233,6 +258,24 @@ class ELF:
                 name = data[shstr_off + sh_name_idx : name_end].decode("ascii", errors="ignore")
                 if name == ".text":
                     self.text_start = sh_addr
+                    # In Go ELF PIE binaries linked with CGO/libc, C runtime startup stubs (crt1.o)
+                    # precede Go code in .text. Scan forward for the first Go function prologue
+                    # (runtime.text) to ensure pclntab entry offsets resolve to exact symbol VAs.
+                    if self.arch == "arm64":
+                        for off in range(sh_offset, min(sh_offset + 4096, len(data) - 4), 4):
+                            if struct.unpack("<I", data[off : off + 4])[0] == 0xF9400B90:
+                                self.text_start = sh_addr + (off - sh_offset)
+                                break
+                    elif self.arch == "x86_64":
+                        for off in range(sh_offset, min(sh_offset + 4096, len(data) - 4)):
+                            # cmp rsp, [r14+0x10] (49 3b 66 10) or cmp r12, [r14+0x10] (4d 3b 66 10)
+                            if data[off : off + 4] in (b"\x49\x3b\x66\x10", b"\x4d\x3b\x66\x10"):
+                                start_off = off
+                                # If preceded by lea r12, [rsp-disp] (4c 8d 64 24), adjust start
+                                if off >= sh_offset + 5 and data[off - 5 : off - 1] == b"\x4c\x8d\x64\x24":
+                                    start_off = off - 5
+                                self.text_start = sh_addr + (start_off - sh_offset)
+                                break
                     break
 
         if self.text_start is None:
@@ -634,6 +677,41 @@ class GoPclnTab:
                     return va - (off - cur)
         return va
 
+    def find_subagent_tools_gatekeeper(self):
+        """
+        Locates the `cortex/config/config.SubagentToolsEnabled` gatekeeper function.
+        
+        Reverse Engineering Discovery:
+        ------------------------------
+        `SubagentToolsEnabled` is the master feature switch in `cortex/config`:
+        1. In `cortex/core/components/config.getBaselineConfig`, it gates injecting
+           `invoke_subagent`, `manage_subagents`, and `define_subagent` tools into
+           the LLM tool registry (`baselineConfig.Tools`).
+        2. In `cortex/core/components/config.builtinSubagents`, it gates initialization
+           of the built-in subagent list.
+        Without patching this function to return true, the model never receives
+        subagent tools in its schema and subagent delegation fails completely.
+        """
+        # Primary: direct symbol lookup in pclntab
+        for name, va in self.funcs.items():
+            if name.endswith("config.SubagentToolsEnabled"):
+                return va
+
+        # Fallback: scan for reference to string "invoke-subagent-config"
+        is_arm64 = self.container.arch == "arm64"
+        decoder = self.decode_arm64_string_refs if is_arm64 else self.decode_x86_string_refs
+        cfg_pkg = "google3/third_party/jetski/cortex/config"
+        target_bytes = b"invoke-subagent-config"
+        for name, va in self.funcs.items():
+            if not name.startswith(cfg_pkg):
+                continue
+            refs = decoder(va, length=256)
+            for r in refs:
+                s = self.get_string_at_va(r, len(target_bytes) + 4)
+                if target_bytes in s:
+                    return va
+        return None
+
     def find_subagent_predicates(self):
         """
         Dynamically finds the 3 subagent predicate functions in `builtin/agents`.
@@ -719,6 +797,59 @@ class GoPclnTab:
                                 break
         return entries
 
+    def find_builtin_subagents(self) -> int | None:
+        """
+        Locates cortex/core/components/config.builtinSubagents, which constructs
+        the allowed subagents registry used by CalculateAllowedSubagents.
+        """
+        for name, va in self.funcs.items():
+            if name.endswith("core/components/config/config.builtinSubagents"):
+                return va
+        return None
+
+    def find_subagent_feature_calls(self, func_va: int) -> list[int]:
+        """
+        Finds the indirect call sites to FeatureProvider.IsEnabled inside builtinSubagents
+        for 'enable-teamwork-subagent' and 'enable-owl-slash-command' (string length 24 / 0x18),
+        while skipping 'enable-browser-subagent-v2' (string length 26 / 0x1a) to avoid
+        the unhandled Playwright driver 404 download bug.
+
+        Returns file offsets of the call instructions to patch.
+        """
+        off = self.container.va_to_offset(func_va)
+        if off is None:
+            return []
+        chunk = self.data[off : off + 0x400]
+        matched_offsets = []
+
+        if self.container.arch == "arm64":
+            call_opcode = bytes.fromhex("60003fd6")  # blr x3
+            idx = 0
+            while True:
+                pos = chunk.find(call_opcode, idx)
+                if pos == -1:
+                    break
+                idx = pos + 4
+                # Look back up to 16 bytes for length 24:
+                # orr x2, xzr, #0x18 (0xb27d07e2) or mov x2, #0x18 (0xd2800302)
+                pre = chunk[max(0, pos - 16) : pos]
+                if bytes.fromhex("e2077db2") in pre or bytes.fromhex("020380d2") in pre:
+                    matched_offsets.append(off + pos)
+        else:
+            call_opcode = bytes.fromhex("ffd2")  # callq *%rdx
+            idx = 0
+            while True:
+                pos = chunk.find(call_opcode, idx)
+                if pos == -1:
+                    break
+                idx = pos + 2
+                # Look back up to 16 bytes for movl $0x18, %ecx (b9 18 00 00 00)
+                pre = chunk[max(0, pos - 16) : pos]
+                if b"\xb9\x18\x00\x00\x00" in pre:
+                    matched_offsets.append(off + pos)
+
+        return matched_offsets
+
 
 # ==============================================================================
 # Patcher Core
@@ -768,7 +899,15 @@ def patch_binary(input_path: str, output_path: str):
         targets_to_patch.append(("Slash commands gatekeeper (hasBuiltinAgents)", resolved_va))
         seen_vas.add(resolved_va)
 
-    # 2. Builtin Subagent Predicates (teamwork-subagent, DeepCoder, DeepInvestigator)
+    # 2. Subagent Tools Gatekeeper (SubagentToolsEnabled - unlocks invoke_subagent, define_subagent, manage_subagents)
+    subagent_tools_va = pclntab.find_subagent_tools_gatekeeper()
+    if subagent_tools_va:
+        resolved_va = pclntab.resolve_function_entry(subagent_tools_va)
+        if resolved_va not in seen_vas:
+            targets_to_patch.append(("Subagent tools gatekeeper (SubagentToolsEnabled)", resolved_va))
+            seen_vas.add(resolved_va)
+
+    # 3. Builtin Subagent Predicates (teamwork-subagent, DeepCoder, DeepInvestigator)
     subagent_targets = pclntab.find_subagent_predicates()
     for label, entry in subagent_targets:
         if entry not in seen_vas:
@@ -789,6 +928,22 @@ def patch_binary(input_path: str, output_path: str):
         if off is None or off + len(patch_return_true) > len(data):
             raise RuntimeError(f"Cannot map VA {hex(va)} to file offset for {label}")
         data[off : off + len(patch_return_true)] = patch_return_true
+
+    # 4. Builtin Subagents Allowed List Registration (builtinSubagents)
+    # Patches the runtime registry so invoke_subagent permits DeepInvestigator,
+    # DeepCoder, and teamwork_preview, while keeping browser disabled.
+    builtin_subagents_va = pclntab.find_builtin_subagents()
+    if builtin_subagents_va:
+        resolved_subagents_va = pclntab.resolve_function_entry(builtin_subagents_va)
+        call_offsets = pclntab.find_subagent_feature_calls(resolved_subagents_va)
+        if container.arch == "arm64":
+            call_patch = bytes.fromhex("20008052")  # mov w0, #1
+        else:
+            call_patch = bytes.fromhex("b001")      # mov $1, %al
+        print(f"[*] Identified {len(call_offsets)} builtinSubagents feature check calls to patch in {hex(resolved_subagents_va)}:")
+        for call_off in call_offsets:
+            print(f"    - Subagent feature call: FileOffset={hex(call_off)}")
+            data[call_off : call_off + len(call_patch)] = call_patch
 
     # For Windows PE binaries, strip the invalid Authenticode signature
     if isinstance(container, PE):
