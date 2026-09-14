@@ -64,14 +64,14 @@ Challenges Across Architectures, OSes, and Go Releases:
      (`"teamwork_preview"`, `"enable-teamwork-subagent"`, `"enable-owl-slash-command"`)
      and tracing relative call instructions (`BL` on ARM64, `CALL` on x86_64).
 
-4. Go Function Entry Points in `pclntab`:
+5. Go Function Entry Points in `pclntab`:
    - Go's `pclntab` function table (`ftab`) entries map directly to true function
      entry points. ELF PIE binaries are anchored by discovering the `runtime.text`
      entry point in the text section.
    - Pclntab candidates are collected and filtered by `max(nfunc)` to select the main
      binary table over any embedded helpers (e.g., WebM recorder).
 
-5. Builtin Subagent Allowed List Registration (`config.builtinSubagents`):
+6. Builtin Subagent Allowed List Registration (`config.builtinSubagents`):
    - When the LLM invokes a subagent (such as `DeepInvestigator` under `/boost`),
      `InvokeSubagentHandler.findAgentByName` validates the requested agent name
      against `CalculateAllowedSubagents`.
@@ -115,13 +115,19 @@ Dependencies:
 Zero external third-party packages (uses only Python 3 standard library).
 """
 
-import sys
+from __future__ import annotations
+
+from abc import ABC, abstractmethod
 import os
+import platform
 import shutil
 import struct
-import tempfile
 import subprocess
-import platform
+import sys
+import tempfile
+from typing import Dict, List, Optional, Set, Tuple, Union
+
+BinaryData = Union[bytes, bytearray]
 
 
 # ==============================================================================
@@ -133,11 +139,25 @@ import platform
 # 3. Base Virtual Address for the `.text` segment (`get_text_start`)
 # ==============================================================================
 
-class BinaryFormat:
-    """Factory class to identify and instantiate the appropriate executable parser."""
+class BinaryFormat(ABC):
+    """Base class and factory for executable binary formats (Mach-O, ELF, PE)."""
+    name: str
+    arch: str
+    data: BinaryData
+    text_start: Optional[int]
+
+    @abstractmethod
+    def get_text_start(self) -> int:
+        """Returns the virtual address of the .text section."""
+        ...
+
+    @abstractmethod
+    def va_to_offset(self, va: Optional[int]) -> Optional[int]:
+        """Translates a virtual memory address to a physical file byte offset."""
+        ...
 
     @staticmethod
-    def parse(data: bytes):
+    def parse(data: BinaryData) -> BinaryFormat:
         """Identifies executable format via magic bytes and returns a parsed container."""
         if data[:4] in (b"\xcf\xfa\xed\xfe", b"\xfe\xed\xfa\xcf"):
             # 0xFEEDFACF (Little-Endian 64-bit Mach-O) or Big-Endian
@@ -151,7 +171,7 @@ class BinaryFormat:
         raise ValueError("Unsupported binary format. Expected 64-bit Mach-O, ELF, or PE.")
 
 
-class MachO:
+class MachO(BinaryFormat):
     """
     Parser for macOS Mach-O 64-bit binaries.
     
@@ -159,7 +179,7 @@ class MachO:
     and sections (`__text`) from Virtual Address to file offsets.
     """
 
-    def __init__(self, data: bytes):
+    def __init__(self, data: BinaryData):
         self.name = "Mach-O 64-bit"
         self.data = data
 
@@ -200,7 +220,7 @@ class MachO:
         """Returns the virtual address of the .text section."""
         return self.text_start or 0
 
-    def va_to_offset(self, va: int):
+    def va_to_offset(self, va: Optional[int]) -> Optional[int]:
         """Translates a virtual memory address to a physical file byte offset."""
         if va is None:
             return None
@@ -210,7 +230,7 @@ class MachO:
         return None
 
 
-class ELF:
+class ELF(BinaryFormat):
     """
     Parser for Linux ELF 64-bit binaries (including Position Independent Executables).
     
@@ -218,7 +238,7 @@ class ELF:
     to determine the base text address needed by Go's `runtime.pclntab`.
     """
 
-    def __init__(self, data: bytes):
+    def __init__(self, data: BinaryData):
         self.name = "ELF 64-bit"
         self.data = data
 
@@ -287,7 +307,7 @@ class ELF:
         """Returns the virtual address of the .text section."""
         return self.text_start or 0
 
-    def va_to_offset(self, va: int):
+    def va_to_offset(self, va: Optional[int]) -> Optional[int]:
         """Translates an ELF virtual address to a file offset using PT_LOAD headers."""
         if va is None:
             return None
@@ -297,7 +317,7 @@ class ELF:
         return None
 
 
-class PE:
+class PE(BinaryFormat):
     """
     Parser for Windows PE32+ (64-bit Portable Executable) binaries.
     
@@ -305,7 +325,7 @@ class PE:
     to translate RVAs (Relative Virtual Addresses) to raw file offsets.
     """
 
-    def __init__(self, data: bytes):
+    def __init__(self, data: BinaryData):
         self.name = "PE32+ 64-bit"
         self.data = data
 
@@ -336,7 +356,7 @@ class PE:
         """Returns the virtual address of the .text section."""
         return self.text_start or self.image_base
 
-    def va_to_offset(self, va: int):
+    def va_to_offset(self, va: Optional[int]) -> Optional[int]:
         """Translates a PE virtual address (ImageBase + RVA) to physical file offset."""
         if va is None:
             return None
@@ -406,10 +426,10 @@ class PE:
 class GoPclnTab:
     """Parses Go's runtime.pclntab and performs dynamic disassembly and semantic analysis."""
 
-    def __init__(self, data: bytes, container: BinaryFormat):
+    def __init__(self, data: BinaryData, container: BinaryFormat):
         self.data = data
         self.container = container
-        self.funcs = {}  # Symbol Name -> Virtual Address (int)
+        self.funcs: Dict[str, int] = {}  # Symbol Name -> Virtual Address (int)
         self.text_start = 0
         self._parse()
 
