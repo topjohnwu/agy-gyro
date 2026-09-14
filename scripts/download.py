@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-download_agy.py - Universal Antigravity CLI (agy) Binary Downloader
-===================================================================
+download.py - Universal Antigravity CLI (agy) Binary Downloader
+===============================================================
 
 Downloads official Google Antigravity CLI (`agy`) executable binaries for any
 operating system and CPU architecture directly from Google's official release
@@ -436,22 +436,22 @@ def build_parser() -> argparse.ArgumentParser:
         epilog="""\
 Examples:
   # Download latest agy for current host system (saved to ./agy):
-  python3 download_agy.py
+  python3 scripts/download.py
 
   # Download latest agy for Linux x86_64:
-  python3 download_agy.py --os linux --arch x64
+  python3 scripts/download.py --os linux --arch x64
 
   # Download latest agy for Windows ARM64:
-  python3 download_agy.py --os windows --arch arm64
+  python3 scripts/download.py --os windows --arch arm64
 
   # Download all 6 OS/arch binaries into a target directory:
-  python3 download_agy.py --all --dir ./binaries
+  python3 scripts/download.py --all --dir ./binaries
 
   # Download a specific historical version:
-  python3 download_agy.py --version 1.2.1
+  python3 scripts/download.py --version 1.2.1
 
   # List all available versions:
-  python3 download_agy.py --list-versions
+  python3 scripts/download.py --list-versions
 """,
     )
 

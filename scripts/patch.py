@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-patch_agy.py - Universal Dynamic Patcher for Google Antigravity CLI (agy)
-==========================================================================
+patch.py - Universal Dynamic Patcher for Google Antigravity CLI (agy)
+==================================================================
 
 Overview & Reverse Engineering Background:
 ------------------------------------------
@@ -106,9 +106,9 @@ stable, semantic entry points and registry calls:
 
 Usage:
 ------
-  python3 patch_agy.py                  # Patch agy found in PATH in-place
-  python3 patch_agy.py <input>          # Patch <input> in-place
-  python3 patch_agy.py <input> <output> # Patch <input> to <output>
+  python3 scripts/patch.py                  # Patch agy found in PATH in-place
+  python3 scripts/patch.py <input>          # Patch <input> in-place
+  python3 scripts/patch.py <input> <output> # Patch <input> to <output>
 
 Dependencies:
 -------------
@@ -997,9 +997,9 @@ def main():
     args = sys.argv[1:]
     if any(arg in ("-h", "--help") for arg in args):
         print("Usage:")
-        print("  patch_agy.py                  # Patch agy in PATH in-place")
-        print("  patch_agy.py <input>          # Patch <input> in-place")
-        print("  patch_agy.py <input> <output> # Patch <input> to <output>")
+        print("  patch.py                  # Patch agy in PATH in-place")
+        print("  patch.py <input>          # Patch <input> in-place")
+        print("  patch.py <input> <output> # Patch <input> to <output>")
         sys.exit(0)
 
     if len(args) == 0:
@@ -1020,9 +1020,9 @@ def main():
         banner = f"[*] 2 arguments provided.\n    Input:  {input_path}\n    Output: {output_path}"
     else:
         print("Usage:", file=sys.stderr)
-        print("  patch_agy.py                  # Patch agy in PATH in-place", file=sys.stderr)
-        print("  patch_agy.py <input>          # Patch <input> in-place", file=sys.stderr)
-        print("  patch_agy.py <input> <output> # Patch <input> to <output>", file=sys.stderr)
+        print("  patch.py                  # Patch agy in PATH in-place", file=sys.stderr)
+        print("  patch.py <input>          # Patch <input> in-place", file=sys.stderr)
+        print("  patch.py <input> <output> # Patch <input> to <output>", file=sys.stderr)
         sys.exit(1)
 
     if not os.path.isfile(input_path):
