@@ -71,22 +71,26 @@ Challenges Across Architectures, OSes, and Go Releases:
    - Pclntab candidates are collected and filtered by `max(nfunc)` to select the main
      binary table over any embedded helpers (e.g., WebM recorder).
 
-6. Builtin Subagent Allowed List Registration (`config.builtinSubagents`):
+6. Builtin Subagent Allowed List Registration (`config.builtinSubagents` / `config.buildDefaultAgent`):
    - When the LLM invokes a subagent (such as `DeepInvestigator` under `/boost`),
      `InvokeSubagentHandler.findAgentByName` validates the requested agent name
      against `CalculateAllowedSubagents`.
-   - `CalculateAllowedSubagents` relies on `config.builtinSubagents`, which
-     queries `FeatureProvider.IsEnabled` for:
+   - `CalculateAllowedSubagents` relies on `config.builtinSubagents` (inlined into
+     `config.buildDefaultAgent` in `agy` 1.4.2+), which queries `FeatureProvider.IsEnabled` for:
      * `enable-browser-subagent-v2` (browser)
      * `enable-teamwork-subagent` (teamwork_preview)
      * `enable-owl-slash-command` (DeepCoder)
      * `enable-owl-slash-command` (DeepInvestigator)
+   - Additionally, `agy` 1.4.2+ introduces `config.deepAgent` (`enable-deepagent` for `/deepagent`)
+     and `config.reviewAgent` (`enable-review` for `/review-agent`), which populate
+     `DefinedSubagents` and gate the corresponding slash commands.
    - If these feature flags are disabled on the server, `builtinSubagents` returns
      only `["self", "research"]`, causing `findAgentByName` to reject invocations:
      `subagent "DeepInvestigator" not found or not allowed to be invoked`.
    - Solution: By intercepting the indirect call sites to `fp.IsEnabled` inside
-     `builtinSubagents` for non-browser flags (string len 24), we unlock `DeepInvestigator`,
-     `DeepCoder`, and `teamwork_preview` while keeping the unstable browser agent safely disabled.
+     `builtinSubagents` / `buildDefaultAgent`, `deepAgent`, and `reviewAgent` for the
+     target feature flags, we unlock `DeepInvestigator`, `DeepCoder`, `teamwork_preview`,
+     `deepagent`, and `review-agent` while keeping the unstable browser agent safely disabled.
      Calls are patched using `mov w0, #1` on ARM64 and `movl $1, %eax` + NOPs on x86_64
      to ensure clean 64-bit return registers.
 
@@ -94,14 +98,15 @@ Patching Architecture:
 ----------------------
 Instead of fragile, brute-force patching of dozens of closures, this patcher targets
 stable, semantic entry points and registry calls:
-  [1] `slashcommands.hasBuiltinAgents`:
-      Central permission check unlocking restricted slash commands (/boost, /teamwork-preview).
+  [1] `slashcommands.hasBuiltinAgents` + `deepagent`/`review-agent` slash predicates:
+      Central permission checks unlocking restricted slash commands (/boost, /teamwork-preview,
+      /deepagent, /review-agent).
   [2] `cortex/config/config.SubagentToolsEnabled`:
       Master tools switch unlocking `invoke_subagent`, `define_subagent`, and `manage_subagents`.
   [3] `builtin/agents` Teamwork Subagent Predicate (`enable-teamwork-subagent`).
   [4] `builtin/agents` Owl Subagent Predicate 1 (DeepCoder).
   [5] `builtin/agents` Owl Subagent Predicate 2 (DeepInvestigator).
-  [6] `cortex/core/components/config/config.builtinSubagents`:
+  [6] `cortex/core/components/config` (`builtinSubagents` / `buildDefaultAgent`, `deepAgent`, `reviewAgent`):
       Runtime registration call sites patched to permit allowed subagent invocations.
 
 Usage:
@@ -430,6 +435,7 @@ class GoPclnTab:
         self.data = data
         self.container = container
         self.funcs: Dict[str, int] = {}  # Symbol Name -> Virtual Address (int)
+        self.func_sizes: Dict[int, int] = {}  # Virtual Address (int) -> Function Byte Size (int)
         self.text_start = 0
         self._parse()
 
@@ -479,7 +485,7 @@ class GoPclnTab:
         # textStart in Go 1.20+ is the base address for all relative function offsets.
         # In PIE binaries where textStart in header is 0, fall back to container .text start.
         self.text_start = textStart if textStart != 0 else self.container.get_text_start()
-        table = self.data[pcln_off + pclntab : pcln_off + pclntab + 8 * nfunc]
+        table = self.data[pcln_off + pclntab : pcln_off + pclntab + 8 * (nfunc + 1)]
         funcnames = self.data[pcln_off + funcnametab :]
 
         for i in range(nfunc):
@@ -488,66 +494,120 @@ class GoPclnTab:
             f_entryOff, nameOff = struct.unpack("<II", f_data)
             end = funcnames.find(b"\x00", nameOff)
             name = funcnames[nameOff:end].decode("ascii", errors="ignore")
-            self.funcs[name] = self.text_start + entryOff
+            va = self.text_start + entryOff
+            self.funcs[name] = va
+            if (i + 2) * 8 <= len(table):
+                next_entryOff = struct.unpack("<I", table[(i + 1) * 8 : (i + 1) * 8 + 4])[0]
+                if next_entryOff > entryOff:
+                    self.func_sizes[va] = next_entryOff - entryOff
 
     def decode_arm64_string_refs(self, fn_va: int, length: int = 512):
         """
-        Disassembles ARM64 instructions looking for ADRP + ADD string reference pairs.
+        Disassembles ARM64 instructions looking for ADRP + ADD string/global reference pairs.
         
-        ARM64 loads 64-bit string addresses using a 2-instruction sequence:
+        ARM64 loads 64-bit addresses using a 2-instruction sequence:
           1. ADRP Xd, #page_imm (computes 4KB-aligned page address relative to PC)
           2. ADD Xd, Xn, #imm12 (adds lower 12-bit offset within that 4KB page)
+        Tracks ADRP base pages per register across a short instruction window so
+        pairs remain matched even if the compiler schedules instructions between them.
         """
         off = self.container.va_to_offset(fn_va)
         if off is None or off + length > len(self.data):
             return []
         fn_bytes = self.data[off : off + length]
         refs = []
-        for i in range(0, len(fn_bytes) - 8, 4):
-            inst1 = struct.unpack("<I", fn_bytes[i : i + 4])[0]
-            inst2 = struct.unpack("<I", fn_bytes[i + 4 : i + 8])[0]
+        adrp_pages: Dict[int, Tuple[int, int]] = {}  # reg -> (byte_offset, page_va)
+        for i in range(0, len(fn_bytes) - 3, 4):
+            inst = struct.unpack("<I", fn_bytes[i : i + 4])[0]
 
             # Match ADRP: 1_00_10000_... (bits 31, 28:24 = 1 10000)
-            if (inst1 & 0x9F000000) == 0x90000000:
-                rd1 = inst1 & 0x1F
-                immlo = (inst1 >> 29) & 0x3
-                immhi = (inst1 >> 5) & 0x7FFFF
+            if (inst & 0x9F000000) == 0x90000000:
+                rd = inst & 0x1F
+                immlo = (inst >> 29) & 0x3
+                immhi = (inst >> 5) & 0x7FFFF
                 imm = (immhi << 2) | immlo
                 # Sign-extend 21-bit signed immediate
                 if imm & (1 << 20):
                     imm -= 1 << 21
                 pc = fn_va + i
                 page = (pc & ~0xFFF) + (imm << 12)
+                adrp_pages[rd] = (i, page)
 
-                # Match ADD (immediate): 1001000100_... (bits 31:22 = 0x244)
-                if (inst2 & 0xFFC00000) == 0x91000000:
-                    rd2 = inst2 & 0x1F
-                    rn2 = (inst2 >> 5) & 0x1F
-                    imm12 = (inst2 >> 10) & 0xFFF
-                    # Verify ADD uses the exact same register populated by ADRP
-                    if rn2 == rd1:
+            # Match ADD (immediate): 1001000100_... (bits 31:22 = 0x244)
+            elif (inst & 0xFFC00000) == 0x91000000:
+                rd = inst & 0x1F
+                rn = (inst >> 5) & 0x1F
+                imm12 = (inst >> 10) & 0xFFF
+                if rn in adrp_pages:
+                    adrp_i, page = adrp_pages[rn]
+                    if i - adrp_i <= 16:
                         refs.append(page + imm12)
+                    if rd == rn:
+                        del adrp_pages[rn]
         return refs
 
-    def decode_x86_string_refs(self, fn_va: int, length: int = 512):
+    def decode_x86_string_refs(self, fn_va: int, length: int = 512, include_mov: bool = False):
         """
-        Disassembles x86_64 instructions looking for RIP-relative LEA references.
+        Disassembles x86_64 instructions looking for RIP-relative LEA (and optionally MOV) references.
         
         Sequence:
-          LEA r64, [rip + disp32] (Opcode: 0x48/0x4C 0x8D ModR/M=0x05)
+          LEA/MOV r64, [rip + disp32] (Opcode: 0x48/0x4C 0x8D/0x8B ModR/M=0x05)
         """
         off = self.container.va_to_offset(fn_va)
         if off is None or off + length > len(self.data):
             return []
         fn_bytes = self.data[off : off + length]
         refs = []
+        opcodes = (0x8D, 0x8B) if include_mov else (0x8D,)
         for i in range(0, len(fn_bytes) - 7):
-            # REX.W prefix (0x48 or 0x4C) + 0x8D (LEA) + ModR/M with RIP-relative addressing (0x05)
-            if fn_bytes[i] in (0x48, 0x4C) and fn_bytes[i + 1] == 0x8D and (fn_bytes[i + 2] & 0xC7) == 0x05:
+            # REX.W prefix (0x48 or 0x4C) + 0x8D (LEA) / 0x8B (MOV) + ModR/M with RIP-relative addressing (0x05)
+            if fn_bytes[i] in (0x48, 0x4C) and fn_bytes[i + 1] in opcodes and (fn_bytes[i + 2] & 0xC7) == 0x05:
                 disp = struct.unpack("<i", fn_bytes[i + 3 : i + 7])[0]
                 rip = fn_va + i + 7
                 refs.append(rip + disp)
         return refs
+
+    def decode_inlined_ascii_immediates(self, fn_va: int, length: int = 512) -> List[bytes]:
+        """
+        Reconstructs inlined 8-byte ASCII string constants from register-immediate
+        instructions in a completely register-agnostic manner:
+          - ARM64: Decodes MOVZ (0x52800000) + MOVK (0x72800000) sequences on any register X0..X30.
+          - x86_64: Decodes MOVABS $imm64, r64 (REX.W + 0xB8..0xBF) on any register RAX..R15.
+        Go compilers frequently inline short string equality comparisons (8-16 bytes)
+        as 64-bit integer immediate comparisons rather than rodata pointers.
+        """
+        off = self.container.va_to_offset(fn_va)
+        if off is None or off + length > len(self.data):
+            return []
+        fn_bytes = self.data[off : off + length]
+        results: List[bytes] = []
+
+        if self.container.arch == "arm64":
+            regs: Dict[int, int] = {}
+            for i in range(0, len(fn_bytes) - 3, 4):
+                inst = struct.unpack("<I", fn_bytes[i : i + 4])[0]
+                if (inst & 0x7F800000) == 0x52800000:  # MOVZ
+                    rd = inst & 0x1F
+                    hw = (inst >> 21) & 0x3
+                    imm16 = (inst >> 5) & 0xFFFF
+                    regs[rd] = imm16 << (hw * 16)
+                elif (inst & 0x7F800000) == 0x72800000:  # MOVK
+                    rd = inst & 0x1F
+                    hw = (inst >> 21) & 0x3
+                    imm16 = (inst >> 5) & 0xFFFF
+                    regs[rd] = (regs.get(rd, 0) & ~(0xFFFF << (hw * 16))) | (imm16 << (hw * 16))
+                    if hw == 3:
+                        b = regs[rd].to_bytes(8, "little")
+                        if all(32 <= x < 127 for x in b):
+                            results.append(b)
+        else:
+            for i in range(0, len(fn_bytes) - 9):
+                if fn_bytes[i] in (0x48, 0x49) and 0xB8 <= fn_bytes[i + 1] <= 0xBF:
+                    b = bytes(fn_bytes[i + 2 : i + 10])
+                    if all(32 <= x < 127 for x in b):
+                        results.append(b)
+
+        return results
 
     def get_string_at_va(self, va: int, max_len: int = 40) -> bytes:
         """Reads a printable ASCII string slice at the given virtual address."""
@@ -580,8 +640,8 @@ class GoPclnTab:
         decoder = self.decode_arm64_string_refs if is_arm64 else self.decode_x86_string_refs
 
         for name, va in candidates:
-            # Bound search to 256 bytes from function entry to avoid bleeding into adjacent functions
-            refs = decoder(va, length=256)
+            size = self.func_sizes.get(va, 256)
+            refs = decoder(va, length=size)
             for r in refs:
                 s = self.get_string_at_va(r, len(target_bytes) + 8)
                 if target_bytes in s:
@@ -622,7 +682,8 @@ class GoPclnTab:
             for name, va in self.funcs.items():
                 if not name.startswith(slash_pkg):
                     continue
-                refs = decoder(va, length=256)
+                size = self.func_sizes.get(va, 256)
+                refs = decoder(va, length=size)
                 for r in refs:
                     s = self.get_string_at_va(r, len(target_bytes) + 4)
                     if target_bytes in s:
@@ -630,7 +691,7 @@ class GoPclnTab:
                         off = self.container.va_to_offset(va)
                         if off is None:
                             continue
-                        chunk = self.data[off : off + 256]
+                        chunk = self.data[off : off + size]
                         if is_arm64:
                             for j in range(0, len(chunk) - 4, 4):
                                 inst = struct.unpack("<I", chunk[j : j + 4])[0]
@@ -649,6 +710,100 @@ class GoPclnTab:
                                     return rip + disp32
         return None
 
+    def find_slash_predicates(self) -> List[Tuple[str, int]]:
+        """
+        Locates additional slash command availability predicates in `cortex/slashcommands`
+        (such as `/deepagent` and `/review-agent` introduced in agy 1.4.2+).
+
+        Uses a two-tier portable discovery strategy:
+        1. Primary (Data-table inspection): Locate `slashcommands.GetSystemSlashCommandsDefinitions`,
+           resolve its reference to the global `systemSlashCommands` slice header, and read each
+           command entry's `{def_ptr, closure_ptr}` struct to map command names directly to their
+           availability predicate function VAs.
+        2. Fallback (Register-agnostic instruction & immediate decoding): Scan `slashcommands.init.func*`
+           closures for either rodata string references or inlined 64-bit ASCII immediate constants
+           (`MOVZ`/`MOVK` on ARM64, `MOVABS` on x86_64) independent of compiler register allocation.
+        """
+        target_cmds = (b"deepagent", b"review-agent")
+        results: List[Tuple[str, int]] = []
+        found_tags = set()
+        is_arm64 = self.container.arch == "arm64"
+
+        # 1. Primary: Parse global systemSlashCommands slice via GetSystemSlashCommandsDefinitions
+        for name, va in self.funcs.items():
+            if not name.endswith("slashcommands.GetSystemSlashCommandsDefinitions"):
+                continue
+            refs = (
+                self.decode_arm64_string_refs(va, length=128)
+                if is_arm64
+                else self.decode_x86_string_refs(va, length=128, include_mov=True)
+            )
+            for r in refs:
+                off = self.container.va_to_offset(r)
+                if off is None or off + 24 > len(self.data):
+                    continue
+                ptr, length, cap = struct.unpack("<QQQ", self.data[off : off + 24])
+                if not (1 <= length <= 64 and length <= cap <= 128):
+                    continue
+                arr_off = self.container.va_to_offset(ptr)
+                if arr_off is None or arr_off + length * 8 > len(self.data):
+                    continue
+                for i in range(length):
+                    elem_va = struct.unpack("<Q", self.data[arr_off + i * 8 : arr_off + (i + 1) * 8])[0]
+                    elem_off = self.container.va_to_offset(elem_va)
+                    if elem_off is None or elem_off + 16 > len(self.data):
+                        continue
+                    def_va, clos_va = struct.unpack("<QQ", self.data[elem_off : elem_off + 16])
+                    def_off = self.container.va_to_offset(def_va)
+                    clos_off = self.container.va_to_offset(clos_va)
+                    if def_off is None or clos_off is None or def_off + 32 > len(self.data) or clos_off + 8 > len(self.data):
+                        continue
+                    s_ptr, s_len = struct.unpack("<QQ", self.data[def_off + 16 : def_off + 32])
+                    if not (1 <= s_len <= 32):
+                        continue
+                    cmd = self.get_string_at_va(s_ptr, s_len)
+                    fn_va = struct.unpack("<Q", self.data[clos_off : clos_off + 8])[0]
+                    if cmd in target_cmds and fn_va in self.func_sizes:
+                        tag = cmd.decode("ascii")
+                        if tag not in found_tags:
+                            found_tags.add(tag)
+                            results.append((f"Slash command predicate (/{tag})", fn_va))
+
+        if len(found_tags) == len(target_cmds):
+            return results
+
+        # 2. Fallback: Scan slashcommands.init.func* closures via rodata refs + register-agnostic immediates
+        decoder = self.decode_arm64_string_refs if is_arm64 else self.decode_x86_string_refs
+        for name, va in self.funcs.items():
+            if "slashcommands.init.func" not in name:
+                continue
+            size = self.func_sizes.get(va, 256)
+            matched_tag = None
+
+            for r in decoder(va, length=size):
+                s = self.get_string_at_va(r, 24)
+                for cmd in target_cmds:
+                    if s.startswith(cmd):
+                        matched_tag = cmd.decode("ascii")
+                        break
+                if matched_tag:
+                    break
+
+            if matched_tag is None:
+                for imm_bytes in self.decode_inlined_ascii_immediates(va, length=size):
+                    for cmd in target_cmds:
+                        if imm_bytes.startswith(cmd[:8]):
+                            matched_tag = cmd.decode("ascii")
+                            break
+                    if matched_tag:
+                        break
+
+            if matched_tag is not None and matched_tag not in found_tags:
+                found_tags.add(matched_tag)
+                results.append((f"Slash command predicate (/{matched_tag})", va))
+
+        return results
+
     def resolve_function_entry(self, va: int) -> int:
         """
         Bypassed: Go pclntab ftab entries already point directly to function entry points.
@@ -664,11 +819,11 @@ class GoPclnTab:
         Reverse Engineering Discovery:
         ------------------------------
         `SubagentToolsEnabled` is the master feature switch in `cortex/config`:
-        1. In `cortex/core/components/config.getBaselineConfig`, it gates injecting
-           `invoke_subagent`, `manage_subagents`, and `define_subagent` tools into
+        1. In `cortex/core/components/config.getBaselineConfig` (or `buildDefaultAgent`), it gates
+           injecting `invoke_subagent`, `manage_subagents`, and `define_subagent` tools into
            the LLM tool registry (`baselineConfig.Tools`).
-        2. In `cortex/core/components/config.builtinSubagents`, it gates initialization
-           of the built-in subagent list.
+        2. In `cortex/core/components/config.builtinSubagents` (or `buildDefaultAgent`), it gates
+           initialization of the built-in subagent list.
         Without patching this function to return true, the model never receives
         subagent tools in its schema and subagent delegation fails completely.
         """
@@ -685,7 +840,8 @@ class GoPclnTab:
         for name, va in self.funcs.items():
             if not name.startswith(cfg_pkg):
                 continue
-            refs = decoder(va, length=256)
+            size = self.func_sizes.get(va, 256)
+            refs = decoder(va, length=size)
             for r in refs:
                 s = self.get_string_at_va(r, len(target_bytes) + 4)
                 if target_bytes in s:
@@ -703,20 +859,41 @@ class GoPclnTab:
           - `DeepCoder` (Owl): Guarded by experiment flag "enable-owl-slash-command".
           - `DeepInvestigator` (Owl): Guarded by experiment flag "enable-owl-slash-command".
         
-        This method scans the code range of `builtin/agents` for references to these
-        strings, and for each reference site, walks backward to the function prologue.
-        This guarantees we patch the actual predicate function bodies rather than
-        inlined stubs or registration tables.
+        Strategy:
+        1. Primary: Iterate over `pclntab` function entries in `builtin/agents` (`agents.init.func*`)
+           using their exact `pclntab` sizes and decode string references. This does not depend
+           on compiler stack-check prologue opcodes.
+        2. Fallback: Scan the raw `builtin/agents` code range and walk backward to the function
+           stack-check prologue if `pclntab` closure entries are unavailable.
         """
         agents_pkg = "google3/third_party/jetski/cortex/customizations/builtin/agents"
+        entries = []
+        seen = set()
+        is_arm64 = self.container.arch == "arm64"
+        decoder = self.decode_arm64_string_refs if is_arm64 else self.decode_x86_string_refs
+
+        # 1. Primary: Pclntab function-boundary scan
+        for name, va in self.funcs.items():
+            if not name.startswith(agents_pkg) or name.endswith(".init") or name.endswith(".init.0"):
+                continue
+            size = self.func_sizes.get(va, 512)
+            for r in decoder(va, length=size):
+                s = self.get_string_at_va(r, 40)
+                if s.startswith(b"enable-teamwork-subagent") or s.startswith(b"enable-owl-slash-command"):
+                    if va not in seen:
+                        seen.add(va)
+                        tag = "teamwork-subagent" if s.startswith(b"enable-teamwork-subagent") else "owl-subagent"
+                        entries.append((f"Subagent predicate ({tag})", va))
+                    break
+
+        if entries:
+            return entries
+
+        # 2. Fallback: Raw range scan + backward prologue walk
         pkg_vas = [va for name, va in self.funcs.items() if name.startswith(agents_pkg)]
         if not pkg_vas:
             return []
         min_va, max_va = min(pkg_vas), max(pkg_vas) + 0x2000
-
-        entries = []
-        seen = set()
-        is_arm64 = self.container.arch == "arm64"
 
         if is_arm64:
             for va in range(min_va, max_va, 4):
@@ -779,54 +956,100 @@ class GoPclnTab:
 
     def find_builtin_subagents(self) -> int | None:
         """
-        Locates cortex/core/components/config.builtinSubagents, which constructs
-        the allowed subagents registry used by CalculateAllowedSubagents.
+        Locates the primary subagent configuration function in `cortex/core/components/config`
+        (`config.builtinSubagents`, `config.buildDefaultAgent`, or `config.getBaselineConfig`).
         """
+        for suffix in (
+            "config.builtinSubagents",
+            "config.buildDefaultAgent",
+            "config.getBaselineConfig",
+        ):
+            for name, va in self.funcs.items():
+                if name.endswith(suffix):
+                    return va
         for name, va in self.funcs.items():
-            if name.endswith("builtinSubagents"):
+            if "cortex/core/components/config/" in name:
                 return va
         return None
 
     def find_subagent_feature_calls(self, func_va: int) -> list[int]:
         """
-        Finds the indirect call sites to FeatureProvider.IsEnabled inside builtinSubagents
-        for 'enable-teamwork-subagent' and 'enable-owl-slash-command' (string length 24 / 0x18),
-        while skipping 'enable-browser-subagent-v2' (string length 26 / 0x1a) to avoid
-        the unhandled Playwright driver 404 download bug.
+        Finds the indirect call sites to FeatureProvider.IsEnabled across
+        `cortex/core/components/config` (`builtinSubagents`, `buildDefaultAgent`,
+        `deepAgent`, `reviewAgent`, or any future refactored config helpers) for:
+          - 'enable-teamwork-subagent'
+          - 'enable-owl-slash-command'
+          - 'enable-deepagent'
+          - 'enable-review'
+        while skipping 'enable-browser-subagent-v2' and unrelated feature flags to avoid
+        unintended side effects or the unhandled Playwright driver 404 download bug.
+
+        Uses register-agnostic indirect call matching:
+          - ARM64: Matches any `BLR Xn` (`(inst & 0xFFFFFC1F) == 0xD63F0000`).
+          - x86_64: Matches any `CALLQ *%rN` (`FF D0..D7` or `41 FF D0..D7`).
 
         Returns file offsets of the call instructions to patch.
         """
-        off = self.container.va_to_offset(func_va)
-        if off is None:
-            return []
-        chunk = self.data[off : off + 0x400]
-        matched_offsets = []
+        target_vas = [func_va]
+        for name, va in self.funcs.items():
+            if "cortex/core/components/config/" in name and va not in target_vas:
+                target_vas.append(va)
 
-        if self.container.arch == "arm64":
-            call_opcode = bytes.fromhex("60003fd6")  # blr x3
-            idx = 0
-            while True:
-                pos = chunk.find(call_opcode, idx)
-                if pos == -1:
-                    break
-                idx = pos + 4
-                # Look back up to 16 bytes for length 24:
-                # orr x2, xzr, #0x18 (0xb27d07e2) or mov x2, #0x18 (0xd2800302)
-                pre = chunk[max(0, pos - 16) : pos]
-                if bytes.fromhex("e2077db2") in pre or bytes.fromhex("020380d2") in pre:
-                    matched_offsets.append(off + pos)
-        else:
-            call_opcode = bytes.fromhex("ffd2")  # callq *%rdx
-            idx = 0
-            while True:
-                pos = chunk.find(call_opcode, idx)
-                if pos == -1:
-                    break
-                idx = pos + 2
-                # Look back up to 16 bytes for movl $0x18, %ecx (b9 18 00 00 00)
-                pre = chunk[max(0, pos - 16) : pos]
-                if b"\xb9\x18\x00\x00\x00" in pre:
-                    matched_offsets.append(off + pos)
+        allowed_flags = (
+            b"enable-teamwork-subagent",
+            b"enable-owl-slash-command",
+            b"enable-deepagent",
+            b"enable-review",
+        )
+        is_arm64 = self.container.arch == "arm64"
+        decoder = self.decode_arm64_string_refs if is_arm64 else self.decode_x86_string_refs
+
+        matched_offsets: list[int] = []
+        for va in target_vas:
+            off = self.container.va_to_offset(va)
+            if off is None:
+                continue
+            size = self.func_sizes.get(va, 0x400)
+            chunk = self.data[off : off + size]
+
+            if is_arm64:
+                for pos in range(0, len(chunk) - 3, 4):
+                    inst = struct.unpack("<I", chunk[pos : pos + 4])[0]
+                    # Match any ARM64 BLR Xn: 1101011_0001_11111_000000_rn_00000
+                    if (inst & 0xFFFFFC1F) != 0xD63F0000:
+                        continue
+                    win_start = max(0, pos - 32)
+                    refs = decoder(va + win_start, length=pos - win_start)
+                    matched = any(
+                        self.get_string_at_va(r, 32).startswith(flag)
+                        for r in refs
+                        for flag in allowed_flags
+                    )
+                    if not matched and va == func_va and size <= 0x400:
+                        pre = chunk[max(0, pos - 16) : pos]
+                        matched = bytes.fromhex("e2077db2") in pre or bytes.fromhex("020380d2") in pre
+                    if matched:
+                        matched_offsets.append(off + pos)
+            else:
+                pos = 0
+                while pos < len(chunk) - 1:
+                    # Match x86_64 CALLQ *%rN (FF D0..D7)
+                    if chunk[pos] == 0xFF and 0xD0 <= chunk[pos + 1] <= 0xD7:
+                        win_start = max(0, pos - 32)
+                        refs = decoder(va + win_start, length=pos - win_start)
+                        matched = any(
+                            self.get_string_at_va(r, 32).startswith(flag)
+                            for r in refs
+                            for flag in allowed_flags
+                        )
+                        if not matched and va == func_va and size <= 0x400:
+                            pre = chunk[max(0, pos - 16) : pos]
+                            matched = b"\xb9\x18\x00\x00\x00" in pre
+                        if matched:
+                            matched_offsets.append(off + pos)
+                            pos += 2
+                            continue
+                    pos += 1
 
         return matched_offsets
 
@@ -878,6 +1101,12 @@ def patch_binary(input_path: str, output_path: str):
     targets_to_patch.append(("Slash commands gatekeeper (hasBuiltinAgents)", gatekeeper_va))
     seen_vas.add(gatekeeper_va)
 
+    # 1b. Additional Slash Command Predicates (unlocks /deepagent, /review-agent in agy 1.4.2+)
+    for label, entry in pclntab.find_slash_predicates():
+        if entry not in seen_vas:
+            targets_to_patch.append((label, entry))
+            seen_vas.add(entry)
+
     # 2. Subagent Tools Gatekeeper (SubagentToolsEnabled - unlocks invoke_subagent, define_subagent, manage_subagents)
     subagent_tools_va = pclntab.find_subagent_tools_gatekeeper()
     assert subagent_tools_va is not None, "Could not locate subagent tools gatekeeper (SubagentToolsEnabled)."
@@ -907,46 +1136,47 @@ def patch_binary(input_path: str, output_path: str):
             raise RuntimeError(f"Cannot map VA {hex(va)} to file offset for {label}")
         data[off : off + len(patch_return_true)] = patch_return_true
 
-    # 4. Builtin Subagents Allowed List Registration (builtinSubagents)
+    # 4. Builtin Subagents Allowed List Registration (builtinSubagents / buildDefaultAgent)
     # Patches the runtime registry so invoke_subagent permits DeepInvestigator,
-    # DeepCoder, and teamwork_preview, while keeping browser disabled.
+    # DeepCoder, teamwork_preview, deepagent, and review-agent, while keeping browser disabled.
     builtin_subagents_va = pclntab.find_builtin_subagents()
-    assert builtin_subagents_va is not None, "Could not locate config.builtinSubagents in binary."
+    assert builtin_subagents_va is not None, "Could not locate config.builtinSubagents or config.buildDefaultAgent in binary."
     call_offsets = pclntab.find_subagent_feature_calls(builtin_subagents_va)
     assert len(call_offsets) >= 3, (
         f"Expected at least 3 builtinSubagents feature check calls to patch in {hex(builtin_subagents_va)}, "
         f"found {len(call_offsets)}"
     )
-    print(f"[*] Identified {len(call_offsets)} builtinSubagents feature check calls to patch in {hex(builtin_subagents_va)}:")
+    print(f"[*] Identified {len(call_offsets)} builtinSubagents feature check calls to patch:")
     if container.arch == "arm64":
         call_patch = bytes.fromhex("20008052")  # mov w0, #1
         for call_off in call_offsets:
             print(f"    - Subagent feature call: FileOffset={hex(call_off)}")
             data[call_off : call_off + len(call_patch)] = call_patch
     else:
-        # x86_64: Replace `movl $0x18, %ecx` + `callq *%rdx` with `movl $1, %eax` + NOPs
-        # to guarantee full 64-bit register cleanliness (setting RAX = 1 and clearing upper bits).
-        # If preceding `movl $0x18, %ecx` is absent, safely NOP the call and NOP the following
-        # conditional jump (je) within 64 bytes to guarantee the true branch is taken.
+        # x86_64: In Go's register ABI (ABIInternal), string length for `fp.IsEnabled(flag)` is passed
+        # in ECX via `movl $<len>, %ecx` (0xB9 <len> 0x00 0x00 0x00) immediately preceding `callq *%rN`.
+        # Replace `movl $<len>, %ecx` + `callq *%rN` with `movl $1, %eax` + NOPs to set RAX = 1 cleanly.
         for call_off in call_offsets:
-            pre = data[max(0, call_off - 16) : call_off]
-            mov_idx = pre.rfind(b"\xb9\x18\x00\x00\x00")
+            win_start = max(0, call_off - 16)
+            pre = data[win_start:call_off]
+            mov_idx = -1
+            for i in range(len(pre) - 5, -1, -1):
+                if pre[i] == 0xB9 and 1 <= pre[i + 1] <= 64 and pre[i + 2 : i + 5] == b"\x00\x00\x00":
+                    mov_idx = i
+                    break
             if mov_idx != -1:
-                mov_off = max(0, call_off - 16) + mov_idx
+                mov_off = win_start + mov_idx
                 span = (call_off + 2) - mov_off
                 patch = b"\xb8\x01\x00\x00\x00" + b"\x90" * (span - 5)
                 print(f"    - Subagent feature call: FileOffset={hex(mov_off)} (span {span} bytes: mov eax, 1 + nops)")
                 data[mov_off : mov_off + span] = patch
             else:
-                # Safe jump NOPing fallback: NOP the call instruction (2 bytes) and NOP the downstream
-                # JE opcode (0x74) within 64 bytes so the subagent registration branch always executes.
-                data[call_off : call_off + 2] = b"\x90\x90"
-                post = data[call_off + 2 : min(len(data), call_off + 64)]
-                je_idx = post.find(b"\x74")
-                assert je_idx != -1, f"Could not find conditional jump (je) following call at {hex(call_off)}"
-                je_off = call_off + 2 + je_idx
-                data[je_off : je_off + 2] = b"\x90\x90"
-                print(f"    - Subagent feature call: FileOffset={hex(call_off)} (NOPed call and JE at {hex(je_off)})")
+                # In-place 2-byte fallback: replace `callq *%rN` (FF D0..D7) with `movb $1, %al` (B0 01).
+                call_start = call_off - 1 if data[call_off - 1] == 0x41 else call_off
+                call_len = (call_off + 2) - call_start
+                patch = b"\xb0\x01" + b"\x90" * (call_len - 2)
+                data[call_start : call_start + call_len] = patch
+                print(f"    - Subagent feature call: FileOffset={hex(call_start)} (in-place mov al, 1)")
 
     # For Windows PE binaries, strip the invalid Authenticode signature
     if isinstance(container, PE):
