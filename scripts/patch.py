@@ -508,15 +508,14 @@ class GoPclnTab:
         funcnames = self.data[pcln_off + funcnametab :]
 
         for i in range(nfunc):
-            entryOff, funcOff = struct.unpack("<II", table[i * 8 : (i + 1) * 8])
-            f_data = self.data[pcln_off + pclntab + funcOff : pcln_off + pclntab + funcOff + 8]
-            f_entryOff, nameOff = struct.unpack("<II", f_data)
+            entryOff, funcOff = struct.unpack_from("<II", table, i * 8)
+            f_entryOff, nameOff = struct.unpack_from("<II", self.data, pcln_off + pclntab + funcOff)
             end = funcnames.find(b"\x00", nameOff)
             name = funcnames[nameOff:end].decode("ascii", errors="ignore")
             va = self.text_start + entryOff
             self.funcs[name] = va
             if (i + 2) * 8 <= len(table):
-                next_entryOff = struct.unpack("<I", table[(i + 1) * 8 : (i + 1) * 8 + 4])[0]
+                next_entryOff = struct.unpack_from("<I", table, (i + 1) * 8)[0]
                 if next_entryOff > entryOff:
                     self.func_sizes[va] = next_entryOff - entryOff
 
@@ -527,7 +526,7 @@ class GoPclnTab:
         ARM64 loads 64-bit addresses using a 2-instruction sequence:
           1. ADRP Xd, #page_imm (computes 4KB-aligned page address relative to PC)
           2. ADD Xd, Xn, #imm12 (adds lower 12-bit offset within that 4KB page)
-        Tracks ADRP base pages per register across a short instruction window so
+        Tracks ADRP base pages per register across a 64-byte instruction window so
         pairs remain matched even if the compiler schedules instructions between them.
         """
         off = self.container.va_to_offset(fn_va)
@@ -537,7 +536,7 @@ class GoPclnTab:
         refs = []
         adrp_pages: Dict[int, Tuple[int, int]] = {}  # reg -> (byte_offset, page_va)
         for i in range(0, len(fn_bytes) - 3, 4):
-            inst = struct.unpack("<I", fn_bytes[i : i + 4])[0]
+            inst = struct.unpack_from("<I", fn_bytes, i)[0]
 
             # Match ADRP: 1_00_10000_... (bits 31, 28:24 = 1 10000)
             if (inst & 0x9F000000) == 0x90000000:
@@ -559,7 +558,7 @@ class GoPclnTab:
                 imm12 = (inst >> 10) & 0xFFF
                 if rn in adrp_pages:
                     adrp_i, page = adrp_pages[rn]
-                    if i - adrp_i <= 16:
+                    if i - adrp_i <= 64:
                         refs.append(page + imm12)
                     if rd == rn:
                         del adrp_pages[rn]
@@ -581,7 +580,7 @@ class GoPclnTab:
         for i in range(0, len(fn_bytes) - 7):
             # REX.W prefix (0x48 or 0x4C) + 0x8D (LEA) / 0x8B (MOV) + ModR/M with RIP-relative addressing (0x05)
             if fn_bytes[i] in (0x48, 0x4C) and fn_bytes[i + 1] in opcodes and (fn_bytes[i + 2] & 0xC7) == 0x05:
-                disp = struct.unpack("<i", fn_bytes[i + 3 : i + 7])[0]
+                disp = struct.unpack_from("<i", fn_bytes, i + 3)[0]
                 rip = fn_va + i + 7
                 refs.append(rip + disp)
         return refs
@@ -592,8 +591,8 @@ class GoPclnTab:
         instructions in a completely register-agnostic manner:
           - ARM64: Decodes MOVZ (0x52800000) + MOVK (0x72800000) sequences on any register X0..X30.
           - x86_64: Decodes MOVABS $imm64, r64 (REX.W + 0xB8..0xBF) on any register RAX..R15.
-        Go compilers frequently inline short string equality comparisons (8-16 bytes)
-        as 64-bit integer immediate comparisons rather than rodata pointers.
+        Required on Linux ELF PIE binaries where global pointer tables in `.data.rel.ro`
+        are relocated at runtime via `DT_RELA` and are zero on disk.
         """
         off = self.container.va_to_offset(fn_va)
         if off is None or off + length > len(self.data):
@@ -604,7 +603,7 @@ class GoPclnTab:
         if self.container.arch == "arm64":
             regs: Dict[int, int] = {}
             for i in range(0, len(fn_bytes) - 3, 4):
-                inst = struct.unpack("<I", fn_bytes[i : i + 4])[0]
+                inst = struct.unpack_from("<I", fn_bytes, i)[0]
                 if (inst & 0x7F800000) == 0x52800000:  # MOVZ
                     rd = inst & 0x1F
                     hw = (inst >> 21) & 0x3
@@ -640,33 +639,6 @@ class GoPclnTab:
             else:
                 break
         return s
-
-    def find_closure_by_string(self, package_prefix: str, target_str: str):
-        """
-        Finds anonymous closures in a package whose code references a target string literal.
-        
-        Scans only candidate functions containing '.func' to avoid scanning the entire binary.
-        """
-        candidates = [
-            (name, va)
-            for name, va in self.funcs.items()
-            if name.startswith(package_prefix) and ".func" in name
-        ]
-        target_bytes = target_str.encode("ascii")
-        matching = []
-
-        is_arm64 = self.container.arch == "arm64"
-        decoder = self.decode_arm64_string_refs if is_arm64 else self.decode_x86_string_refs
-
-        for name, va in candidates:
-            size = self.func_sizes.get(va, 256)
-            refs = decoder(va, length=size)
-            for r in refs:
-                s = self.get_string_at_va(r, len(target_bytes) + 8)
-                if target_bytes in s:
-                    matching.append((name, va))
-                    break
-        return matching
 
     def find_slash_gatekeeper(self):
         """
@@ -823,14 +795,6 @@ class GoPclnTab:
 
         return results
 
-    def resolve_function_entry(self, va: int) -> int:
-        """
-        Bypassed: Go pclntab ftab entries already point directly to function entry points.
-        Backward scanning is unnecessary and misidentified large-frame functions on x86_64
-        (e.g. builtinSubagents shifted by -46 bytes into morestack slow-path).
-        """
-        return va
-
     def find_subagent_tools_gatekeeper(self):
         """
         Locates the `cortex/config/config.SubagentToolsEnabled` gatekeeper function.
@@ -877,13 +841,6 @@ class GoPclnTab:
           - `teamwork-subagent`: Guarded by experiment flag "enable-teamwork-subagent".
           - `DeepCoder` (Owl): Guarded by experiment flag "enable-owl-slash-command".
           - `DeepInvestigator` (Owl): Guarded by experiment flag "enable-owl-slash-command".
-        
-        Strategy:
-        1. Primary: Iterate over `pclntab` function entries in `builtin/agents` (`agents.init.func*`)
-           using their exact `pclntab` sizes and decode string references. This does not depend
-           on compiler stack-check prologue opcodes.
-        2. Fallback: Scan the raw `builtin/agents` code range and walk backward to the function
-           stack-check prologue if `pclntab` closure entries are unavailable.
         """
         agents_pkg = "google3/third_party/jetski/cortex/customizations/builtin/agents"
         entries = []
@@ -891,7 +848,6 @@ class GoPclnTab:
         is_arm64 = self.container.arch == "arm64"
         decoder = self.decode_arm64_string_refs if is_arm64 else self.decode_x86_string_refs
 
-        # 1. Primary: Pclntab function-boundary scan
         for name, va in self.funcs.items():
             if not name.startswith(agents_pkg) or name.endswith(".init") or name.endswith(".init.0"):
                 continue
@@ -905,93 +861,9 @@ class GoPclnTab:
                         entries.append((f"Subagent predicate ({tag})", va))
                     break
 
-        if entries:
-            return entries
-
-        # 2. Fallback: Raw range scan + backward prologue walk
-        pkg_vas = [va for name, va in self.funcs.items() if name.startswith(agents_pkg)]
-        if not pkg_vas:
-            return []
-        min_va, max_va = min(pkg_vas), max(pkg_vas) + 0x2000
-
-        if is_arm64:
-            for va in range(min_va, max_va, 4):
-                off = self.container.va_to_offset(va)
-                if off is None or off + 8 > len(self.data):
-                    continue
-                inst1 = struct.unpack("<I", self.data[off : off + 4])[0]
-                inst2 = struct.unpack("<I", self.data[off + 4 : off + 8])[0]
-                # Match ADRP + ADD
-                if (inst1 & 0x9F000000) == 0x90000000 and (inst2 & 0xFFC00000) == 0x91000000:
-                    immlo = (inst1 >> 29) & 0x3
-                    immhi = (inst1 >> 5) & 0x7FFFF
-                    imm = (immhi << 2) | immlo
-                    if imm & (1 << 20):
-                        imm -= 1 << 21
-                    page = (va & ~0xFFF) + (imm << 12)
-                    rn2 = (inst2 >> 5) & 0x1F
-                    rd1 = inst1 & 0x1F
-                    imm12 = (inst2 >> 10) & 0xFFF
-                    if rn2 == rd1:
-                        target = page + imm12
-                        s = self.get_string_at_va(target, 40)
-                        if b"enable-teamwork-subagent" in s or b"enable-owl-slash-command" in s:
-                            # Walk backward from this instruction to find the function entry prologue
-                            for step in range(4, 512, 4):
-                                p_off = off - step
-                                if p_off < 0:
-                                    break
-                                if struct.unpack("<I", self.data[p_off : p_off + 4])[0] == 0xF9400B90:
-                                    entry = va - step
-                                    if entry not in seen:
-                                        seen.add(entry)
-                                        tag = "teamwork-subagent" if s.startswith(b"enable-teamwork-subagent") else "owl-subagent"
-                                        entries.append((f"Subagent predicate ({tag})", entry))
-                                    break
-        else:
-            # x86_64
-            for va in range(min_va, max_va):
-                off = self.container.va_to_offset(va)
-                if off is None or off + 7 > len(self.data):
-                    continue
-                # Match LEA r64, [rip + disp32]
-                if self.data[off] in (0x48, 0x4C) and self.data[off + 1] == 0x8D and (self.data[off + 2] & 0xC7) == 0x05:
-                    disp = struct.unpack("<i", self.data[off + 3 : off + 7])[0]
-                    target = va + 7 + disp
-                    s = self.get_string_at_va(target, 40)
-                    if b"enable-teamwork-subagent" in s or b"enable-owl-slash-command" in s:
-                        for step in range(1, 512):
-                            p_off = off - step
-                            if p_off < 0:
-                                break
-                            if self.data[p_off : p_off + 4] == b"\x49\x3b\x66\x10":
-                                entry = va - step
-                                if entry not in seen:
-                                    seen.add(entry)
-                                    tag = "teamwork-subagent" if s.startswith(b"enable-teamwork-subagent") else "owl-subagent"
-                                    entries.append((f"Subagent predicate ({tag})", entry))
-                                break
         return entries
 
-    def find_builtin_subagents(self) -> int | None:
-        """
-        Locates the primary subagent configuration function in `cortex/core/components/config`
-        (`config.builtinSubagents`, `config.buildDefaultAgent`, or `config.getBaselineConfig`).
-        """
-        for suffix in (
-            "config.builtinSubagents",
-            "config.buildDefaultAgent",
-            "config.getBaselineConfig",
-        ):
-            for name, va in self.funcs.items():
-                if name.endswith(suffix):
-                    return va
-        for name, va in self.funcs.items():
-            if "cortex/core/components/config/" in name:
-                return va
-        return None
-
-    def find_subagent_feature_calls(self, func_va: int) -> list[int]:
+    def find_subagent_feature_calls(self) -> list[int]:
         """
         Finds the indirect call sites to FeatureProvider.IsEnabled across
         `cortex/core/components/config` (`builtinSubagents`, `buildDefaultAgent`,
@@ -1009,11 +881,9 @@ class GoPclnTab:
 
         Returns file offsets of the call instructions to patch.
         """
-        target_vas = [func_va]
-        for name, va in self.funcs.items():
-            if "cortex/core/components/config/" in name and va not in target_vas:
-                target_vas.append(va)
-
+        target_vas = [
+            va for name, va in self.funcs.items() if "cortex/core/components/config/" in name
+        ]
         allowed_flags = (
             b"enable-teamwork-subagent",
             b"enable-owl-slash-command",
@@ -1033,21 +903,17 @@ class GoPclnTab:
 
             if is_arm64:
                 for pos in range(0, len(chunk) - 3, 4):
-                    inst = struct.unpack("<I", chunk[pos : pos + 4])[0]
+                    inst = struct.unpack_from("<I", chunk, pos)[0]
                     # Match any ARM64 BLR Xn: 1101011_0001_11111_000000_rn_00000 (or already-patched mov w0, #1)
                     if (inst & 0xFFFFFC1F) != 0xD63F0000 and inst != 0x52800020:
                         continue
-                    win_start = max(0, pos - 32)
+                    win_start = max(0, pos - 48)
                     refs = decoder(va + win_start, length=pos - win_start)
-                    matched = any(
+                    if any(
                         self.get_string_at_va(r, 32).startswith(flag)
                         for r in refs
                         for flag in allowed_flags
-                    )
-                    if not matched and va == func_va and size <= 0x400:
-                        pre = chunk[max(0, pos - 16) : pos]
-                        matched = bytes.fromhex("e2077db2") in pre or bytes.fromhex("020380d2") in pre
-                    if matched:
+                    ):
                         matched_offsets.append(off + pos)
             else:
                 pos = 0
@@ -1056,17 +922,13 @@ class GoPclnTab:
                     is_call = chunk[pos] == 0xFF and 0xD0 <= chunk[pos + 1] <= 0xD7
                     is_patched = pos >= 5 and chunk[pos - 5 : pos + 2] == b"\xb8\x01\x00\x00\x00\x90\x90"
                     if is_call or is_patched:
-                        win_start = max(0, pos - 32)
+                        win_start = max(0, pos - 48)
                         refs = decoder(va + win_start, length=pos - win_start)
-                        matched = any(
+                        if any(
                             self.get_string_at_va(r, 32).startswith(flag)
                             for r in refs
                             for flag in allowed_flags
-                        )
-                        if not matched and va == func_va and size <= 0x400:
-                            pre = chunk[max(0, pos - 16) : pos + 2]
-                            matched = b"\xb9\x18\x00\x00\x00" in pre or is_patched
-                        if matched:
+                        ):
                             matched_offsets.append(off + pos)
                             pos += 2
                             continue
@@ -1121,7 +983,7 @@ class GoPclnTab:
             for i in range(0, len(choice_chunk) - 3, 4):
                 inst = struct.unpack_from("<I", choice_chunk, i)[0]
                 if ldr_settings is None and (inst & 0xFFC003E0) == 0xF9400000:
-                    ldr_settings = (inst & 0xFFC00000) | 0x42
+                    ldr_settings = (inst & 0xFFFFFC00) | 0x42
                 elif ldp_cw is None and (inst & 0xFFC00000) == 0xA9400000:
                     ldp_cw = (inst & 0xFFFF8000) | 0x0841
             if ldr_settings is None or ldp_cw is None:
@@ -1147,24 +1009,30 @@ class GoPclnTab:
             cw_pos = next(
                 (
                     i for i in range(12, len(cw_chunk) - 40, 4)
-                    if (struct.unpack_from("<I", cw_chunk, i)[0] & 0xFFC003FF) == 0xF94003E2
-                    and (struct.unpack_from("<I", cw_chunk, i + 8)[0] & 0xFF00001F) == 0xB4000002
+                    if (struct.unpack_from("<I", cw_chunk, i)[0] & 0xFFC003E0) == 0xF94003E0
+                    and (struct.unpack_from("<I", cw_chunk, i + 4)[0] & 0xFFC00000) == 0xF9400000
+                    and ((struct.unpack_from("<I", cw_chunk, i + 4)[0] >> 10) & 0xFFF) > 0
+                    and (struct.unpack_from("<I", cw_chunk, i + 8)[0] & 0xFF00001F)
+                    == (0xB4000000 | (struct.unpack_from("<I", cw_chunk, i)[0] & 0x1F))
                 ),
                 None,
             )
             if cw_pos is None:
                 raise RuntimeError("Could not locate tier check block in (*Store).ContextWindow")
-            ldr_s_inst = struct.unpack_from("<I", cw_chunk, cw_pos)[0]
+            ldr_s_inst = struct.unpack_from("<I", cw_chunk, cw_pos)[0] & 0xFFFFFFE0
+            cbz_inst = (struct.unpack_from("<I", cw_chunk, cw_pos + 8)[0] & 0xFFFFFFE0) | 2
             data[cw_off + cw_pos - 12 : cw_off + cw_pos - 4] = struct.pack("<2I", 0xD503201F, 0xD503201F)
-            data[cw_off + cw_pos + 4 : cw_off + cw_pos + 8] = struct.pack("<I", ldr_settings)
-            data[cw_off + cw_pos + 12 : cw_off + cw_pos + 40] = struct.pack(
-                "<7I",
+            data[cw_off + cw_pos : cw_off + cw_pos + 40] = struct.pack(
+                "<10I",
+                ldr_s_inst | 2,                                # ldr x2, [sp, #s_off]
+                ldr_settings,                                  # ldr x2, [x2, #settings_off]
+                cbz_inst,                                      # cbz x2, nil_ret
                 0xD503201F,                                    # nop
                 0xD503201F,                                    # nop
                 ldp_cw,                                        # ldp x1, x2, [x2, #cw_off]
                 arm64_bl(cw_va + cw_pos + 24, aco_va),         # bl store.AutoCompactOverride
                 0xB5000061,                                    # cbnz x1, .+12 (epilogue)
-                ldr_s_inst & 0xFFFFFFE0,                       # ldr x0, [sp, #s_off]
+                ldr_s_inst,                                    # ldr x0, [sp, #s_off]
                 arm64_bl(cw_va + cw_pos + 36, choice_va),      # bl (*Store).ContextWindowChoice
             )
             patched_sites.append(("(*Store).ContextWindow -> AutoCompactOverride + ContextWindowChoice", cw_va + cw_pos))
@@ -1185,56 +1053,76 @@ class GoPclnTab:
             patched_sites.append(("SelectorModel.offersContextWindow -> return true", offers_va + offers_pos + 4))
 
         elif self.container.arch == "x86_64":
-            # 1. Extract settings_off (0x10) and cw_field_off (0x70) from ContextWindowChoice
+            # 1. Extract settings_off (0x10) and cw_field_off (0x70) from ContextWindowChoice (register-agnostic)
             settings_off = next(
                 (
                     choice_chunk[i + 3] for i in range(len(choice_chunk) - 4)
-                    if choice_chunk[i : i + 3] == b"\x48\x8b\x48"
+                    if choice_chunk[i] in (0x48, 0x4C)
+                    and choice_chunk[i + 1] == 0x8B
+                    and (choice_chunk[i + 2] & 0xC7) == 0x40
                 ),
                 None,
             )
             cw_field_off = next(
                 (
                     choice_chunk[i + 3] for i in range(len(choice_chunk) - 4)
-                    if choice_chunk[i : i + 3] == b"\x48\x8b\x41"
+                    if choice_chunk[i] in (0x48, 0x49)
+                    and choice_chunk[i + 1] == 0x8B
+                    and (choice_chunk[i + 2] & 0xF8) == 0x40
+                    and (choice_chunk[i + 2] & 0x07) != 4
                 ),
                 None,
             )
             if settings_off is None or cw_field_off is None:
                 raise RuntimeError("Could not extract struct offsets from ContextWindowChoice")
 
-            # 2. Patch store.AutoCompactOverride: `xor eax, eax; xor ebx, ebx` -> `mov rbx, rax; mov rcx, rbx`
-            aco_zero = bytes.fromhex("31c031db0f1f440000")
-            aco_pass = bytes.fromhex("4889d84889cb909090")
-            aco_pos = next((i for i in range(len(aco_chunk) - 9) if aco_chunk[i : i + 9] in (aco_zero, aco_pass)), None)
+            # 2. Patch store.AutoCompactOverride: `xor eax, eax; xor ebx, ebx` (4B) -> `mov rcx, rax; nop` (4B)
+            aco_zero = bytes.fromhex("31c031db")
+            aco_pass = bytes.fromhex("4889c890")
+            aco_pos = next((i for i in range(len(aco_chunk) - 4) if aco_chunk[i : i + 4] in (aco_zero, aco_pass)), None)
             if aco_pos is None:
                 raise RuntimeError("Could not locate TrimSpace arg setup in store.AutoCompactOverride")
-            data[aco_off + aco_pos : aco_off + aco_pos + 9] = aco_pass
+            data[aco_off + aco_pos : aco_off + aco_pos + 4] = aco_pass
             patched_sites.append(("store.AutoCompactOverride -> accept raw string", aco_va + aco_pos))
 
-            # 3. Patch (*Store).ContextWindow: call AutoCompactOverride(maxTokens, raw) then ContextWindowChoice()
+            # 3. Patch (*Store).ContextWindow: call AutoCompactOverride(maxTokens, len, ptr) then ContextWindowChoice()
             cw_pos = next(
                 (
-                    i for i in range(11, len(cw_chunk) - 60)
-                    if cw_chunk[i : i + 4] == b"\x48\x8b\x8c\x24" and cw_chunk[i + 16 : i + 20] == b"\x48\x85\xc9\x74"
+                    i for i in range(16, len(cw_chunk) - 60)
+                    if cw_chunk[i : i + 2] in (b"\x48\x8b", b"\x4c\x8b")
+                    and (cw_chunk[i + 2] & 0xC7) == 0x84
+                    and cw_chunk[i + 3] == 0x24
+                    and (
+                        cw_chunk[i + 11 : i + 15] == b"\xb8\x00\x00\x00"
+                        or cw_chunk[i + 8 : i + 12] == bytes([0x48, 0x8B, 0x49, settings_off])
+                    )
                 ),
                 None,
             )
             if cw_pos is None:
                 raise RuntimeError("Could not locate tier check block in (*Store).ContextWindow")
-            mov_s_rax = b"\x48\x8b\x84\x24" + cw_chunk[cw_pos + 4 : cw_pos + 8]
-            body_va = cw_va + cw_pos + 21
+            for k in range(cw_pos - 16, cw_pos - 8):
+                if cw_chunk[k] == 0xE8:
+                    data[cw_off + k : cw_off + cw_pos] = b"\x90" * (cw_pos - k)
+                    break
+            s_disp = cw_chunk[cw_pos + 4 : cw_pos + 8]
+            mov_s_rcx = b"\x48\x8b\x8c\x24" + s_disp
+            mov_s_rax = b"\x48\x8b\x84\x24" + s_disp
+            body_va = cw_va + cw_pos + 17
             body = (
-                bytes([0x48, 0x8B, 0x59, cw_field_off, 0x48, 0x8B, 0x49, cw_field_off + 8])
+                bytes([0x48, 0x8B, 0x59, cw_field_off + 8, 0x48, 0x8B, 0x49, cw_field_off])
                 + b"\xe8" + struct.pack("<i", aco_va - (body_va + 13))
                 + b"\x48\x85\xdb\x75\x0d"
                 + mov_s_rax
                 + b"\xe8" + struct.pack("<i", choice_va - (body_va + 31))
             )
-            data[cw_off + cw_pos - 11 : cw_off + cw_pos] = b"\x90" * 11
-            data[cw_off + cw_pos + 8 : cw_off + cw_pos + 15] = bytes([0x48, 0x8B, 0x49, settings_off]) + b"\x90\x90\x90"
-            tail = bytes([len(body) + 2]) + body + b"\xc9\xc3\x31\xc0\x31\xdb\xc9\xc3"
-            data[cw_off + cw_pos + 20 : cw_off + cw_pos + 20 + len(tail)] = tail
+            seq = (
+                mov_s_rcx
+                + bytes([0x48, 0x8B, 0x49, settings_off, 0x48, 0x85, 0xC9, 0x74, len(body) + 2])
+                + body
+                + b"\xc9\xc3\x31\xc0\x31\xdb\xc9\xc3"
+            )
+            data[cw_off + cw_pos : cw_off + cw_pos + len(seq)] = seq
             patched_sites.append(("(*Store).ContextWindow -> AutoCompactOverride + ContextWindowChoice", cw_va + cw_pos))
 
             # 4. Patch SelectorModel.overrideFor -> return "" and SelectorModel.offersContextWindow -> return true
@@ -1338,12 +1226,9 @@ def patch_binary(input_path: str, output_path: str):
     # 4. Builtin Subagents Allowed List Registration (builtinSubagents / buildDefaultAgent)
     # Patches the runtime registry so invoke_subagent permits DeepInvestigator,
     # DeepCoder, teamwork_preview, deepagent, and review-agent, while keeping browser disabled.
-    builtin_subagents_va = pclntab.find_builtin_subagents()
-    assert builtin_subagents_va is not None, "Could not locate config.builtinSubagents or config.buildDefaultAgent in binary."
-    call_offsets = pclntab.find_subagent_feature_calls(builtin_subagents_va)
+    call_offsets = pclntab.find_subagent_feature_calls()
     assert len(call_offsets) >= 3, (
-        f"Expected at least 3 builtinSubagents feature check calls to patch in {hex(builtin_subagents_va)}, "
-        f"found {len(call_offsets)}"
+        f"Expected at least 3 builtinSubagents feature check calls to patch, found {len(call_offsets)}"
     )
     print(f"[*] Identified {len(call_offsets)} builtinSubagents feature check calls to patch:")
     if container.arch == "arm64":
