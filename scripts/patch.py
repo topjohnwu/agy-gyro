@@ -94,6 +94,25 @@ Challenges Across Architectures, OSes, and Go Releases:
      Calls are patched using `mov w0, #1` on ARM64 and `movl $1, %eax` + NOPs on x86_64
      to ensure clean 64-bit return registers.
 
+7. Context Window Configuration (`store.(*Store).ContextWindow`, `store.AutoCompactOverride`, `SelectorModel.offersContextWindow`):
+   - Antigravity CLI includes two built-in mechanisms for configuring `CheckpointConfig.MaxTokenLimit`
+     (which controls when rolling checkpoint compaction triggers for `store.contextWindowModels`,
+     such as `Gemini 4 Argon`):
+     * Mechanism B1 (Interactive Preset Selector & Preset Settings: `"256K"`, `"512K"`, `"900K"`):
+       `store.(*Store).ContextWindowChoice` parses `"contextWindow"` from `settings.json` via
+       `backend.ParsePresetContextWindow`, and `SelectorModel.offersContextWindow` enables cycling
+       `256K` / `512K` / `900K` in `/model`. Both functions are dead-coded in release builds by a nil
+       interface check on `[store, #0xb8]` followed by `runtime.typeAssert`.
+     * Mechanism B2 (`store.AutoCompactOverride`: Percentage `"1%"`–`"100%"` & Raw Token Integer Override):
+       `store.AutoCompactOverride(modelMaxTokens int) string` computes a percentage of the model's max
+       context tokens (e.g. `"85%"` -> `"891289"`) or validates a raw `uint32` token count (e.g. `"800000"`),
+       which `backend.ContextWindow.MaxTokenLimit` parses directly into `MaxTokenLimit`. In release builds,
+       the input string before `strings.TrimSpace` is zeroed out (`mov x0, xzr; mov x1, xzr`).
+   - Solution: Patch `store.AutoCompactOverride` in-place to accept `(maxTokens int, raw string)`,
+     patch `(*Store).ContextWindow` in-place across its dead `[store, #0xb8]` block to call
+     `AutoCompactOverride(maxTokens, s.settings.ContextWindow)` and fall back to `s.ContextWindowChoice()`,
+     and restore `SelectorModel.offersContextWindow` to return `true`.
+
 Patching Architecture:
 ----------------------
 Instead of fragile, brute-force patching of dozens of closures, this patcher targets
@@ -1015,8 +1034,8 @@ class GoPclnTab:
             if is_arm64:
                 for pos in range(0, len(chunk) - 3, 4):
                     inst = struct.unpack("<I", chunk[pos : pos + 4])[0]
-                    # Match any ARM64 BLR Xn: 1101011_0001_11111_000000_rn_00000
-                    if (inst & 0xFFFFFC1F) != 0xD63F0000:
+                    # Match any ARM64 BLR Xn: 1101011_0001_11111_000000_rn_00000 (or already-patched mov w0, #1)
+                    if (inst & 0xFFFFFC1F) != 0xD63F0000 and inst != 0x52800020:
                         continue
                     win_start = max(0, pos - 32)
                     refs = decoder(va + win_start, length=pos - win_start)
@@ -1033,8 +1052,10 @@ class GoPclnTab:
             else:
                 pos = 0
                 while pos < len(chunk) - 1:
-                    # Match x86_64 CALLQ *%rN (FF D0..D7)
-                    if chunk[pos] == 0xFF and 0xD0 <= chunk[pos + 1] <= 0xD7:
+                    # Match x86_64 CALLQ *%rN (FF D0..D7) or already-patched mov eax, 1; nop; nop
+                    is_call = chunk[pos] == 0xFF and 0xD0 <= chunk[pos + 1] <= 0xD7
+                    is_patched = pos >= 5 and chunk[pos - 5 : pos + 2] == b"\xb8\x01\x00\x00\x00\x90\x90"
+                    if is_call or is_patched:
                         win_start = max(0, pos - 32)
                         refs = decoder(va + win_start, length=pos - win_start)
                         matched = any(
@@ -1043,8 +1064,8 @@ class GoPclnTab:
                             for flag in allowed_flags
                         )
                         if not matched and va == func_va and size <= 0x400:
-                            pre = chunk[max(0, pos - 16) : pos]
-                            matched = b"\xb9\x18\x00\x00\x00" in pre
+                            pre = chunk[max(0, pos - 16) : pos + 2]
+                            matched = b"\xb9\x18\x00\x00\x00" in pre or is_patched
                         if matched:
                             matched_offsets.append(off + pos)
                             pos += 2
@@ -1052,6 +1073,184 @@ class GoPclnTab:
                     pos += 1
 
         return matched_offsets
+
+    def patch_context_window(self, data: bytearray) -> list[Tuple[str, int]]:
+        """
+        Restores both built-in context window configuration mechanisms in `cli/store` and `cli/model`:
+          1. Mechanism B1 (Interactive Preset Selector & Preset Settings: "256K", "512K", "900K")
+          2. Mechanism B2 (`store.AutoCompactOverride`: Percentage "1%"-"100%" & Raw Token Integer Override)
+
+        How it works:
+          - `store.AutoCompactOverride` is patched in-place to accept `(maxTokens int, raw string)`
+            instead of hardcoding `""` before `strings.TrimSpace`.
+          - `store.(*Store).ContextWindow` is patched in-place across its dead `[s, #0xb8]` tier-check
+            block to load `s.settings.ContextWindow`, call `AutoCompactOverride(maxTokens, raw)`, and
+            fall back to `s.ContextWindowChoice()`.
+          - `model.SelectorModel.overrideFor` is stubbed to return `""` and
+            `model.SelectorModel.offersContextWindow` is patched to return `true` after matching
+            `store.contextWindowModels`.
+        """
+        aco_va = next((va for k, va in self.funcs.items() if k.endswith("store.AutoCompactOverride")), None)
+        choice_va = next((va for k, va in self.funcs.items() if k.endswith("store.(*Store).ContextWindowChoice")), None)
+        cw_va = next((va for k, va in self.funcs.items() if k.endswith("store.(*Store).ContextWindow")), None)
+        offers_va = next((va for k, va in self.funcs.items() if k.endswith("model.SelectorModel.offersContextWindow")), None)
+        ov_va = next((va for k, va in self.funcs.items() if k.endswith("model.SelectorModel.overrideFor")), None)
+        if not all((aco_va, choice_va, cw_va, offers_va, ov_va)):
+            raise RuntimeError("Could not locate required context window symbols in pclntab")
+
+        aco_off = self.container.va_to_offset(aco_va)
+        choice_off = self.container.va_to_offset(choice_va)
+        cw_off = self.container.va_to_offset(cw_va)
+        offers_off = self.container.va_to_offset(offers_va)
+        ov_off = self.container.va_to_offset(ov_va)
+
+        aco_chunk = self.data[aco_off : aco_off + self.func_sizes.get(aco_va, 0x120)]
+        choice_chunk = self.data[choice_off : choice_off + self.func_sizes.get(choice_va, 0x60)]
+        cw_chunk = self.data[cw_off : cw_off + self.func_sizes.get(cw_va, 0x280)]
+        offers_chunk = self.data[offers_off : offers_off + self.func_sizes.get(offers_va, 0x320)]
+
+        patched_sites: list[Tuple[str, int]] = []
+
+        if self.container.arch == "arm64":
+            def arm64_bl(src_va: int, dst_va: int) -> int:
+                return 0x94000000 | (((dst_va - src_va) // 4) & 0x3FFFFFF)
+
+            # 1. Extract `ldr x2, [x2, #settings_off]` and `ldp x1, x2, [x2, #cw_off]` from ContextWindowChoice
+            ldr_settings = None
+            ldp_cw = None
+            for i in range(0, len(choice_chunk) - 3, 4):
+                inst = struct.unpack_from("<I", choice_chunk, i)[0]
+                if ldr_settings is None and (inst & 0xFFC003E0) == 0xF9400000:
+                    ldr_settings = (inst & 0xFFC00000) | 0x42
+                elif ldp_cw is None and (inst & 0xFFC00000) == 0xA9400000:
+                    ldp_cw = (inst & 0xFFFF8000) | 0x0841
+            if ldr_settings is None or ldp_cw is None:
+                raise RuntimeError("Could not extract struct offsets from ContextWindowChoice")
+
+            # 2. Patch store.AutoCompactOverride: `mov x0, xzr; mov x1, xzr` -> `mov x0, x1; mov x1, x2`
+            aco_zero = bytes.fromhex("e0031faae1031faa")
+            aco_pass = bytes.fromhex("e00301aae10302aa")
+            aco_pos = next(
+                (
+                    i for i in range(0, len(aco_chunk) - 11, 4)
+                    if aco_chunk[i : i + 8] in (aco_zero, aco_pass)
+                    and (struct.unpack_from("<I", aco_chunk, i + 8)[0] & 0xFC000000) == 0x94000000
+                ),
+                None,
+            )
+            if aco_pos is None:
+                raise RuntimeError("Could not locate TrimSpace arg setup in store.AutoCompactOverride")
+            data[aco_off + aco_pos : aco_off + aco_pos + 8] = aco_pass
+            patched_sites.append(("store.AutoCompactOverride -> accept raw string", aco_va + aco_pos))
+
+            # 3. Patch (*Store).ContextWindow: call AutoCompactOverride(maxTokens, raw) then ContextWindowChoice()
+            cw_pos = next(
+                (
+                    i for i in range(12, len(cw_chunk) - 40, 4)
+                    if (struct.unpack_from("<I", cw_chunk, i)[0] & 0xFFC003FF) == 0xF94003E2
+                    and (struct.unpack_from("<I", cw_chunk, i + 8)[0] & 0xFF00001F) == 0xB4000002
+                ),
+                None,
+            )
+            if cw_pos is None:
+                raise RuntimeError("Could not locate tier check block in (*Store).ContextWindow")
+            ldr_s_inst = struct.unpack_from("<I", cw_chunk, cw_pos)[0]
+            data[cw_off + cw_pos - 12 : cw_off + cw_pos - 4] = struct.pack("<2I", 0xD503201F, 0xD503201F)
+            data[cw_off + cw_pos + 4 : cw_off + cw_pos + 8] = struct.pack("<I", ldr_settings)
+            data[cw_off + cw_pos + 12 : cw_off + cw_pos + 40] = struct.pack(
+                "<7I",
+                0xD503201F,                                    # nop
+                0xD503201F,                                    # nop
+                ldp_cw,                                        # ldp x1, x2, [x2, #cw_off]
+                arm64_bl(cw_va + cw_pos + 24, aco_va),         # bl store.AutoCompactOverride
+                0xB5000061,                                    # cbnz x1, .+12 (epilogue)
+                ldr_s_inst & 0xFFFFFFE0,                       # ldr x0, [sp, #s_off]
+                arm64_bl(cw_va + cw_pos + 36, choice_va),      # bl (*Store).ContextWindowChoice
+            )
+            patched_sites.append(("(*Store).ContextWindow -> AutoCompactOverride + ContextWindowChoice", cw_va + cw_pos))
+
+            # 4. Patch SelectorModel.overrideFor -> return "" and SelectorModel.offersContextWindow -> return true
+            data[ov_off : ov_off + 12] = bytes.fromhex("e0031faae1031faac0035fd6")
+            offers_pos = next(
+                (
+                    i for i in range(0, len(offers_chunk) - 7, 4)
+                    if offers_chunk[i : i + 4] == b"\x3f\x00\x00\xf1"
+                    and offers_chunk[i + 4 : i + 8] in (b"\xe0\x07\x9f\x9a", b"\x20\x00\x80\x52")
+                ),
+                None,
+            )
+            if offers_pos is None:
+                raise RuntimeError("Could not locate return check in SelectorModel.offersContextWindow")
+            data[offers_off + offers_pos + 4 : offers_off + offers_pos + 8] = b"\x20\x00\x80\x52"
+            patched_sites.append(("SelectorModel.offersContextWindow -> return true", offers_va + offers_pos + 4))
+
+        elif self.container.arch == "x86_64":
+            # 1. Extract settings_off (0x10) and cw_field_off (0x70) from ContextWindowChoice
+            settings_off = next(
+                (
+                    choice_chunk[i + 3] for i in range(len(choice_chunk) - 4)
+                    if choice_chunk[i : i + 3] == b"\x48\x8b\x48"
+                ),
+                None,
+            )
+            cw_field_off = next(
+                (
+                    choice_chunk[i + 3] for i in range(len(choice_chunk) - 4)
+                    if choice_chunk[i : i + 3] == b"\x48\x8b\x41"
+                ),
+                None,
+            )
+            if settings_off is None or cw_field_off is None:
+                raise RuntimeError("Could not extract struct offsets from ContextWindowChoice")
+
+            # 2. Patch store.AutoCompactOverride: `xor eax, eax; xor ebx, ebx` -> `mov rbx, rax; mov rcx, rbx`
+            aco_zero = bytes.fromhex("31c031db0f1f440000")
+            aco_pass = bytes.fromhex("4889d84889cb909090")
+            aco_pos = next((i for i in range(len(aco_chunk) - 9) if aco_chunk[i : i + 9] in (aco_zero, aco_pass)), None)
+            if aco_pos is None:
+                raise RuntimeError("Could not locate TrimSpace arg setup in store.AutoCompactOverride")
+            data[aco_off + aco_pos : aco_off + aco_pos + 9] = aco_pass
+            patched_sites.append(("store.AutoCompactOverride -> accept raw string", aco_va + aco_pos))
+
+            # 3. Patch (*Store).ContextWindow: call AutoCompactOverride(maxTokens, raw) then ContextWindowChoice()
+            cw_pos = next(
+                (
+                    i for i in range(11, len(cw_chunk) - 60)
+                    if cw_chunk[i : i + 4] == b"\x48\x8b\x8c\x24" and cw_chunk[i + 16 : i + 20] == b"\x48\x85\xc9\x74"
+                ),
+                None,
+            )
+            if cw_pos is None:
+                raise RuntimeError("Could not locate tier check block in (*Store).ContextWindow")
+            mov_s_rax = b"\x48\x8b\x84\x24" + cw_chunk[cw_pos + 4 : cw_pos + 8]
+            body_va = cw_va + cw_pos + 21
+            body = (
+                bytes([0x48, 0x8B, 0x59, cw_field_off, 0x48, 0x8B, 0x49, cw_field_off + 8])
+                + b"\xe8" + struct.pack("<i", aco_va - (body_va + 13))
+                + b"\x48\x85\xdb\x75\x0d"
+                + mov_s_rax
+                + b"\xe8" + struct.pack("<i", choice_va - (body_va + 31))
+            )
+            data[cw_off + cw_pos - 11 : cw_off + cw_pos] = b"\x90" * 11
+            data[cw_off + cw_pos + 8 : cw_off + cw_pos + 15] = bytes([0x48, 0x8B, 0x49, settings_off]) + b"\x90\x90\x90"
+            tail = bytes([len(body) + 2]) + body + b"\xc9\xc3\x31\xc0\x31\xdb\xc9\xc3"
+            data[cw_off + cw_pos + 20 : cw_off + cw_pos + 20 + len(tail)] = tail
+            patched_sites.append(("(*Store).ContextWindow -> AutoCompactOverride + ContextWindowChoice", cw_va + cw_pos))
+
+            # 4. Patch SelectorModel.overrideFor -> return "" and SelectorModel.offersContextWindow -> return true
+            data[ov_off : ov_off + 5] = bytes.fromhex("31c031dbc3")
+            offers_orig = bytes.fromhex("4885db0f95c0")
+            offers_true = bytes.fromhex("b80100000090")
+            offers_pos = next(
+                (i for i in range(len(offers_chunk) - 6) if offers_chunk[i : i + 6] in (offers_orig, offers_true)),
+                None,
+            )
+            if offers_pos is None:
+                raise RuntimeError("Could not locate return check in SelectorModel.offersContextWindow")
+            data[offers_off + offers_pos : offers_off + offers_pos + 6] = offers_true
+            patched_sites.append(("SelectorModel.offersContextWindow -> return true", offers_va + offers_pos))
+
+        return patched_sites
 
 
 # ==============================================================================
@@ -1170,6 +1369,8 @@ def patch_binary(input_path: str, output_path: str):
                 patch = b"\xb8\x01\x00\x00\x00" + b"\x90" * (span - 5)
                 print(f"    - Subagent feature call: FileOffset={hex(mov_off)} (span {span} bytes: mov eax, 1 + nops)")
                 data[mov_off : mov_off + span] = patch
+            elif call_off >= 5 and data[call_off - 5 : call_off + 2] == b"\xb8\x01\x00\x00\x00\x90\x90":
+                print(f"    - Subagent feature call: FileOffset={hex(call_off - 5)} (span 7 bytes: mov eax, 1 + nops)")
             else:
                 # In-place 2-byte fallback: replace `callq *%rN` (FF D0..D7) with `movb $1, %al` (B0 01).
                 call_start = call_off - 1 if data[call_off - 1] == 0x41 else call_off
@@ -1177,6 +1378,14 @@ def patch_binary(input_path: str, output_path: str):
                 patch = b"\xb0\x01" + b"\x90" * (call_len - 2)
                 data[call_start : call_start + call_len] = patch
                 print(f"    - Subagent feature call: FileOffset={hex(call_start)} (in-place mov al, 1)")
+
+    # 5. Context Window Configuration (Preset Selector 256K/512K/900K + AutoCompactOverride % / raw tokens)
+    cw_sites = pclntab.patch_context_window(data)
+    if cw_sites:
+        print(f"[*] Patched {len(cw_sites)} context window configuration sites:")
+        for label, va in cw_sites:
+            off = container.va_to_offset(va)
+            print(f"    - {label}: VA={hex(va)} -> FileOffset={hex(off) if off else 'N/A'}")
 
     # For Windows PE binaries, strip the invalid Authenticode signature
     if isinstance(container, PE):
