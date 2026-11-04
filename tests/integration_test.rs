@@ -16,7 +16,7 @@ async fn spawn_test_proxy(upstream_url: String, max_retries: u32) -> String {
 
 /// Helper function to start a test proxy with configurable buffering
 async fn spawn_test_proxy_opts(upstream_url: String, max_retries: u32, no_buffer: bool) -> String {
-    spawn_test_proxy_full(upstream_url, max_retries, no_buffer, Vec::new()).await
+    spawn_test_proxy_full(upstream_url, max_retries, no_buffer, None).await
 }
 
 /// Helper function to start a test proxy with full configuration options
@@ -24,7 +24,7 @@ async fn spawn_test_proxy_full(
     upstream_url: String,
     max_retries: u32,
     no_buffer: bool,
-    redirect_model: Vec<String>,
+    api_key: Option<String>,
 ) -> String {
     let config = Config {
         host: "127.0.0.1".to_string(),
@@ -36,7 +36,7 @@ async fn spawn_test_proxy_full(
         no_jitter: true,
         no_buffer,
         request_timeout_secs: 10,
-        redirect_model,
+        api_key,
     };
 
     let client = Client::builder()
@@ -610,13 +610,14 @@ async fn test_run_wrapper_executes_child_and_propagates_exit_code() {
             no_jitter: true,
             no_buffer: false,
             request_timeout_secs: 10,
-            redirect_model: Vec::new(),
+            api_key: None,
         },
         agy_path: "sh".to_string(),
         log_file: None,
         agy_args: vec![
             "-c".to_string(),
-            r#"test -n "$GOOGLE_GEMINI_BASE_URL" && exit 42"#.to_string(),
+            r#"test -n "$AGY_LLM_GATEWAY_URL" && test "$AGY_LLM_GATEWAY_WIRE_PROTOCOL" = "genai" && test -n "$AGY_LLM_GATEWAY_API_KEY" && test -n "$AGY_LLM_GATEWAY_MODELS" && exit 42"#
+                .to_string(),
         ],
     };
 
@@ -624,93 +625,122 @@ async fn test_run_wrapper_executes_child_and_propagates_exit_code() {
     assert_eq!(exit_code, 42);
 }
 
-#[test]
-fn test_rewrite_model_path_unit() {
-    use agy_gyro::proxy::rewrite_model_path;
-
-    let redirects = vec![
-        ("gemini-3.7-flash", "gemini-3.8-flash"),
-        ("gemini-3.5-flash", "gemini-3.8-flash"),
-    ];
-
-    // Standard streaming generateContent - matched rule
-    assert_eq!(
-        rewrite_model_path(
-            "/v1beta/models/gemini-3.7-flash:streamGenerateContent?alt=sse",
-            &redirects
-        ),
-        "/v1beta/models/gemini-3.8-flash:streamGenerateContent?alt=sse"
-    );
-
-    // Standard generateContent - second matched rule
-    assert_eq!(
-        rewrite_model_path(
-            "/v1beta/models/gemini-3.5-flash:generateContent",
-            &redirects
-        ),
-        "/v1beta/models/gemini-3.8-flash:generateContent"
-    );
-
-    // Model path with query param - matched rule
-    assert_eq!(
-        rewrite_model_path("/v1/models/gemini-3.7-flash?key=abc", &redirects),
-        "/v1/models/gemini-3.8-flash?key=abc"
-    );
-
-    // Exact model endpoint - matched rule
-    assert_eq!(
-        rewrite_model_path("/v1beta/models/gemini-3.7-flash", &redirects),
-        "/v1beta/models/gemini-3.8-flash"
-    );
-
-    // Unmatched model remains untouched
-    assert_eq!(
-        rewrite_model_path("/v1beta/models/gemini-2.5-pro:generateContent", &redirects),
-        "/v1beta/models/gemini-2.5-pro:generateContent"
-    );
-
-    // Non-model paths remain untouched
-    assert_eq!(
-        rewrite_model_path("/v1beta/models", &redirects),
-        "/v1beta/models"
-    );
-    assert_eq!(
-        rewrite_model_path("/v1internal:fetchAvailableModels", &redirects),
-        "/v1internal:fetchAvailableModels"
-    );
-
-    // Empty redirects list leaves everything untouched
-    assert_eq!(
-        rewrite_model_path("/v1beta/models/gemini-3.7-flash:streamGenerateContent", &[]),
-        "/v1beta/models/gemini-3.7-flash:streamGenerateContent"
-    );
-}
-
 #[tokio::test]
-async fn test_redirect_model_rewrites_matched_and_ignores_unmatched() {
-    let mock_server = MockServer::start().await;
+async fn test_resolve_gateway_models_fetches_and_expands_models() {
+    use agy_gyro::config::EXCLUDED_MODELS;
+    use agy_gyro::proxy::resolve_gateway_models;
 
-    // Matched model: gemini-3.7-flash -> gemini-3.8-flash
-    Mock::given(method("POST"))
-        .and(path("/v1beta/models/gemini-3.8-flash:streamGenerateContent"))
-        .and(query_param("alt", "sse"))
+    let mock_server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/v1beta/models"))
+        .and(header("x-goog-api-key", "my-gemini-api-key"))
         .respond_with(
             ResponseTemplate::new(200)
-                .insert_header("content-type", "text/event-stream")
-                .set_body_string("data: {\"candidates\": [{\"content\": {\"parts\": [{\"text\": \"Response from 3.8-flash\"}]}}]}\n\n"),
+                .insert_header("content-type", "application/json")
+                .set_body_json(serde_json::json!({
+                    "models": [
+                        {
+                            "name": format!("models/{}", EXCLUDED_MODELS[0]),
+                            "supportedGenerationMethods": ["generateContent", "countTokens"],
+                            "thinking": true
+                        },
+                        {
+                            "name": "models/gemini-99-flash",
+                            "supportedGenerationMethods": ["generateContent", "countTokens"],
+                            "thinking": true
+                        },
+                        {
+                            "name": "models/gemini-99-pro",
+                            "supportedGenerationMethods": ["generateContent", "countTokens"],
+                            "thinking": true
+                        },
+                        {
+                            "name": "models/gemini-99-flash-image",
+                            "supportedGenerationMethods": ["generateContent", "countTokens"],
+                            "thinking": true
+                        }
+                    ]
+                })),
         )
         .expect(1)
         .mount(&mock_server)
         .await;
 
-    // Unmatched model: gemini-2.5-pro remains untouched
+    let config = Config {
+        host: "127.0.0.1".to_string(),
+        port: Some(0),
+        upstream: mock_server.uri(),
+        max_retries: 3,
+        initial_delay_ms: 10,
+        max_delay_ms: 100,
+        no_jitter: true,
+        no_buffer: false,
+        request_timeout_secs: 10,
+        api_key: Some("my-gemini-api-key".to_string()),
+    };
+
+    let client = Client::new();
+    let models = resolve_gateway_models(&client, &config).await;
+    assert_eq!(
+        models,
+        "gemini-99-pro-low,gemini-99-pro-medium,gemini-99-pro-high,gemini-99-flash-low,gemini-99-flash-medium,gemini-99-flash-high"
+    );
+}
+
+#[tokio::test]
+async fn test_gateway_bearer_auth_translated_to_x_goog_api_key() {
+    let mock_server = MockServer::start().await;
+
     Mock::given(method("POST"))
-        .and(path("/v1beta/models/gemini-2.5-pro:generateContent"))
+        .and(path("/v1beta/models/gemini-3.8-flash:streamGenerateContent"))
+        .and(query_param("alt", "sse"))
+        .and(header("x-goog-api-key", "gateway-bearer-key-xyz"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "text/event-stream")
+                .set_body_string("data: {\"candidates\": [{\"content\": {\"parts\": [{\"text\": \"PONG\"}]}}]}\n\n"),
+        )
+        .expect(1)
+        .mount(&mock_server)
+        .await;
+
+    let proxy_url = spawn_test_proxy_full(mock_server.uri(), 3, false, None).await;
+    let client = Client::new();
+
+    let res = client
+        .post(format!(
+            "{}/v1beta/models/gemini-3.8-flash:streamGenerateContent?alt=sse",
+            proxy_url
+        ))
+        .header("Authorization", "Bearer gateway-bearer-key-xyz")
+        .header("content-type", "application/json")
+        .body(r#"{"contents":[{"parts":[{"text":"Reply with PONG"}]}]}"#)
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(res.status(), 200);
+    let text = res.text().await.unwrap();
+    assert!(text.contains("PONG"));
+
+    // Verify Authorization header was stripped before reaching upstream
+    let received = mock_server.received_requests().await.unwrap();
+    assert_eq!(received.len(), 1);
+    assert!(!received[0].headers.contains_key("authorization"));
+}
+
+#[tokio::test]
+async fn test_gateway_configured_gemini_api_key_overrides_bearer() {
+    let mock_server = MockServer::start().await;
+
+    Mock::given(method("POST"))
+        .and(path("/v1beta/models/gemini-4-argon:generateContent"))
+        .and(header("x-goog-api-key", "configured-gemini-key"))
         .respond_with(
             ResponseTemplate::new(200)
                 .insert_header("content-type", "application/json")
                 .set_body_json(serde_json::json!({
-                    "candidates": [{ "content": { "parts": [{ "text": "Response from 2.5-pro" }] } }]
+                    "candidates": [{ "content": { "parts": [{ "text": "GEMINI_API_KEY override OK" }] } }]
                 })),
         )
         .expect(1)
@@ -721,45 +751,28 @@ async fn test_redirect_model_rewrites_matched_and_ignores_unmatched() {
         mock_server.uri(),
         3,
         false,
-        vec!["gemini-3.7-flash:gemini-3.8-flash".to_string()],
+        Some("configured-gemini-key".to_string()),
     )
     .await;
 
     let client = Client::new();
-
-    // 1. Request for gemini-3.7-flash (should be rewritten to gemini-3.8-flash)
-    let res1 = client
+    let res = client
         .post(format!(
-            "{}/v1beta/models/gemini-3.7-flash:streamGenerateContent?alt=sse",
+            "{}/v1beta/models/gemini-4-argon:generateContent",
             proxy_url
         ))
+        .header("Authorization", "Bearer dummy-client-key")
         .header("content-type", "application/json")
         .body(r#"{"contents":[{"parts":[{"text":"Hello"}]}]}"#)
         .send()
         .await
         .unwrap();
 
-    assert_eq!(res1.status(), 200);
-    let text1 = res1.text().await.unwrap();
-    assert!(text1.contains("Response from 3.8-flash"));
-
-    // 2. Request for gemini-2.5-pro (should stay gemini-2.5-pro)
-    let res2 = client
-        .post(format!(
-            "{}/v1beta/models/gemini-2.5-pro:generateContent",
-            proxy_url
-        ))
-        .header("content-type", "application/json")
-        .body(r#"{"contents":[{"parts":[{"text":"Hello"}]}]}"#)
-        .send()
-        .await
-        .unwrap();
-
-    assert_eq!(res2.status(), 200);
-    let body2: serde_json::Value = res2.json().await.unwrap();
+    assert_eq!(res.status(), 200);
+    let body: serde_json::Value = res.json().await.unwrap();
     assert_eq!(
-        body2["candidates"][0]["content"]["parts"][0]["text"],
-        "Response from 2.5-pro"
+        body["candidates"][0]["content"]["parts"][0]["text"],
+        "GEMINI_API_KEY override OK"
     );
 }
 
@@ -768,16 +781,13 @@ fn test_cli_parse_env_vars() {
     use agy_gyro::config::Cli;
     use clap::Parser;
 
-    // Set AGY_GYRO_ environment variables
+    // Set AGY_GYRO_ and GEMINI_API_KEY environment variables
     unsafe {
         std::env::set_var("AGY_GYRO_MAX_RETRIES", "42");
         std::env::set_var("AGY_GYRO_HOST", "0.0.0.0");
         std::env::set_var("AGY_GYRO_AGY_PATH", "/custom/agy");
         std::env::set_var("AGY_GYRO_NO_BUFFER", "true");
-        std::env::set_var(
-            "AGY_GYRO_REDIRECT_MODEL",
-            "gemini-3.7-flash:gemini-3.8-flash,gemini-3.5-flash:gemini-3.8-flash",
-        );
+        std::env::set_var("GEMINI_API_KEY", "env-gemini-key-123");
     }
 
     let cli = Cli::parse_from(["agy-gyro"]);
@@ -788,18 +798,8 @@ fn test_cli_parse_env_vars() {
     assert!(cli.wrapper_args.config.no_buffer);
     assert!(!cli.wrapper_args.config.is_buffer_enabled());
     assert_eq!(
-        cli.wrapper_args.config.redirect_model,
-        vec![
-            "gemini-3.7-flash:gemini-3.8-flash".to_string(),
-            "gemini-3.5-flash:gemini-3.8-flash".to_string()
-        ]
-    );
-    assert_eq!(
-        cli.wrapper_args.config.model_redirects(),
-        vec![
-            ("gemini-3.7-flash", "gemini-3.8-flash"),
-            ("gemini-3.5-flash", "gemini-3.8-flash")
-        ]
+        cli.wrapper_args.config.api_key.as_deref(),
+        Some("env-gemini-key-123")
     );
 
     // Clean up env vars
@@ -808,28 +808,6 @@ fn test_cli_parse_env_vars() {
         std::env::remove_var("AGY_GYRO_HOST");
         std::env::remove_var("AGY_GYRO_AGY_PATH");
         std::env::remove_var("AGY_GYRO_NO_BUFFER");
-        std::env::remove_var("AGY_GYRO_REDIRECT_MODEL");
+        std::env::remove_var("GEMINI_API_KEY");
     }
-}
-
-#[test]
-fn test_cli_parse_redirect_model_flags() {
-    use agy_gyro::config::Cli;
-    use clap::Parser;
-
-    let cli = Cli::parse_from([
-        "agy-gyro",
-        "--redirect-model",
-        "gemini-3.7-flash:gemini-3.8-flash",
-        "--redirect-model",
-        "gemini-3.1-pro:gemini-3.1-pro-preview",
-    ]);
-
-    assert_eq!(
-        cli.wrapper_args.config.model_redirects(),
-        vec![
-            ("gemini-3.7-flash", "gemini-3.8-flash"),
-            ("gemini-3.1-pro", "gemini-3.1-pro-preview")
-        ]
-    );
 }

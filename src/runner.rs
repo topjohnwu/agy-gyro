@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
 
 use crate::config::WrapperArgs;
-use crate::proxy::{ProxyState, build_http_client, create_router};
+use crate::proxy::{ProxyState, build_http_client, create_router, resolve_gateway_models};
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
@@ -61,9 +61,30 @@ pub async fn run_wrapper(wrapper_args: WrapperArgs) -> Result<i32, Box<dyn std::
     let listener = tokio::net::TcpListener::bind(&addr).await?;
     let bound_addr = listener.local_addr()?;
 
-    info!("agy-gyro wrapper proxy listening on http://{}", bound_addr);
+    info!("agy-gyro wrapper gateway listening on http://{}", bound_addr);
+
+    let gateway_api_key = std::env::var("AGY_LLM_GATEWAY_API_KEY")
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+        .or_else(|| {
+            config
+                .api_key
+                .as_ref()
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+        })
+        .unwrap_or_else(|| "agy-gyro".to_string());
 
     let client = build_http_client(&config)?;
+
+    let gateway_models = match std::env::var("AGY_LLM_GATEWAY_MODELS")
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+    {
+        Some(models) => models,
+        None => resolve_gateway_models(&client, &config).await,
+    };
+
     let state = Arc::new(ProxyState::new(config, client));
     let app = create_router(state);
 
@@ -81,7 +102,10 @@ pub async fn run_wrapper(wrapper_args: WrapperArgs) -> Result<i32, Box<dyn std::
 
     let mut cmd = tokio::process::Command::new(&wrapper_args.agy_path);
     cmd.args(&wrapper_args.agy_args)
-        .env("GOOGLE_GEMINI_BASE_URL", &proxy_url)
+        .env("AGY_LLM_GATEWAY_URL", &proxy_url)
+        .env("AGY_LLM_GATEWAY_WIRE_PROTOCOL", "genai")
+        .env("AGY_LLM_GATEWAY_API_KEY", &gateway_api_key)
+        .env("AGY_LLM_GATEWAY_MODELS", &gateway_models)
         .stdin(std::process::Stdio::inherit())
         .stdout(std::process::Stdio::inherit())
         .stderr(std::process::Stdio::inherit());

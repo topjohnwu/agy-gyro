@@ -3,12 +3,36 @@
 use clap::{Args, Parser, Subcommand};
 use std::path::PathBuf;
 
+/// Fallback list of Gemini models if dynamic discovery fails.
+pub const DEFAULT_GATEWAY_MODELS: &[&str] = &["gemini-4-argon", "gemini-3.8-flash"];
+
+/// Effort suffixes expanded for each thinking-capable Gemini model.
+pub const MODEL_EFFORT_LEVELS: &[&str] = &["low", "medium", "high"];
+
+/// Fixed list of older, lite, alias, or specialized-variant Core Gemini Text / Reasoning
+/// models to exclude when dynamically building the model list from `/v1beta/models`.
+pub const EXCLUDED_MODELS: &[&str] = &[
+    "gemini-flash-latest",
+    "gemini-flash-lite-latest",
+    "gemini-pro-latest",
+    "gemini-2.5-flash-lite",
+    "gemini-3-flash-preview",
+    "gemini-3.1-pro-preview",
+    "gemini-3.1-pro-preview-customtools",
+    "gemini-3.1-flash-lite-preview",
+    "gemini-3.1-flash-lite",
+    "gemini-3.5-flash",
+    "gemini-3.5-flash-lite",
+    "gemini-3.6-flash",
+    "gemini-3.7-flash",
+];
+
 #[derive(Parser, Debug, Clone)]
 #[command(
     name = "agy-gyro",
     author,
     version,
-    about = "Gemini API retry proxy and wrapper for Antigravity CLI (agy)"
+    about = "Local Antigravity Enterprise Gateway and Gemini API retry proxy for Antigravity CLI (agy)"
 )]
 pub struct Cli {
     #[command(subcommand)]
@@ -105,9 +129,9 @@ pub struct Config {
     #[arg(long, env = "AGY_GYRO_REQUEST_TIMEOUT_SECS", default_value_t = 600)]
     pub request_timeout_secs: u64,
 
-    /// Redirect model requests in format "FROM:TO" (e.g. "gemini-3.7-flash:gemini-3.8-flash")
-    #[arg(long, env = "AGY_GYRO_REDIRECT_MODEL", value_delimiter = ',')]
-    pub redirect_model: Vec<String>,
+    /// Gemini API key for authenticating upstream requests
+    #[arg(long, env = "GEMINI_API_KEY", hide_env_values = true)]
+    pub api_key: Option<String>,
 }
 
 impl Config {
@@ -117,12 +141,5 @@ impl Config {
 
     pub fn is_buffer_enabled(&self) -> bool {
         !self.no_buffer
-    }
-
-    pub fn model_redirects(&self) -> Vec<(&str, &str)> {
-        self.redirect_model
-            .iter()
-            .filter_map(|s| s.split_once(':'))
-            .collect()
     }
 }

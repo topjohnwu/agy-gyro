@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: MIT
 
-use crate::config::Config;
+use crate::config::{Config, DEFAULT_GATEWAY_MODELS, EXCLUDED_MODELS, MODEL_EFFORT_LEVELS};
 use crate::retry::{
     calculate_backoff, is_retriable_error, is_retriable_status, parse_in_stream_error,
     parse_retry_after,
@@ -14,9 +14,170 @@ use axum::{
     routing::any,
 };
 use futures_util::StreamExt;
+use serde::Deserialize;
 use std::sync::Arc;
 use std::time::Duration;
 use tracing::{debug, error, info, warn};
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GeminiModelsResponse {
+    #[serde(default)]
+    pub models: Vec<GeminiModelInfo>,
+    pub next_page_token: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GeminiModelInfo {
+    pub name: String,
+    #[serde(default)]
+    pub supported_generation_methods: Vec<String>,
+    #[serde(default)]
+    pub thinking: bool,
+}
+
+/// Filters a list of `/v1beta/models` entries to retain only Core Gemini Text / Reasoning
+/// models, excluding [`EXCLUDED_MODELS`], ordered newest-first.
+pub fn filter_core_gemini_models(models: &[GeminiModelInfo]) -> Vec<String> {
+    const NON_TEXT_KEYWORDS: &[&str] = &[
+        "-image",
+        "-banana",
+        "-tts",
+        "-audio",
+        "-live",
+        "-transcribe",
+        "-omni",
+        "-robotics",
+        "-computer-use",
+        "-embedding",
+    ];
+
+    let mut filtered: Vec<String> = models
+        .iter()
+        .filter_map(|m| {
+            let id = m.name.strip_prefix("models/").unwrap_or(&m.name);
+            if !id.starts_with("gemini-") {
+                return None;
+            }
+            if !m.thinking {
+                return None;
+            }
+            if !m
+                .supported_generation_methods
+                .iter()
+                .any(|method| method == "generateContent")
+            {
+                return None;
+            }
+            if NON_TEXT_KEYWORDS.iter().any(|kw| id.contains(kw)) {
+                return None;
+            }
+            if EXCLUDED_MODELS.contains(&id) {
+                return None;
+            }
+            Some(id.to_string())
+        })
+        .collect();
+
+    // The Gemini API returns models oldest-first; reverse so newest models appear first.
+    filtered.reverse();
+    filtered
+}
+
+/// Expands a list of base Gemini model names into a comma-separated list of
+/// effort-suffixed model IDs (`<model>-low`, `<model>-medium`, `<model>-high`).
+pub fn expand_gateway_models<S: AsRef<str>>(models: &[S]) -> String {
+    models
+        .iter()
+        .flat_map(|model| {
+            let base = model.as_ref();
+            MODEL_EFFORT_LEVELS
+                .iter()
+                .map(move |effort| format!("{}-{}", base, effort))
+        })
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+/// Queries `GET {upstream}/v1beta/models` and returns the comma-separated list of
+/// active Core Gemini Text / Reasoning models expanded with effort suffixes
+/// (falling back to [`DEFAULT_GATEWAY_MODELS`] if no API key is available or the request fails).
+pub async fn resolve_gateway_models(client: &reqwest::Client, config: &Config) -> String {
+    let Some(api_key) = config
+        .api_key
+        .as_deref()
+        .map(str::trim)
+        .filter(|k| !k.is_empty())
+    else {
+        debug!("No GEMINI_API_KEY configured; using fallback DEFAULT_GATEWAY_MODELS");
+        return expand_gateway_models(DEFAULT_GATEWAY_MODELS);
+    };
+
+    let upstream_base = config.upstream.trim_end_matches('/');
+    let mut all_models = Vec::new();
+    let mut page_token: Option<String> = None;
+
+    loop {
+        let mut url = format!("{}/v1beta/models?pageSize=100", upstream_base);
+        if let Some(ref token) = page_token {
+            url.push_str("&pageToken=");
+            url.push_str(token);
+        }
+
+        let res = match client
+            .get(&url)
+            .header("x-goog-api-key", api_key)
+            .timeout(Duration::from_secs(10))
+            .send()
+            .await
+        {
+            Ok(res) if res.status().is_success() => res,
+            Ok(res) => {
+                warn!(
+                    "Failed to fetch models from {} (status {}); falling back to default model list",
+                    url,
+                    res.status()
+                );
+                return expand_gateway_models(DEFAULT_GATEWAY_MODELS);
+            }
+            Err(err) => {
+                warn!(
+                    "Error fetching models from {}: {}; falling back to default model list",
+                    url, err
+                );
+                return expand_gateway_models(DEFAULT_GATEWAY_MODELS);
+            }
+        };
+
+        match res.json::<GeminiModelsResponse>().await {
+            Ok(parsed) => {
+                all_models.extend(parsed.models);
+                if let Some(next) = parsed.next_page_token.filter(|t| !t.is_empty()) {
+                    page_token = Some(next);
+                } else {
+                    break;
+                }
+            }
+            Err(err) => {
+                warn!(
+                    "Failed to parse /v1beta/models JSON response: {}; falling back to default model list",
+                    err
+                );
+                return expand_gateway_models(DEFAULT_GATEWAY_MODELS);
+            }
+        }
+    }
+
+    let models = filter_core_gemini_models(&all_models);
+    if models.is_empty() {
+        warn!("No core Gemini models matched filter; falling back to default model list");
+        expand_gateway_models(DEFAULT_GATEWAY_MODELS)
+    } else {
+        info!("Discovered available Gemini models: {}", models.join(","));
+        expand_gateway_models(&models)
+    }
+}
 
 pub struct ProxyState {
     pub config: Config,
@@ -72,30 +233,18 @@ fn is_hop_by_hop(header_name: &HeaderName) -> bool {
     )
 }
 
-/// Rewrites the model identifier in Gemini API paths if it matches any configured redirect rule.
-pub fn rewrite_model_path(path_and_query: &str, redirects: &[(&str, &str)]) -> String {
-    if redirects.is_empty() {
-        return path_and_query.to_string();
-    }
-
-    if let Some(models_idx) = path_and_query.find("/models/") {
-        let prefix_end = models_idx + "/models/".len();
-        let prefix = &path_and_query[..prefix_end];
-        let rest = &path_and_query[prefix_end..];
-
-        let model_end = rest.find([':', '/', '?']).unwrap_or(rest.len());
-
-        if model_end > 0 {
-            let model_name = &rest[..model_end];
-            for &(from, to) in redirects {
-                if model_name == from {
-                    let remainder = &rest[model_end..];
-                    return format!("{}{}{}", prefix, to, remainder);
-                }
-            }
-        }
-    }
-    path_and_query.to_string()
+/// Extracts the Bearer token from an HTTP `Authorization: Bearer <token>` header.
+pub fn extract_bearer_token(headers: &HeaderMap) -> Option<&str> {
+    let val = headers
+        .get(axum::http::header::AUTHORIZATION)?
+        .to_str()
+        .ok()?
+        .trim();
+    let rest = val
+        .strip_prefix("Bearer ")
+        .or_else(|| val.strip_prefix("bearer "))?;
+    let token = rest.trim();
+    if token.is_empty() { None } else { Some(token) }
 }
 
 pub async fn proxy_handler(
@@ -105,26 +254,12 @@ pub async fn proxy_handler(
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
-    let raw_path_and_query = original_uri
+    let path_and_query = original_uri
         .path_and_query()
         .map(|pq| pq.as_str())
         .unwrap_or("/");
 
-    let redirects = state.config.model_redirects();
-    let effective_path = if !redirects.is_empty() {
-        let rewritten = rewrite_model_path(raw_path_and_query, &redirects);
-        if rewritten != raw_path_and_query {
-            debug!(
-                "Redirecting model in request path: {} -> {}",
-                raw_path_and_query, rewritten
-            );
-        }
-        rewritten
-    } else {
-        raw_path_and_query.to_string()
-    };
-
-    let target_url_str = format!("{}{}", state.upstream_base, effective_path);
+    let target_url_str = format!("{}{}", state.upstream_base, path_and_query);
     let target_url = match reqwest::Url::parse(&target_url_str) {
         Ok(url) => url,
         Err(err) => {
@@ -142,6 +277,20 @@ pub async fn proxy_handler(
     let with_jitter = state.config.is_jitter_enabled();
     let max_retries = state.config.max_retries;
 
+    let effective_api_key = state
+        .config
+        .api_key
+        .as_deref()
+        .filter(|k| !k.trim().is_empty())
+        .or_else(|| {
+            headers
+                .get("x-goog-api-key")
+                .and_then(|v| v.to_str().ok())
+                .map(str::trim)
+                .filter(|k| !k.is_empty())
+        })
+        .or_else(|| extract_bearer_token(&headers));
+
     let mut attempt = 0;
 
     loop {
@@ -152,11 +301,18 @@ pub async fn proxy_handler(
 
         let mut req_builder = state.client.request(method.clone(), target_url.clone());
 
-        // Forward headers
+        // Forward headers, stripping hop-by-hop and gateway Authorization header
         for (header_name, header_val) in headers.iter() {
-            if !is_hop_by_hop(header_name) {
+            if !is_hop_by_hop(header_name)
+                && header_name != axum::http::header::AUTHORIZATION
+                && header_name.as_str() != "x-goog-api-key"
+            {
                 req_builder = req_builder.header(header_name, header_val);
             }
+        }
+
+        if let Some(api_key) = effective_api_key {
+            req_builder = req_builder.header("x-goog-api-key", api_key);
         }
 
         // Set request body
@@ -498,5 +654,84 @@ pub async fn proxy_handler(
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::http::HeaderValue;
+
+    #[test]
+    fn test_expand_gateway_models() {
+        assert_eq!(
+            expand_gateway_models(&["model-a", "model-b"]),
+            "model-a-low,model-a-medium,model-a-high,model-b-low,model-b-medium,model-b-high"
+        );
+    }
+
+    #[test]
+    fn test_filter_core_gemini_models() {
+        let models = vec![
+            GeminiModelInfo {
+                name: format!("models/{}", EXCLUDED_MODELS[0]),
+                supported_generation_methods: vec!["generateContent".to_string()],
+                thinking: true,
+            },
+            GeminiModelInfo {
+                name: "models/gemini-2.0-flash".to_string(), // thinking == false
+                supported_generation_methods: vec!["generateContent".to_string()],
+                thinking: false,
+            },
+            GeminiModelInfo {
+                name: "models/gemini-99-flash".to_string(),
+                supported_generation_methods: vec!["generateContent".to_string()],
+                thinking: true,
+            },
+            GeminiModelInfo {
+                name: "models/gemini-99-pro".to_string(),
+                supported_generation_methods: vec!["generateContent".to_string()],
+                thinking: true,
+            },
+            GeminiModelInfo {
+                name: "models/gemini-99-flash-image".to_string(), // non-text (-image)
+                supported_generation_methods: vec!["generateContent".to_string()],
+                thinking: true,
+            },
+            GeminiModelInfo {
+                name: "models/gemma-3-27b-it".to_string(), // non-gemini
+                supported_generation_methods: vec!["generateContent".to_string()],
+                thinking: true,
+            },
+        ];
+
+        assert_eq!(
+            filter_core_gemini_models(&models),
+            vec!["gemini-99-pro", "gemini-99-flash"]
+        );
+    }
+
+    #[test]
+    fn test_extract_bearer_token() {
+        let mut headers = HeaderMap::new();
+        assert_eq!(extract_bearer_token(&headers), None);
+
+        headers.insert(
+            axum::http::header::AUTHORIZATION,
+            HeaderValue::from_static("Bearer secret-token-123"),
+        );
+        assert_eq!(extract_bearer_token(&headers), Some("secret-token-123"));
+
+        headers.insert(
+            axum::http::header::AUTHORIZATION,
+            HeaderValue::from_static("bearer   trimmed-token  "),
+        );
+        assert_eq!(extract_bearer_token(&headers), Some("trimmed-token"));
+
+        headers.insert(
+            axum::http::header::AUTHORIZATION,
+            HeaderValue::from_static("Basic dXNlcjpwYXNz"),
+        );
+        assert_eq!(extract_bearer_token(&headers), None);
     }
 }

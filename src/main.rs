@@ -39,7 +39,7 @@ async fn run_server(server_args: ServerArgs) -> Result<(), Box<dyn std::error::E
     let mut config = server_args.config;
     config.port = Some(port);
 
-    info!("Starting agy-gyro proxy server");
+    info!("Starting agy-gyro local Antigravity Enterprise Gateway server");
     info!("Upstream URL: {}", config.upstream);
     info!(
         "Retry configuration: max_retries={}, initial_delay_ms={}ms, max_delay_ms={}ms, jitter={}",
@@ -50,6 +50,7 @@ async fn run_server(server_args: ServerArgs) -> Result<(), Box<dyn std::error::E
     );
 
     let client = agy_gyro::proxy::build_http_client(&config)?;
+    let gateway_models = agy_gyro::proxy::resolve_gateway_models(&client, &config).await;
     let state = Arc::new(ProxyState::new(config.clone(), client));
 
     let app = create_router(state);
@@ -57,10 +58,10 @@ async fn run_server(server_args: ServerArgs) -> Result<(), Box<dyn std::error::E
     let addr = format!("{}:{}", config.host, port);
     let listener = tokio::net::TcpListener::bind(&addr).await?;
 
-    info!("agy-gyro proxy listening on http://{}", addr);
+    info!("agy-gyro gateway listening on http://{}", addr);
     info!(
-        "To use with Antigravity CLI, run:\n  export GOOGLE_GEMINI_BASE_URL=http://{}\n",
-        addr
+        "To use with Antigravity CLI, run:\n  export AGY_LLM_GATEWAY_URL=http://{}\n  export AGY_LLM_GATEWAY_WIRE_PROTOCOL=genai\n  export AGY_LLM_GATEWAY_API_KEY=\"${{GEMINI_API_KEY:-agy-gyro}}\"\n  export AGY_LLM_GATEWAY_MODELS=\"{}\"\n",
+        addr, gateway_models
     );
 
     axum::serve(listener, app)
