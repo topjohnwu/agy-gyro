@@ -493,8 +493,15 @@ async fn test_run_wrapper_executes_child_and_propagates_exit_code() {
         log_file: None,
         agy_args: vec![
             "-c".to_string(),
-            r#"test -n "$AGY_LLM_GATEWAY_URL" && test "$AGY_LLM_GATEWAY_WIRE_PROTOCOL" = "genai" && test -n "$AGY_LLM_GATEWAY_API_KEY" && test -n "$AGY_LLM_GATEWAY_MODELS" && exit 42"#
-                .to_string(),
+            r#"
+                test -n "$AGY_LLM_GATEWAY_URL" &&
+                test "$AGY_LLM_GATEWAY_WIRE_PROTOCOL" = "genai" &&
+                test -n "$AGY_LLM_GATEWAY_API_KEY" &&
+                test -n "$AGY_LLM_GATEWAY_MODELS" &&
+                test "$AGY_ENABLE_HUB" = "1" &&
+                exit 42
+            "#
+            .to_string(),
         ],
     };
 

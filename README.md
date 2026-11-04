@@ -65,7 +65,7 @@ Prebuilt executables for Linux, macOS, and Windows are also available in the [la
 
 ### Mode 1: Wrapper Mode (Default)
 
-Running `agy-gyro` without subcommands automatically starts an in-process Enterprise Gateway server on a dynamic TCP port (`127.0.0.1:0`), configures `AGY_LLM_GATEWAY_URL`, `AGY_LLM_GATEWAY_WIRE_PROTOCOL=genai`, `AGY_LLM_GATEWAY_API_KEY`, and `AGY_LLM_GATEWAY_MODELS`, and launches `agy`.
+Running `agy-gyro` without subcommands automatically starts an in-process Enterprise Gateway server on a dynamic TCP port (`127.0.0.1:0`), configures `AGY_LLM_GATEWAY_URL`, `AGY_LLM_GATEWAY_WIRE_PROTOCOL=genai`, `AGY_LLM_GATEWAY_API_KEY`, `AGY_LLM_GATEWAY_MODELS`, and `AGY_ENABLE_HUB=1`, and launches `agy`.
 
 ```bash
 # Simply launch agy wrapped with agy-gyro gateway:
@@ -115,6 +115,22 @@ agy-gyro
 ```
 
 `agy-gyro` handles local gateway startup, dynamic port binding, `AGY_LLM_GATEWAY_*` environment variable setup, protocol translation, and signal forwarding seamlessly!
+
+### Antigravity Hub Web UI (`--hub`)
+
+`agy-gyro` automatically exports `AGY_ENABLE_HUB=1` in wrapper mode, unlocking Antigravity's local Hub web interface (which requires Enterprise Gateway mode):
+
+```bash
+agy-gyro -- --hub [--hub-port 4400]
+```
+
+Once the server is running, open the Hub UI in your browser with `?useWebSocket=true`:
+
+```text
+http://localhost:4400/?useWebSocket=true
+```
+
+> **Important**: Always include `?useWebSocket=true` when accessing the Hub UI over `http://localhost:4400`. Without it, the web UI opens multiple long-lived HTTP/1.1 streaming RPCs that exhaust the browser's 6-connection-per-origin limit and cause the UI to stall when switching or starting conversations. With `?useWebSocket=true`, all RPC streams are multiplexed over a single WebSocket connection.
 
 ## Streaming & Error Recovery Behavior
 
