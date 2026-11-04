@@ -32,7 +32,8 @@ pub const EXCLUDED_MODELS: &[&str] = &[
     name = "agy-gyro",
     author,
     version,
-    about = "Local Antigravity Enterprise Gateway and Gemini API retry proxy for Antigravity CLI (agy)"
+    about = "Local Antigravity Enterprise Gateway and Gemini API retry proxy for Antigravity CLI (agy)",
+    subcommand_negates_reqs = true
 )]
 pub struct Cli {
     #[command(subcommand)]
@@ -130,8 +131,15 @@ pub struct Config {
     pub request_timeout_secs: u64,
 
     /// Gemini API key for authenticating upstream requests
-    #[arg(long, env = "GEMINI_API_KEY", hide_env_values = true)]
-    pub api_key: Option<String>,
+    #[arg(
+        long,
+        env = "GEMINI_API_KEY",
+        hide_env_values = true,
+        required = true,
+        default_value = "",
+        hide_default_value = true
+    )]
+    pub api_key: String,
 }
 
 impl Config {

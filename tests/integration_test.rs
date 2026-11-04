@@ -26,7 +26,7 @@ async fn spawn_test_proxy_opts(upstream_url: String, max_retries: u32, no_buffer
         no_jitter: true,
         no_buffer,
         request_timeout_secs: 10,
-        api_key: None,
+        api_key: String::new(),
     };
 
     let client = Client::builder()
@@ -244,10 +244,11 @@ fn test_cli_parse_server_command() {
     use agy_gyro::config::{Cli, Commands};
     use clap::Parser;
 
-    let cli = Cli::parse_from(["agy-gyro", "server", "-p", "9090"]);
+    let cli = Cli::parse_from(["agy-gyro", "server", "-p", "9090", "--api-key", "test-key"]);
     assert!(matches!(cli.command, Some(Commands::Server(_))));
     if let Some(Commands::Server(server_args)) = cli.command {
         assert_eq!(server_args.resolved_port(), 9090);
+        assert_eq!(server_args.config.api_key, "test-key");
     }
 }
 
@@ -258,6 +259,8 @@ fn test_cli_parse_wrapper_default_and_passthrough() {
 
     let cli = Cli::parse_from([
         "agy-gyro",
+        "--api-key",
+        "test-key",
         "--log-file",
         "/tmp/test.log",
         "--",
@@ -266,6 +269,7 @@ fn test_cli_parse_wrapper_default_and_passthrough() {
     ]);
 
     assert!(cli.command.is_none());
+    assert_eq!(cli.wrapper_args.config.api_key, "test-key");
     assert_eq!(
         cli.wrapper_args
             .log_file
@@ -476,18 +480,20 @@ async fn test_run_wrapper_executes_child_and_propagates_exit_code() {
     use agy_gyro::config::{Config, WrapperArgs};
     use agy_gyro::runner::run_wrapper;
 
+    let mock_server = MockServer::start().await;
+
     let wrapper_args = WrapperArgs {
         config: Config {
             host: "127.0.0.1".to_string(),
             port: Some(0),
-            upstream: "https://generativelanguage.googleapis.com".to_string(),
+            upstream: mock_server.uri(),
             max_retries: 3,
             initial_delay_ms: 10,
             max_delay_ms: 100,
             no_jitter: true,
             no_buffer: false,
             request_timeout_secs: 10,
-            api_key: None,
+            api_key: "test-gemini-key".to_string(),
         },
         agy_path: "sh".to_string(),
         log_file: None,
@@ -496,7 +502,7 @@ async fn test_run_wrapper_executes_child_and_propagates_exit_code() {
             r#"
                 test -n "$AGY_LLM_GATEWAY_URL" &&
                 test "$AGY_LLM_GATEWAY_WIRE_PROTOCOL" = "genai" &&
-                test -n "$AGY_LLM_GATEWAY_API_KEY" &&
+                test "$AGY_LLM_GATEWAY_API_KEY" = "test-gemini-key" &&
                 test -n "$AGY_LLM_GATEWAY_MODELS" &&
                 test "$AGY_ENABLE_HUB" = "1" &&
                 exit 42
@@ -560,7 +566,7 @@ async fn test_resolve_gateway_models_fetches_and_expands_models() {
         no_jitter: true,
         no_buffer: false,
         request_timeout_secs: 10,
-        api_key: Some("my-gemini-api-key".to_string()),
+        api_key: "my-gemini-api-key".to_string(),
     };
 
     let client = Client::new();
@@ -618,6 +624,12 @@ fn test_cli_parse_env_vars() {
     use agy_gyro::config::Cli;
     use clap::Parser;
 
+    unsafe {
+        std::env::remove_var("GEMINI_API_KEY");
+    }
+    assert!(Cli::try_parse_from(["agy-gyro"]).is_err());
+    assert!(Cli::try_parse_from(["agy-gyro", "server"]).is_err());
+
     // Set AGY_GYRO_ and GEMINI_API_KEY environment variables
     unsafe {
         std::env::set_var("AGY_GYRO_MAX_RETRIES", "42");
@@ -634,10 +646,7 @@ fn test_cli_parse_env_vars() {
     assert_eq!(cli.wrapper_args.agy_path, "/custom/agy");
     assert!(cli.wrapper_args.config.no_buffer);
     assert!(!cli.wrapper_args.config.is_buffer_enabled());
-    assert_eq!(
-        cli.wrapper_args.config.api_key.as_deref(),
-        Some("env-gemini-key-123")
-    );
+    assert_eq!(cli.wrapper_args.config.api_key, "env-gemini-key-123");
 
     // Clean up env vars
     unsafe {

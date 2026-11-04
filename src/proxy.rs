@@ -102,18 +102,9 @@ pub fn expand_gateway_models<S: AsRef<str>>(models: &[S]) -> String {
 
 /// Queries `GET {upstream}/v1beta/models` and returns the comma-separated list of
 /// active Core Gemini Text / Reasoning models expanded with effort suffixes
-/// (falling back to [`DEFAULT_GATEWAY_MODELS`] if no API key is available or the request fails).
+/// (falling back to [`DEFAULT_GATEWAY_MODELS`] if the request fails).
 pub async fn resolve_gateway_models(client: &reqwest::Client, config: &Config) -> String {
-    let Some(api_key) = config
-        .api_key
-        .as_deref()
-        .map(str::trim)
-        .filter(|k| !k.is_empty())
-    else {
-        debug!("No GEMINI_API_KEY configured; using fallback DEFAULT_GATEWAY_MODELS");
-        return expand_gateway_models(DEFAULT_GATEWAY_MODELS);
-    };
-
+    let api_key = config.api_key.trim();
     let upstream_base = config.upstream.trim_end_matches('/');
     let mut all_models = Vec::new();
     let mut page_token: Option<String> = None;
@@ -277,11 +268,8 @@ pub async fn proxy_handler(
     let with_jitter = state.config.is_jitter_enabled();
     let max_retries = state.config.max_retries;
 
-    let effective_api_key = state
-        .config
-        .api_key
-        .as_deref()
-        .filter(|k| !k.trim().is_empty())
+    let effective_api_key = Some(state.config.api_key.trim())
+        .filter(|k| !k.is_empty())
         .or_else(|| {
             headers
                 .get("x-goog-api-key")

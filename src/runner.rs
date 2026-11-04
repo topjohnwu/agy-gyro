@@ -69,14 +69,7 @@ pub async fn run_wrapper(wrapper_args: WrapperArgs) -> Result<i32, Box<dyn std::
     let gateway_api_key = std::env::var("AGY_LLM_GATEWAY_API_KEY")
         .ok()
         .filter(|s| !s.trim().is_empty())
-        .or_else(|| {
-            config
-                .api_key
-                .as_ref()
-                .map(|s| s.trim().to_string())
-                .filter(|s| !s.is_empty())
-        })
-        .unwrap_or_else(|| "agy-gyro".to_string());
+        .unwrap_or_else(|| config.api_key.trim().to_string());
 
     let client = build_http_client(&config)?;
 

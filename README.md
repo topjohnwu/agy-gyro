@@ -93,7 +93,7 @@ agy-gyro server --port 8080
 | `-H`, `--host`           | `AGY_GYRO_HOST`                 | `127.0.0.1`                                 | Host address to bind the gateway server                 |
 | `-p`, `--port`           | `AGY_GYRO_PORT`                 | `0` (wrapper) / `8080` (server)             | Port to listen on (`0` = OS-assigned free port)         |
 | `-u`, `--upstream`       | `AGY_GYRO_UPSTREAM_URL`         | `https://generativelanguage.googleapis.com` | Target upstream Gemini API base URL                     |
-| `--api-key`              | `GEMINI_API_KEY`                | _None_                                      | Gemini API key for authenticating upstream requests     |
+| `--api-key`              | `GEMINI_API_KEY`                | _Required_                                  | Gemini API key for authenticating upstream requests     |
 | `--agy-path`             | `AGY_GYRO_AGY_PATH`             | `agy`                                       | Executable path for Antigravity CLI                     |
 | `--log-file`             | `AGY_GYRO_LOG_FILE`             | _None_                                      | Path to log file for proxy tracing logs in wrapper mode |
 | `--max-retries`          | `AGY_GYRO_MAX_RETRIES`          | `15`                                        | Maximum number of retry attempts for retriable errors   |
