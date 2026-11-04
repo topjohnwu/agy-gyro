@@ -61,7 +61,10 @@ pub async fn run_wrapper(wrapper_args: WrapperArgs) -> Result<i32, Box<dyn std::
     let listener = tokio::net::TcpListener::bind(&addr).await?;
     let bound_addr = listener.local_addr()?;
 
-    info!("agy-gyro wrapper gateway listening on http://{}", bound_addr);
+    info!(
+        "agy-gyro wrapper gateway listening on http://{}",
+        bound_addr
+    );
 
     let gateway_api_key = std::env::var("AGY_LLM_GATEWAY_API_KEY")
         .ok()

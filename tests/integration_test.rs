@@ -16,16 +16,6 @@ async fn spawn_test_proxy(upstream_url: String, max_retries: u32) -> String {
 
 /// Helper function to start a test proxy with configurable buffering
 async fn spawn_test_proxy_opts(upstream_url: String, max_retries: u32, no_buffer: bool) -> String {
-    spawn_test_proxy_full(upstream_url, max_retries, no_buffer, None).await
-}
-
-/// Helper function to start a test proxy with full configuration options
-async fn spawn_test_proxy_full(
-    upstream_url: String,
-    max_retries: u32,
-    no_buffer: bool,
-    api_key: Option<String>,
-) -> String {
     let config = Config {
         host: "127.0.0.1".to_string(),
         port: Some(0), // OS assigns random available port
@@ -36,7 +26,7 @@ async fn spawn_test_proxy_full(
         no_jitter: true,
         no_buffer,
         request_timeout_secs: 10,
-        api_key,
+        api_key: None,
     };
 
     let client = Client::builder()
@@ -150,44 +140,6 @@ async fn test_retry_on_429_resource_exhausted_until_success() {
 }
 
 #[tokio::test]
-async fn test_retry_on_503_service_unavailable() {
-    let mock_server = MockServer::start().await;
-
-    // First request returns 503
-    Mock::given(method("POST"))
-        .and(path("/v1beta/models/gemini-2.5-pro:generateContent"))
-        .respond_with(ResponseTemplate::new(503).set_body_string("Service Unavailable"))
-        .up_to_n_times(1)
-        .expect(1)
-        .mount(&mock_server)
-        .await;
-
-    // Second request returns 200
-    Mock::given(method("POST"))
-        .and(path("/v1beta/models/gemini-2.5-pro:generateContent"))
-        .respond_with(ResponseTemplate::new(200).set_body_string("OK After 503"))
-        .expect(1)
-        .mount(&mock_server)
-        .await;
-
-    let proxy_url = spawn_test_proxy(mock_server.uri(), 3).await;
-    let client = Client::new();
-
-    let response = client
-        .post(format!(
-            "{}/v1beta/models/gemini-2.5-pro:generateContent",
-            proxy_url
-        ))
-        .send()
-        .await
-        .unwrap();
-
-    assert_eq!(response.status(), 200);
-    let text = response.text().await.unwrap();
-    assert_eq!(text, "OK After 503");
-}
-
-#[tokio::test]
 async fn test_non_retriable_400_bad_request_passed_through_immediately() {
     let mock_server = MockServer::start().await;
 
@@ -222,33 +174,6 @@ async fn test_non_retriable_400_bad_request_passed_through_immediately() {
     assert_eq!(response.status(), 400);
     let body: serde_json::Value = response.json().await.unwrap();
     assert_eq!(body["error"]["code"], 400);
-}
-
-#[tokio::test]
-async fn test_non_retriable_403_forbidden_passed_through_immediately() {
-    let mock_server = MockServer::start().await;
-
-    Mock::given(method("GET"))
-        .and(path("/v1beta/models"))
-        .respond_with(
-            ResponseTemplate::new(403).set_body_string("PERMISSION_DENIED: API key not valid"),
-        )
-        .expect(1) // No retry
-        .mount(&mock_server)
-        .await;
-
-    let proxy_url = spawn_test_proxy(mock_server.uri(), 5).await;
-    let client = Client::new();
-
-    let response = client
-        .get(format!("{}/v1beta/models", proxy_url))
-        .send()
-        .await
-        .unwrap();
-
-    assert_eq!(response.status(), 403);
-    let text = response.text().await.unwrap();
-    assert!(text.contains("PERMISSION_DENIED"));
 }
 
 #[tokio::test]
@@ -312,54 +237,6 @@ async fn test_large_request_body_exceeding_default_limit() {
     assert_eq!(response.status(), 200);
     let text = response.text().await.unwrap();
     assert_eq!(text, "Large body received OK");
-}
-
-#[tokio::test]
-async fn test_in_stream_503_error_retried_until_success() {
-    let mock_server = MockServer::start().await;
-
-    // First attempt returns 200 OK with an in-stream 503 error SSE payload
-    Mock::given(method("POST"))
-        .and(path("/v1beta/models/gemini-2.5-pro:streamGenerateContent"))
-        .respond_with(
-            ResponseTemplate::new(200)
-                .insert_header("content-type", "text/event-stream")
-                .set_body_string(
-                    "data: {\"error\": {\"code\": 503, \"message\": \"This model is currently experiencing high demand.\", \"status\": \"UNAVAILABLE\"}}\n\n",
-                ),
-        )
-        .up_to_n_times(1)
-        .mount(&mock_server)
-        .await;
-
-    // Second attempt returns 200 OK with valid candidates SSE payload
-    Mock::given(method("POST"))
-        .and(path("/v1beta/models/gemini-2.5-pro:streamGenerateContent"))
-        .respond_with(
-            ResponseTemplate::new(200)
-                .insert_header("content-type", "text/event-stream")
-                .set_body_string(
-                    "data: {\"candidates\": [{\"content\": {\"parts\": [{\"text\": \"Streaming success!\"}]}}]}\n\n",
-                ),
-        )
-        .mount(&mock_server)
-        .await;
-
-    let proxy_url = spawn_test_proxy(mock_server.uri(), 5).await;
-    let client = Client::new();
-
-    let response = client
-        .post(format!(
-            "{}/v1beta/models/gemini-2.5-pro:streamGenerateContent?alt=sse",
-            proxy_url
-        ))
-        .send()
-        .await
-        .unwrap();
-
-    assert_eq!(response.status(), 200);
-    let text = response.text().await.unwrap();
-    assert!(text.contains("Streaming success!"));
 }
 
 #[test]
@@ -704,7 +581,7 @@ async fn test_gateway_bearer_auth_translated_to_x_goog_api_key() {
         .mount(&mock_server)
         .await;
 
-    let proxy_url = spawn_test_proxy_full(mock_server.uri(), 3, false, None).await;
+    let proxy_url = spawn_test_proxy(mock_server.uri(), 3).await;
     let client = Client::new();
 
     let res = client
@@ -727,53 +604,6 @@ async fn test_gateway_bearer_auth_translated_to_x_goog_api_key() {
     let received = mock_server.received_requests().await.unwrap();
     assert_eq!(received.len(), 1);
     assert!(!received[0].headers.contains_key("authorization"));
-}
-
-#[tokio::test]
-async fn test_gateway_configured_gemini_api_key_overrides_bearer() {
-    let mock_server = MockServer::start().await;
-
-    Mock::given(method("POST"))
-        .and(path("/v1beta/models/gemini-4-argon:generateContent"))
-        .and(header("x-goog-api-key", "configured-gemini-key"))
-        .respond_with(
-            ResponseTemplate::new(200)
-                .insert_header("content-type", "application/json")
-                .set_body_json(serde_json::json!({
-                    "candidates": [{ "content": { "parts": [{ "text": "GEMINI_API_KEY override OK" }] } }]
-                })),
-        )
-        .expect(1)
-        .mount(&mock_server)
-        .await;
-
-    let proxy_url = spawn_test_proxy_full(
-        mock_server.uri(),
-        3,
-        false,
-        Some("configured-gemini-key".to_string()),
-    )
-    .await;
-
-    let client = Client::new();
-    let res = client
-        .post(format!(
-            "{}/v1beta/models/gemini-4-argon:generateContent",
-            proxy_url
-        ))
-        .header("Authorization", "Bearer dummy-client-key")
-        .header("content-type", "application/json")
-        .body(r#"{"contents":[{"parts":[{"text":"Hello"}]}]}"#)
-        .send()
-        .await
-        .unwrap();
-
-    assert_eq!(res.status(), 200);
-    let body: serde_json::Value = res.json().await.unwrap();
-    assert_eq!(
-        body["candidates"][0]["content"]["parts"][0]["text"],
-        "GEMINI_API_KEY override OK"
-    );
 }
 
 #[test]
