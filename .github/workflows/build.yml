@@ -96,7 +96,7 @@ jobs:
 
   macos:
     name: Build for macOS (Universal)
-    runs-on: macos-latest
+    runs-on: macos-26
 
     steps:
       - name: Check out
