@@ -58,10 +58,21 @@ async fn run_server(server_args: ServerArgs) -> Result<(), Box<dyn std::error::E
     let addr = format!("{}:{}", config.host, port);
     let listener = tokio::net::TcpListener::bind(&addr).await?;
 
+    let model_list: Vec<_> = gateway_models
+        .split(',')
+        .filter(|m| !m.is_empty())
+        .map(|m| format!("      {{ \"modelId\": \"{}\" }}", m))
+        .collect();
+
     info!("agy-gyro gateway listening on http://{}", addr);
     info!(
-        "To use with Antigravity CLI, run:\n  export AGY_LLM_GATEWAY_URL=http://{}\n  export AGY_LLM_GATEWAY_WIRE_PROTOCOL=genai\n  export AGY_LLM_GATEWAY_API_KEY=agy-gyro\n  export AGY_LLM_GATEWAY_MODELS=\"{}\"\n",
+        "To configure via environment variables:\n  export AGY_LLM_GATEWAY_URL=http://{}\n  export AGY_LLM_GATEWAY_WIRE_PROTOCOL=genai\n  export AGY_LLM_GATEWAY_API_KEY=agy-gyro\n  export AGY_LLM_GATEWAY_MODELS=\"{}\"\n",
         addr, gateway_models
+    );
+    info!(
+        "To configure via ~/.gemini/config/config.json:\n{{\n  \"gateway\": {{\n    \"enabled\": true,\n    \"url\": \"http://{}\",\n    \"apiKey\": \"agy-gyro\",\n    \"wireProtocol\": \"genai\"\n  }},\n  \"models\": {{\n    \"list\": [\n{}\n    ]\n  }}\n}}\n",
+        addr,
+        model_list.join(",\n")
     );
 
     axum::serve(listener, app)
