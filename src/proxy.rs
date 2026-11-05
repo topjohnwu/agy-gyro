@@ -224,20 +224,6 @@ fn is_hop_by_hop(header_name: &HeaderName) -> bool {
     )
 }
 
-/// Extracts the Bearer token from an HTTP `Authorization: Bearer <token>` header.
-pub fn extract_bearer_token(headers: &HeaderMap) -> Option<&str> {
-    let val = headers
-        .get(axum::http::header::AUTHORIZATION)?
-        .to_str()
-        .ok()?
-        .trim();
-    let rest = val
-        .strip_prefix("Bearer ")
-        .or_else(|| val.strip_prefix("bearer "))?;
-    let token = rest.trim();
-    if token.is_empty() { None } else { Some(token) }
-}
-
 pub async fn proxy_handler(
     State(state): State<Arc<ProxyState>>,
     method: Method,
@@ -267,17 +253,7 @@ pub async fn proxy_handler(
     let max_delay = Duration::from_millis(state.config.max_delay_ms);
     let with_jitter = state.config.is_jitter_enabled();
     let max_retries = state.config.max_retries;
-
-    let effective_api_key = Some(state.config.api_key.trim())
-        .filter(|k| !k.is_empty())
-        .or_else(|| {
-            headers
-                .get("x-goog-api-key")
-                .and_then(|v| v.to_str().ok())
-                .map(str::trim)
-                .filter(|k| !k.is_empty())
-        })
-        .or_else(|| extract_bearer_token(&headers));
+    let api_key = state.config.api_key.trim();
 
     let mut attempt = 0;
 
@@ -299,9 +275,7 @@ pub async fn proxy_handler(
             }
         }
 
-        if let Some(api_key) = effective_api_key {
-            req_builder = req_builder.header("x-goog-api-key", api_key);
-        }
+        req_builder = req_builder.header("x-goog-api-key", api_key);
 
         // Set request body
         req_builder = req_builder.body(body.clone());

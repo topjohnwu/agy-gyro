@@ -15,9 +15,7 @@
 
 While Antigravity supports a Gemini API key mode (`"modelProvider": "gemini"`), many first-class features and latest models are incomplete or unavailable in that mode.
 
-By contrast, [Antigravity Enterprise Gateway](https://docs.cloud.google.com/gemini/enterprise/docs/ai-developer-tools/deploy-enterprise-gateway) is a first-class integration mode across `agy` and IDE extensions. `agy-gyro` acts as a local Enterprise Gateway server that translates the `genai` gateway wire protocol to standard Gemini API endpoints:
-- **Authentication Translation**: Converts incoming `Authorization: Bearer <KEY>` gateway headers into `x-goog-api-key: <GEMINI_API_KEY>` required by `generativelanguage.googleapis.com`.
-- **Dynamic Model Discovery**: Queries `/v1beta/models` to discover available Core Gemini Text / Reasoning models (filtering out legacy/lite/alias variants and expanding effort levels) so newly released Gemini models become available in `agy` automatically.
+By contrast, [Antigravity Enterprise Gateway](https://docs.cloud.google.com/gemini/enterprise/docs/ai-developer-tools/deploy-enterprise-gateway) is a first-class integration mode across `agy` and IDE extensions. `agy-gyro` acts as a local Enterprise Gateway server that translates the `genai` gateway wire protocol to standard Gemini API endpoints and dynamically queries `/v1beta/models` to discover available Core Gemini Text / Reasoning models (filtering out legacy/lite/alias variants and expanding effort levels) so newly released Gemini models become available in `agy` automatically.
 
 ### 2. Transient API Errors & Lack of Retries
 
@@ -42,10 +40,10 @@ By default, the Antigravity CLI (`agy`) does not implement automatic retry loops
 | Antigravity CLI  |   Wire Protocol     |      agy-gyro       |  (x-goog-api-key)   |          Google Gemini API          |
 |      (agy)       | ------------------> | (127.0.0.1:8080)    | ------------------> | (generativelanguage.googleapis.com) |
 |                  |                     |                     |                     |                                     |
-| Sends prompt or  |                     | 1. Translates auth  |                     | Evaluates request:                  |
-| stream request   |                     |    & gateway paths  |                     | - 429 / 503 / 500 / 504             |
-|                  |                     | 2. Retries on error | <------------------ |   -> Proxy handles backoff + retry  |
-| Receives 200 OK  | <------------------ | 3. Streams response | <------------------ | - 200 OK                            |
+| Sends prompt or  |                     | 1. Buffers req body |                     | Evaluates request:                  |
+| stream request   |                     | 2. Forwards request |                     | - 429 / 503 / 500 / 504             |
+|                  |                     | 3. Retries on error | <------------------ |   -> Proxy handles backoff + retry  |
+| Receives 200 OK  | <------------------ | 4. Streams response | <------------------ | - 200 OK                            |
 +------------------+                     +---------------------+                     +-------------------------------------+
 ```
 

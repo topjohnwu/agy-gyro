@@ -60,7 +60,7 @@ async fn run_server(server_args: ServerArgs) -> Result<(), Box<dyn std::error::E
 
     info!("agy-gyro gateway listening on http://{}", addr);
     info!(
-        "To use with Antigravity CLI, run:\n  export AGY_LLM_GATEWAY_URL=http://{}\n  export AGY_LLM_GATEWAY_WIRE_PROTOCOL=genai\n  export AGY_LLM_GATEWAY_API_KEY=\"$GEMINI_API_KEY\"\n  export AGY_LLM_GATEWAY_MODELS=\"{}\"\n",
+        "To use with Antigravity CLI, run:\n  export AGY_LLM_GATEWAY_URL=http://{}\n  export AGY_LLM_GATEWAY_WIRE_PROTOCOL=genai\n  export AGY_LLM_GATEWAY_API_KEY=agy-gyro\n  export AGY_LLM_GATEWAY_MODELS=\"{}\"\n",
         addr, gateway_models
     );
 

@@ -66,11 +66,6 @@ pub async fn run_wrapper(wrapper_args: WrapperArgs) -> Result<i32, Box<dyn std::
         bound_addr
     );
 
-    let gateway_api_key = std::env::var("AGY_LLM_GATEWAY_API_KEY")
-        .ok()
-        .filter(|s| !s.trim().is_empty())
-        .unwrap_or_else(|| config.api_key.trim().to_string());
-
     let client = build_http_client(&config)?;
 
     let gateway_models = match std::env::var("AGY_LLM_GATEWAY_MODELS")
@@ -100,7 +95,7 @@ pub async fn run_wrapper(wrapper_args: WrapperArgs) -> Result<i32, Box<dyn std::
     cmd.args(&wrapper_args.agy_args)
         .env("AGY_LLM_GATEWAY_URL", &proxy_url)
         .env("AGY_LLM_GATEWAY_WIRE_PROTOCOL", "genai")
-        .env("AGY_LLM_GATEWAY_API_KEY", &gateway_api_key)
+        .env("AGY_LLM_GATEWAY_API_KEY", "agy-gyro")
         .env("AGY_LLM_GATEWAY_MODELS", &gateway_models)
         .env("AGY_ENABLE_HUB", "1")
         .stdin(std::process::Stdio::inherit())

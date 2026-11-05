@@ -26,7 +26,7 @@ async fn spawn_test_proxy_opts(upstream_url: String, max_retries: u32, no_buffer
         no_jitter: true,
         no_buffer,
         request_timeout_secs: 10,
-        api_key: String::new(),
+        api_key: "test-key-123".to_string(),
     };
 
     let client = Client::builder()
@@ -502,7 +502,7 @@ async fn test_run_wrapper_executes_child_and_propagates_exit_code() {
             r#"
                 test -n "$AGY_LLM_GATEWAY_URL" &&
                 test "$AGY_LLM_GATEWAY_WIRE_PROTOCOL" = "genai" &&
-                test "$AGY_LLM_GATEWAY_API_KEY" = "test-gemini-key" &&
+                test "$AGY_LLM_GATEWAY_API_KEY" = "agy-gyro" &&
                 test -n "$AGY_LLM_GATEWAY_MODELS" &&
                 test "$AGY_ENABLE_HUB" = "1" &&
                 exit 42
@@ -584,7 +584,7 @@ async fn test_gateway_bearer_auth_translated_to_x_goog_api_key() {
     Mock::given(method("POST"))
         .and(path("/v1beta/models/gemini-3.8-flash:streamGenerateContent"))
         .and(query_param("alt", "sse"))
-        .and(header("x-goog-api-key", "gateway-bearer-key-xyz"))
+        .and(header("x-goog-api-key", "test-key-123"))
         .respond_with(
             ResponseTemplate::new(200)
                 .insert_header("content-type", "text/event-stream")
@@ -602,7 +602,7 @@ async fn test_gateway_bearer_auth_translated_to_x_goog_api_key() {
             "{}/v1beta/models/gemini-3.8-flash:streamGenerateContent?alt=sse",
             proxy_url
         ))
-        .header("Authorization", "Bearer gateway-bearer-key-xyz")
+        .header("Authorization", "Bearer agy-gyro")
         .header("content-type", "application/json")
         .body(r#"{"contents":[{"parts":[{"text":"Reply with PONG"}]}]}"#)
         .send()
