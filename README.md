@@ -35,16 +35,17 @@ By default, the Antigravity CLI (`agy`) does not implement automatic retry loops
 
 `agy-gyro` solves this by catching transient errors, retrying the requests internally using exponential backoff with jitter (following the [Gemini API Troubleshooting Guide](https://ai.google.dev/gemini-api/docs/troubleshooting)), and only returning the final result to `agy` once resolved (or when retry attempts are exhausted).
 
-```
-+------------------+   genai Gateway     +---------------------+   Gemini REST API   +-------------------------------------+
-| Antigravity CLI  |   Wire Protocol     |      agy-gyro       |  (x-goog-api-key)   |          Google Gemini API          |
-|      (agy)       | ------------------> | (127.0.0.1:8080)    | ------------------> | (generativelanguage.googleapis.com) |
-|                  |                     |                     |                     |                                     |
-| Sends prompt or  |                     | 1. Buffers req body |                     | Evaluates request:                  |
-| stream request   |                     | 2. Forwards request |                     | - 429 / 503 / 500 / 504             |
-|                  |                     | 3. Retries on error | <------------------ |   -> Proxy handles backoff + retry  |
-| Receives 200 OK  | <------------------ | 4. Streams response | <------------------ | - 200 OK                            |
-+------------------+                     +---------------------+                     +-------------------------------------+
+```mermaid
+flowchart LR
+    AGY["Antigravity CLI\n(agy)"]
+    GYRO["agy-gyro\n(127.0.0.1:8080)"]
+    GEMINI["Google Gemini API\n(generativelanguage.googleapis.com)"]
+
+    AGY -- "1. Prompt / stream request\ngenai Gateway Wire Protocol" --> GYRO
+    GYRO -- "2. Buffers & forwards request\nGemini REST API" --> GEMINI
+    GEMINI -. "3. 429 / 503 / 500 / 504\nBackoff + retry" .-> GYRO
+    GEMINI -- "4. 200 OK" --> GYRO
+    GYRO -- "5. Streams response\n(200 OK)" --> AGY
 ```
 
 ## Installation
@@ -120,7 +121,7 @@ Set your Gemini API key and run `agy-gyro`:
 ```bash
 export GEMINI_API_KEY="your-gemini-api-key"
 
-# Launch agy:
+# Launch agy
 agy-gyro
 ```
 
