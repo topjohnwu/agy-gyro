@@ -170,10 +170,15 @@ pub async fn resolve_gateway_models(client: &reqwest::Client, config: &Config) -
     }
 }
 
+/// Default interval before committing early 200 OK headers and between keep-alive heartbeats.
+/// Set to 15 seconds to stay well below agy's 60-second ResponseHeaderTimeout.
+pub const DEFAULT_KEEP_ALIVE_INTERVAL: Duration = Duration::from_secs(15);
+
 pub struct ProxyState {
     pub config: Config,
     pub client: reqwest::Client,
     pub upstream_base: String,
+    pub keep_alive_interval: Duration,
 }
 
 impl ProxyState {
@@ -183,7 +188,13 @@ impl ProxyState {
             config,
             client,
             upstream_base,
+            keep_alive_interval: DEFAULT_KEEP_ALIVE_INTERVAL,
         }
+    }
+
+    pub fn with_keep_alive_interval(mut self, interval: Duration) -> Self {
+        self.keep_alive_interval = interval;
+        self
     }
 }
 
@@ -220,35 +231,188 @@ fn is_hop_by_hop(header_name: &HeaderName) -> bool {
             | "transfer-encoding"
             | "upgrade"
             | "content-length"
-            | "content-encoding"
     )
 }
 
-pub async fn proxy_handler(
-    State(state): State<Arc<ProxyState>>,
+fn is_sse_request(path_and_query: &str, headers: &HeaderMap) -> bool {
+    path_and_query.contains(":streamGenerateContent")
+        || path_and_query.contains("alt=sse")
+        || headers
+            .get(axum::http::header::ACCEPT)
+            .and_then(|v| v.to_str().ok())
+            .is_some_and(|v| v.contains("text/event-stream"))
+}
+
+fn status_to_gemini_status(status: StatusCode) -> &'static str {
+    match status {
+        StatusCode::BAD_REQUEST => "INVALID_ARGUMENT",
+        StatusCode::UNAUTHORIZED => "UNAUTHENTICATED",
+        StatusCode::FORBIDDEN => "PERMISSION_DENIED",
+        StatusCode::NOT_FOUND => "NOT_FOUND",
+        StatusCode::REQUEST_TIMEOUT | StatusCode::GATEWAY_TIMEOUT => "DEADLINE_EXCEEDED",
+        StatusCode::TOO_MANY_REQUESTS => "RESOURCE_EXHAUSTED",
+        StatusCode::SERVICE_UNAVAILABLE | StatusCode::BAD_GATEWAY => "UNAVAILABLE",
+        _ => "INTERNAL",
+    }
+}
+
+fn format_error_json_value(status: StatusCode, body_bytes: &[u8]) -> serde_json::Value {
+    let text = String::from_utf8_lossy(body_bytes);
+    let trimmed = text.trim();
+    let json_candidate = trimmed
+        .strip_prefix("data:")
+        .map(str::trim)
+        .unwrap_or(trimmed);
+
+    if let Ok(val) = serde_json::from_str::<serde_json::Value>(json_candidate) {
+        if val.get("error").is_some() {
+            return val;
+        }
+        if let Some(first) = val.as_array().and_then(|arr| arr.first())
+            && first.get("error").is_some()
+        {
+            return first.clone();
+        }
+    }
+
+    serde_json::json!({
+        "error": {
+            "code": status.as_u16(),
+            "message": if trimmed.is_empty() { status.to_string() } else { trimmed.to_string() },
+            "status": status_to_gemini_status(status),
+        }
+    })
+}
+
+fn format_sse_error_chunk(status: StatusCode, body_bytes: &[u8]) -> Bytes {
+    let val = format_error_json_value(status, body_bytes);
+    Bytes::from(format!("data: {}\n\n", val))
+}
+
+fn format_json_error_chunk(status: StatusCode, body_bytes: &[u8]) -> Bytes {
+    let val = format_error_json_value(status, body_bytes);
+    Bytes::from(val.to_string())
+}
+
+type BoxByteStream =
+    std::pin::Pin<Box<dyn futures_util::Stream<Item = Result<Bytes, std::io::Error>> + Send>>;
+
+enum UpstreamBody {
+    Buffered(Vec<Bytes>),
+    Passthrough(BoxByteStream),
+    Empty,
+}
+
+struct UpstreamOutcome {
+    status: StatusCode,
+    headers: HeaderMap,
+    body: UpstreamBody,
+}
+
+impl UpstreamOutcome {
+    fn bad_gateway(msg: String) -> Self {
+        Self {
+            status: StatusCode::BAD_GATEWAY,
+            headers: HeaderMap::new(),
+            body: UpstreamBody::Buffered(vec![Bytes::from(msg)]),
+        }
+    }
+
+    fn into_fast_response(self) -> Response {
+        let mut client_res_builder = Response::builder().status(self.status.as_u16());
+        for (name, val) in &self.headers {
+            if !is_hop_by_hop(name) {
+                client_res_builder = client_res_builder.header(name, val);
+            }
+        }
+
+        let body = match self.body {
+            UpstreamBody::Buffered(chunks) => {
+                let body_stream = futures_util::stream::iter(
+                    chunks.into_iter().map(Ok::<_, std::convert::Infallible>),
+                );
+                Body::from_stream(body_stream)
+            }
+            UpstreamBody::Passthrough(stream) => Body::from_stream(stream),
+            UpstreamBody::Empty => Body::empty(),
+        };
+
+        match client_res_builder.body(body) {
+            Ok(res) => res,
+            Err(err) => {
+                error!("Failed to build proxy response: {}", err);
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("Failed to build proxy response: {}", err),
+                )
+                    .into_response()
+            }
+        }
+    }
+
+    async fn into_late_stream(self, is_sse: bool) -> BoxByteStream {
+        if self.status.is_success() {
+            match self.body {
+                UpstreamBody::Buffered(chunks) => Box::pin(futures_util::stream::iter(
+                    chunks.into_iter().map(Ok::<_, std::io::Error>),
+                )),
+                UpstreamBody::Passthrough(stream) => stream,
+                UpstreamBody::Empty => Box::pin(futures_util::stream::empty()),
+            }
+        } else {
+            let err_bytes = match self.body {
+                UpstreamBody::Buffered(chunks) => {
+                    let total_len: usize = chunks.iter().map(|c| c.len()).sum();
+                    let mut buf = Vec::with_capacity(total_len);
+                    for c in chunks {
+                        buf.extend_from_slice(&c);
+                    }
+                    Bytes::from(buf)
+                }
+                UpstreamBody::Passthrough(mut stream) => {
+                    let mut buf = Vec::new();
+                    while let Some(Ok(c)) = stream.next().await {
+                        buf.extend_from_slice(&c);
+                    }
+                    Bytes::from(buf)
+                }
+                UpstreamBody::Empty => Bytes::new(),
+            };
+
+            let formatted = if is_sse {
+                format_sse_error_chunk(self.status, &err_bytes)
+            } else {
+                format_json_error_chunk(self.status, &err_bytes)
+            };
+
+            Box::pin(futures_util::stream::once(async move {
+                Ok::<_, std::io::Error>(formatted)
+            }))
+        }
+    }
+}
+
+enum KeepAlivePhase<F> {
+    SendInitialHeartbeat {
+        work_fut: F,
+        interval: tokio::time::Interval,
+    },
+    Waiting {
+        work_fut: F,
+        interval: tokio::time::Interval,
+    },
+    Flushing {
+        payload_stream: BoxByteStream,
+    },
+}
+
+async fn execute_proxy_request(
+    state: Arc<ProxyState>,
     method: Method,
-    OriginalUri(original_uri): OriginalUri,
+    target_url: reqwest::Url,
     headers: HeaderMap,
     body: Bytes,
-) -> Response {
-    let path_and_query = original_uri
-        .path_and_query()
-        .map(|pq| pq.as_str())
-        .unwrap_or("/");
-
-    let target_url_str = format!("{}{}", state.upstream_base, path_and_query);
-    let target_url = match reqwest::Url::parse(&target_url_str) {
-        Ok(url) => url,
-        Err(err) => {
-            error!("Failed to parse target URL {}: {}", target_url_str, err);
-            return (
-                StatusCode::BAD_REQUEST,
-                format!("Invalid target URL: {}", err),
-            )
-                .into_response();
-        }
-    };
-
+) -> UpstreamOutcome {
     let initial_delay = Duration::from_millis(state.config.initial_delay_ms);
     let max_delay = Duration::from_millis(state.config.max_delay_ms);
     let with_jitter = state.config.is_jitter_enabled();
@@ -265,9 +429,10 @@ pub async fn proxy_handler(
 
         let mut req_builder = state.client.request(method.clone(), target_url.clone());
 
-        // Forward headers, stripping hop-by-hop and gateway Authorization header
+        // Forward headers, stripping hop-by-hop, accept-encoding (handled by reqwest gzip), and gateway Authorization header
         for (header_name, header_val) in headers.iter() {
             if !is_hop_by_hop(header_name)
+                && header_name != axum::http::header::ACCEPT_ENCODING
                 && header_name != axum::http::header::AUTHORIZATION
                 && header_name.as_str() != "x-goog-api-key"
             {
@@ -348,12 +513,10 @@ pub async fn proxy_handler(
                     );
                 }
 
-                // Build client response builder
-                let mut client_res_builder = Response::builder().status(status.as_u16());
-
+                let mut res_headers = HeaderMap::new();
                 for (name, val) in upstream_res.headers() {
                     if !is_hop_by_hop(name) {
-                        client_res_builder = client_res_builder.header(name, val);
+                        res_headers.append(name.clone(), val.clone());
                     }
                 }
 
@@ -368,12 +531,14 @@ pub async fn proxy_handler(
                     while let Some(chunk_res) = stream.next().await {
                         match chunk_res {
                             Ok(chunk) => {
-                                if let Some((in_stream_status, err_msg)) =
-                                    parse_in_stream_error(&chunk)
-                                        .filter(|(status, _)| is_retriable_status(*status))
+                                if status.is_success()
+                                    && let Some((in_stream_status, err_msg)) =
+                                        parse_in_stream_error(&chunk)
+                                            .filter(|(s, _)| is_retriable_status(*s))
                                 {
                                     in_stream_err_details =
                                         Some((chunk_index, in_stream_status, err_msg));
+                                    buffered_chunks.clear();
                                     buffered_chunks.push(chunk);
                                     break;
                                 }
@@ -450,41 +615,27 @@ pub async fn proxy_handler(
                                 target_url,
                                 err
                             );
-                            return (
-                                StatusCode::BAD_GATEWAY,
-                                format!("Bad Gateway: upstream stream read failed: {}", err),
-                            )
-                                .into_response();
+                            return UpstreamOutcome::bad_gateway(format!(
+                                "Bad Gateway: upstream stream read failed: {}",
+                                err
+                            ));
                         }
                     }
 
-                    // All chunks buffered cleanly (or retries exhausted) - stream buffered chunks to client
-                    let body_stream = futures_util::stream::iter(
-                        buffered_chunks
-                            .into_iter()
-                            .map(Ok::<_, std::convert::Infallible>),
-                    );
-                    let body = Body::from_stream(body_stream);
-
-                    return match client_res_builder.body(body) {
-                        Ok(res) => res,
-                        Err(err) => {
-                            error!("Failed to build proxy response: {}", err);
-                            (
-                                StatusCode::INTERNAL_SERVER_ERROR,
-                                format!("Failed to build proxy response: {}", err),
-                            )
-                                .into_response()
-                        }
+                    return UpstreamOutcome {
+                        status,
+                        headers: res_headers,
+                        body: UpstreamBody::Buffered(buffered_chunks),
                     };
                 }
 
                 // Passthrough mode (--no-buffer): Peek at the initial stream chunk to catch in-stream 503 / 429 errors early
                 match stream.next().await {
                     Some(Ok(first_chunk)) => {
-                        if let Some((in_stream_status, err_msg)) =
-                            parse_in_stream_error(&first_chunk)
-                                .filter(|(status, _)| is_retriable_status(*status))
+                        if status.is_success()
+                            && let Some((in_stream_status, err_msg)) =
+                                parse_in_stream_error(&first_chunk)
+                                    .filter(|(s, _)| is_retriable_status(*s))
                         {
                             if attempt < max_retries {
                                 let delay = calculate_backoff(
@@ -519,22 +670,14 @@ pub async fn proxy_handler(
 
                         // Stream is healthy or retries exhausted: chain first chunk with remainder
                         let full_stream = futures_util::stream::once(async move {
-                            Ok::<_, reqwest::Error>(first_chunk)
+                            Ok::<_, std::io::Error>(first_chunk)
                         })
-                        .chain(stream);
+                        .chain(stream.map(|res| res.map_err(std::io::Error::other)));
 
-                        let body = Body::from_stream(full_stream);
-
-                        return match client_res_builder.body(body) {
-                            Ok(res) => res,
-                            Err(err) => {
-                                error!("Failed to build proxy response: {}", err);
-                                (
-                                    StatusCode::INTERNAL_SERVER_ERROR,
-                                    format!("Failed to build proxy response: {}", err),
-                                )
-                                    .into_response()
-                            }
+                        return UpstreamOutcome {
+                            status,
+                            headers: res_headers,
+                            body: UpstreamBody::Passthrough(Box::pin(full_stream)),
                         };
                     }
                     Some(Err(err)) => {
@@ -565,22 +708,17 @@ pub async fn proxy_handler(
                                 "Upstream error reading initial stream chunk for {} {}: {}",
                                 method, target_url, err
                             );
-                            return (
-                                StatusCode::BAD_GATEWAY,
-                                format!("Bad Gateway: upstream stream read failed: {}", err),
-                            )
-                                .into_response();
+                            return UpstreamOutcome::bad_gateway(format!(
+                                "Bad Gateway: upstream stream read failed: {}",
+                                err
+                            ));
                         }
                     }
                     None => {
-                        // Empty response body
-                        return match client_res_builder.body(Body::empty()) {
-                            Ok(res) => res,
-                            Err(err) => (
-                                StatusCode::INTERNAL_SERVER_ERROR,
-                                format!("Failed to build proxy response: {}", err),
-                            )
-                                .into_response(),
+                        return UpstreamOutcome {
+                            status,
+                            headers: res_headers,
+                            body: UpstreamBody::Empty,
                         };
                     }
                 }
@@ -608,13 +746,136 @@ pub async fn proxy_handler(
                         "Upstream error for {} {}: {} (retries exhausted or non-retriable)",
                         method, target_url, err
                     );
-                    return (
-                        StatusCode::BAD_GATEWAY,
-                        format!("Bad Gateway: upstream request failed: {}", err),
-                    )
-                        .into_response();
+                    return UpstreamOutcome::bad_gateway(format!(
+                        "Bad Gateway: upstream request failed: {}",
+                        err
+                    ));
                 }
             }
+        }
+    }
+}
+
+pub async fn proxy_handler(
+    State(state): State<Arc<ProxyState>>,
+    method: Method,
+    OriginalUri(original_uri): OriginalUri,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    let path_and_query = original_uri
+        .path_and_query()
+        .map(|pq| pq.as_str())
+        .unwrap_or("/");
+
+    let target_url_str = format!("{}{}", state.upstream_base, path_and_query);
+    let target_url = match reqwest::Url::parse(&target_url_str) {
+        Ok(url) => url,
+        Err(err) => {
+            error!("Failed to parse target URL {}: {}", target_url_str, err);
+            return (
+                StatusCode::BAD_REQUEST,
+                format!("Invalid target URL: {}", err),
+            )
+                .into_response();
+        }
+    };
+
+    let is_sse = is_sse_request(path_and_query, &headers);
+    let keep_alive_interval = state.keep_alive_interval;
+
+    let mut work_fut = Box::pin(execute_proxy_request(
+        state,
+        method.clone(),
+        target_url.clone(),
+        headers,
+        body,
+    ));
+
+    // Wait up to `keep_alive_interval` for the request (including buffering/retries) to finish
+    // before committing HTTP 200 OK headers and starting keep-alive heartbeats.
+    if let Ok(outcome) = tokio::time::timeout(keep_alive_interval, &mut work_fut).await {
+        return outcome.into_fast_response();
+    }
+
+    debug!(
+        "Request {} {} still in progress after {:?}; committing 200 OK headers and starting keep-alive stream",
+        method, target_url, keep_alive_interval
+    );
+
+    let heartbeat_bytes = if is_sse {
+        Bytes::from_static(b": keep-alive\n\n")
+    } else {
+        Bytes::from_static(b"\n")
+    };
+
+    let mut interval = tokio::time::interval_at(
+        tokio::time::Instant::now() + keep_alive_interval,
+        keep_alive_interval,
+    );
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+
+    let initial_phase = KeepAlivePhase::SendInitialHeartbeat { work_fut, interval };
+
+    let keep_alive_stream = futures_util::stream::unfold(initial_phase, move |phase| {
+        let heartbeat = heartbeat_bytes.clone();
+        let req_method = method.clone();
+        let req_url = target_url.clone();
+        async move {
+            match phase {
+                KeepAlivePhase::SendInitialHeartbeat { work_fut, interval } => Some((
+                    Ok::<Bytes, std::io::Error>(heartbeat),
+                    KeepAlivePhase::Waiting { work_fut, interval },
+                )),
+                KeepAlivePhase::Waiting {
+                    mut work_fut,
+                    mut interval,
+                } => {
+                    tokio::select! {
+                        biased;
+                        outcome = &mut work_fut => {
+                            let mut payload_stream = outcome.into_late_stream(is_sse).await;
+                            let item = payload_stream.next().await?;
+                            Some((item, KeepAlivePhase::Flushing { payload_stream }))
+                        }
+                        _ = interval.tick() => {
+                            debug!(
+                                "Sending keep-alive heartbeat for in-flight request {} {}",
+                                req_method, req_url
+                            );
+                            Some((
+                                Ok(heartbeat),
+                                KeepAlivePhase::Waiting { work_fut, interval },
+                            ))
+                        }
+                    }
+                }
+                KeepAlivePhase::Flushing { mut payload_stream } => {
+                    let item = payload_stream.next().await?;
+                    Some((item, KeepAlivePhase::Flushing { payload_stream }))
+                }
+            }
+        }
+    });
+
+    let mut res_builder = Response::builder().status(StatusCode::OK);
+    if is_sse {
+        res_builder = res_builder
+            .header(axum::http::header::CONTENT_TYPE, "text/event-stream")
+            .header(axum::http::header::CACHE_CONTROL, "no-cache");
+    } else {
+        res_builder = res_builder.header(axum::http::header::CONTENT_TYPE, "application/json");
+    }
+
+    match res_builder.body(Body::from_stream(keep_alive_stream)) {
+        Ok(res) => res,
+        Err(err) => {
+            error!("Failed to build keep-alive proxy response: {}", err);
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Failed to build keep-alive proxy response: {}", err),
+            )
+                .into_response()
         }
     }
 }

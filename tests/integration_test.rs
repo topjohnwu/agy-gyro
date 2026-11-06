@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
 
 use agy_gyro::config::Config;
-use agy_gyro::proxy::{ProxyState, create_router};
+use agy_gyro::proxy::{DEFAULT_KEEP_ALIVE_INTERVAL, ProxyState, build_http_client, create_router};
 use reqwest::Client;
 use std::sync::Arc;
 use std::time::Duration;
@@ -16,6 +16,22 @@ async fn spawn_test_proxy(upstream_url: String, max_retries: u32) -> String {
 
 /// Helper function to start a test proxy with configurable buffering
 async fn spawn_test_proxy_opts(upstream_url: String, max_retries: u32, no_buffer: bool) -> String {
+    spawn_test_proxy_with_keep_alive(
+        upstream_url,
+        max_retries,
+        no_buffer,
+        DEFAULT_KEEP_ALIVE_INTERVAL,
+    )
+    .await
+}
+
+/// Helper function to start a test proxy with configurable buffering and keep-alive interval
+async fn spawn_test_proxy_with_keep_alive(
+    upstream_url: String,
+    max_retries: u32,
+    no_buffer: bool,
+    keep_alive_interval: Duration,
+) -> String {
     let config = Config {
         host: "127.0.0.1".to_string(),
         port: Some(0), // OS assigns random available port
@@ -29,12 +45,10 @@ async fn spawn_test_proxy_opts(upstream_url: String, max_retries: u32, no_buffer
         api_key: "test-key-123".to_string(),
     };
 
-    let client = Client::builder()
-        .timeout(Duration::from_secs(config.request_timeout_secs))
-        .build()
-        .unwrap();
+    let client = build_http_client(&config).unwrap();
 
-    let state = Arc::new(ProxyState::new(config, client));
+    let state =
+        Arc::new(ProxyState::new(config, client).with_keep_alive_interval(keep_alive_interval));
 
     let app = create_router(state);
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -755,4 +769,242 @@ request_timeout_secs = 120
     assert!(Cli::try_parse_with_config_from(["agy-gyro"], Some(&temp_path)).is_err());
 
     let _ = std::fs::remove_file(&temp_path);
+}
+
+#[tokio::test]
+async fn test_buffered_mode_sends_keep_alive_during_long_generation_and_retries() {
+    use axum::response::sse::{Event, Sse};
+    use axum::routing::post;
+    use futures_util::{StreamExt, stream};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let call_count = Arc::new(AtomicUsize::new(0));
+    let count_clone = call_count.clone();
+
+    let app = axum::Router::new().route(
+        "/v1beta/models/gemini-4-argon:streamGenerateContent",
+        post(move || {
+            let count = count_clone.clone();
+            async move {
+                let attempt = count.fetch_add(1, Ordering::SeqCst);
+                if attempt == 0 {
+                    // Attempt 0: emit partial chunk 1, pause mid-stream (> keep_alive_interval), then fail with 503
+                    let s = stream::once(async {
+                        Ok::<_, std::convert::Infallible>(
+                            Event::default().data(
+                                "{\"candidates\": [{\"content\": {\"parts\": [{\"text\": \"Partial aborted text\"}]}}]}",
+                            ),
+                        )
+                    })
+                    .chain(stream::once(async {
+                        tokio::time::sleep(Duration::from_millis(60)).await;
+                        Ok::<_, std::convert::Infallible>(
+                            Event::default().data(
+                                "{\"error\": {\"code\": 503, \"message\": \"Mid-stream overload\", \"status\": \"UNAVAILABLE\"}}",
+                            ),
+                        )
+                    }));
+                    Sse::new(s.boxed())
+                } else {
+                    // Attempt 1: pause mid-stream while thinking, then emit clean chunks
+                    let s = stream::once(async {
+                        tokio::time::sleep(Duration::from_millis(60)).await;
+                        Ok::<_, std::convert::Infallible>(
+                            Event::default().data(
+                                "{\"candidates\": [{\"content\": {\"parts\": [{\"text\": \"Recovered after keep-alive!\"}]}}]}",
+                            ),
+                        )
+                    });
+                    Sse::new(s.boxed())
+                }
+            }
+        }),
+    );
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+
+    let proxy_url = spawn_test_proxy_with_keep_alive(
+        format!("http://{}", addr),
+        3,
+        false,
+        Duration::from_millis(25),
+    )
+    .await;
+
+    let req_client = Client::new();
+    // Enforce a strict 80ms response header timeout while upstream buffering + retry takes ~130ms
+    let response = tokio::time::timeout(
+        Duration::from_millis(80),
+        req_client
+            .post(format!(
+                "{}/v1beta/models/gemini-4-argon:streamGenerateContent?alt=sse",
+                proxy_url
+            ))
+            .send(),
+    )
+    .await
+    .expect("response headers must arrive before client header timeout")
+    .unwrap();
+
+    assert_eq!(response.status(), 200);
+    assert_eq!(
+        response
+            .headers()
+            .get("content-type")
+            .unwrap()
+            .to_str()
+            .unwrap(),
+        "text/event-stream"
+    );
+
+    let text = response.text().await.unwrap();
+    // Must contain multiple SSE keep-alive comment frames emitted while buffering and retrying
+    assert!(text.matches(": keep-alive\n\n").count() >= 2);
+    // Must NOT contain partial chunks or mid-stream error from aborted attempt 0
+    assert!(!text.contains("Partial aborted text"));
+    assert!(!text.contains("Mid-stream overload"));
+    // Must contain the clean recovered response from attempt 1
+    assert!(text.contains("Recovered after keep-alive!"));
+    assert_eq!(call_count.load(Ordering::SeqCst), 2);
+}
+
+#[tokio::test]
+async fn test_keep_alive_forwards_in_stream_error_when_retries_exhausted() {
+    use agy_gyro::retry::parse_in_stream_error;
+
+    let mock_server = MockServer::start().await;
+
+    Mock::given(method("POST"))
+        .and(path("/v1beta/models/gemini-4-argon:streamGenerateContent"))
+        .respond_with(
+            ResponseTemplate::new(503)
+                .set_delay(Duration::from_millis(40))
+                .set_body_json(serde_json::json!({
+                    "error": {
+                        "code": 503,
+                        "message": "Persistent backend overload",
+                        "status": "UNAVAILABLE"
+                    }
+                })),
+        )
+        .expect(2)
+        .mount(&mock_server)
+        .await;
+
+    let proxy_url =
+        spawn_test_proxy_with_keep_alive(mock_server.uri(), 1, false, Duration::from_millis(25))
+            .await;
+
+    let req_client = Client::new();
+    let response = req_client
+        .post(format!(
+            "{}/v1beta/models/gemini-4-argon:streamGenerateContent?alt=sse",
+            proxy_url
+        ))
+        .send()
+        .await
+        .unwrap();
+
+    // 200 OK headers were already committed due to keep-alive timer
+    assert_eq!(response.status(), 200);
+    let text = response.text().await.unwrap();
+    assert!(text.contains(": keep-alive\n\n"));
+
+    let (err_status, err_msg) = parse_in_stream_error(text.as_bytes()).unwrap();
+    assert_eq!(err_status, reqwest::StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(err_msg, "Persistent backend overload");
+}
+
+#[tokio::test]
+async fn test_buffered_mode_json_keep_alive_on_slow_generate_content() {
+    let mock_server = MockServer::start().await;
+
+    Mock::given(method("POST"))
+        .and(path("/v1beta/models/gemini-4-argon:generateContent"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_delay(Duration::from_millis(60))
+                .insert_header("content-type", "application/json")
+                .set_body_json(serde_json::json!({
+                    "candidates": [{
+                        "content": { "parts": [{ "text": "Slow non-SSE JSON response" }] }
+                    }]
+                })),
+        )
+        .expect(1)
+        .mount(&mock_server)
+        .await;
+
+    let proxy_url =
+        spawn_test_proxy_with_keep_alive(mock_server.uri(), 2, false, Duration::from_millis(20))
+            .await;
+
+    let req_client = Client::new();
+    let response = req_client
+        .post(format!(
+            "{}/v1beta/models/gemini-4-argon:generateContent",
+            proxy_url
+        ))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), 200);
+    let body: serde_json::Value = response.json().await.unwrap();
+    assert_eq!(
+        body["candidates"][0]["content"]["parts"][0]["text"],
+        "Slow non-SSE JSON response"
+    );
+}
+
+#[tokio::test]
+async fn test_gzip_compressed_error_response_decompressed_cleanly() {
+    let mock_server = MockServer::start().await;
+
+    // Pre-compressed gzip payload for: {"error":{"code":400,"message":"Invalid argument"}}
+    const GZIP_ERROR_BODY: &[u8] = &[
+        0x1f, 0x8b, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00, 0x02, 0xff, 0xab, 0x56, 0x4a, 0x2d, 0x2a,
+        0xca, 0x2f, 0x52, 0xb2, 0xaa, 0x56, 0x4a, 0xce, 0x4f, 0x49, 0x55, 0xb2, 0x32, 0x31, 0x30,
+        0xd0, 0x51, 0xca, 0x4d, 0x2d, 0x2e, 0x4e, 0x4c, 0x07, 0xf2, 0x94, 0x3c, 0xf3, 0xca, 0x12,
+        0x73, 0x32, 0x53, 0x14, 0x12, 0x8b, 0xd2, 0x4b, 0x73, 0x53, 0xf3, 0x4a, 0x94, 0x6a, 0x6b,
+        0x01, 0x49, 0x2d, 0xbc, 0x73, 0x33, 0x00, 0x00, 0x00,
+    ];
+
+    Mock::given(method("POST"))
+        .and(path("/v1beta/models/gemini-2.5-pro:generateContent"))
+        .respond_with(
+            ResponseTemplate::new(400)
+                .insert_header("content-type", "application/json")
+                .insert_header("content-encoding", "gzip")
+                .set_body_bytes(GZIP_ERROR_BODY),
+        )
+        .expect(1)
+        .mount(&mock_server)
+        .await;
+
+    let proxy_url = spawn_test_proxy(mock_server.uri(), 3).await;
+
+    // Use a client with gzip disabled to verify the proxy itself delivers uncompressed UTF-8
+    let raw_client = Client::builder().no_gzip().build().unwrap();
+    let response = raw_client
+        .post(format!(
+            "{}/v1beta/models/gemini-2.5-pro:generateContent",
+            proxy_url
+        ))
+        .header("accept-encoding", "gzip")
+        .body(r#"{"contents":[]}"#)
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), 400);
+    let raw_bytes = response.bytes().await.unwrap();
+    let utf8_str = std::str::from_utf8(&raw_bytes).expect("body must be valid decompressed UTF-8");
+    let json: serde_json::Value = serde_json::from_str(utf8_str).unwrap();
+    assert_eq!(json["error"]["code"], 400);
+    assert_eq!(json["error"]["message"], "Invalid argument");
 }

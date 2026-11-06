@@ -150,7 +150,8 @@ http://localhost:4400/?useWebSocket=true
 In default mode, `agy-gyro` buffers all incoming stream chunks before delivering them to `agy`:
 1. **Full Verification**: Ensures every chunk in the response is error-free and that the upstream stream completes cleanly.
 2. **Zero-Byte Leakage**: If an error (e.g. `503 UNAVAILABLE`, `429 RESOURCE_EXHAUSTED`, or network disconnect) occurs at chunk 1 or mid-stream, `agy-gyro` discards the buffered chunks and replays the request from scratch.
-3. **Flawless Delivery**: `agy` only receives verified, complete streams without partial output or syntax errors.
+3. **Automatic Keep-Alive Heartbeats**: If buffering or retry backoff exceeds 15 seconds, `agy-gyro` commits `200 OK` headers and streams periodic keep-alive heartbeats (`: keep-alive\n\n` for SSE) to satisfy `agy`'s 60-second `ResponseHeaderTimeout` while continuing to buffer and retry in the background.
+4. **Flawless Delivery**: `agy` only receives verified, complete streams without partial output or syntax errors.
 
 ### Passthrough Mode (`--no-buffer`)
 
