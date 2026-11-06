@@ -86,20 +86,32 @@ agy-gyro server --port 8080
 
 ### Options & Flags
 
-| Flag                     | Environment Variable            | Default                                     | Description                                             |
-| :----------------------- | :------------------------------ | :------------------------------------------ | :------------------------------------------------------ |
-| `-H`, `--host`           | `AGY_GYRO_HOST`                 | `127.0.0.1`                                 | Host address to bind the gateway server                 |
-| `-p`, `--port`           | `AGY_GYRO_PORT`                 | `0` (wrapper) / `8080` (server)             | Port to listen on (`0` = OS-assigned free port)         |
-| `-u`, `--upstream`       | `AGY_GYRO_UPSTREAM_URL`         | `https://generativelanguage.googleapis.com` | Target upstream Gemini API base URL                     |
-| `--api-key`              | `GEMINI_API_KEY`                | _Required_                                  | Gemini API key for authenticating upstream requests     |
-| `--agy-path`             | `AGY_GYRO_AGY_PATH`             | `agy`                                       | Executable path for Antigravity CLI                     |
-| `--log-file`             | `AGY_GYRO_LOG_FILE`             | _None_                                      | Path to log file for proxy tracing logs in wrapper mode |
-| `--max-retries`          | `AGY_GYRO_MAX_RETRIES`          | `15`                                        | Maximum number of retry attempts for retriable errors   |
-| `--initial-delay-ms`     | `AGY_GYRO_INITIAL_DELAY_MS`     | `1000`                                      | Initial retry backoff delay in milliseconds             |
-| `--max-delay-ms`         | `AGY_GYRO_MAX_DELAY_MS`         | `60000`                                     | Maximum backoff delay cap in milliseconds               |
-| `--no-jitter`            | `AGY_GYRO_NO_JITTER`            | `false`                                     | Disable randomized jitter in backoff calculation        |
-| `--no-buffer`            | `AGY_GYRO_NO_BUFFER`            | `false`                                     | Disable full stream buffering (stream chunks immediately)|
-| `--request-timeout-secs` | `AGY_GYRO_REQUEST_TIMEOUT_SECS` | `600`                                       | Timeout per attempt in seconds                          |
+Options are resolved in order of precedence: **CLI flags > Environment variables > `~/.gemini/config/agy-gyro.toml` > Defaults**.
+
+| Flag                     | Environment Variable            | Config Key (`agy-gyro.toml`) | Default                                     | Description                                             |
+| :----------------------- | :------------------------------ | :--------------------------- | :------------------------------------------ | :------------------------------------------------------ |
+| `-H`, `--host`           | `AGY_GYRO_HOST`                 | `host`                       | `127.0.0.1`                                 | Host address to bind the gateway server                 |
+| `-p`, `--port`           | `AGY_GYRO_PORT`                 | `port`                       | `0` (wrapper) / `8080` (server)             | Port to listen on (`0` = OS-assigned free port)         |
+| `-u`, `--upstream`       | `AGY_GYRO_UPSTREAM_URL`         | `upstream`                   | `https://generativelanguage.googleapis.com` | Target upstream Gemini API base URL                     |
+| `--api-key`              | `GEMINI_API_KEY`                | `api_key`                    | _Required_                                  | Gemini API key for authenticating upstream requests     |
+| `--agy-path`             | `AGY_GYRO_AGY_PATH`             | `agy_path`                   | `agy`                                       | Executable path for Antigravity CLI                     |
+| `--log-file`             | `AGY_GYRO_LOG_FILE`             | `log_file`                   | _None_                                      | Path to log file for proxy tracing logs in wrapper mode |
+| `--max-retries`          | `AGY_GYRO_MAX_RETRIES`          | `max_retries`                | `15`                                        | Maximum number of retry attempts for retriable errors   |
+| `--initial-delay-ms`     | `AGY_GYRO_INITIAL_DELAY_MS`     | `initial_delay_ms`           | `1000`                                      | Initial retry backoff delay in milliseconds             |
+| `--max-delay-ms`         | `AGY_GYRO_MAX_DELAY_MS`         | `max_delay_ms`               | `60000`                                     | Maximum backoff delay cap in milliseconds               |
+| `--no-jitter`            | `AGY_GYRO_NO_JITTER`            | `no_jitter`                  | `false`                                     | Disable randomized jitter in backoff calculation        |
+| `--no-buffer`            | `AGY_GYRO_NO_BUFFER`            | `no_buffer`                  | `false`                                     | Disable full stream buffering (stream chunks immediately)|
+| `--request-timeout-secs` | `AGY_GYRO_REQUEST_TIMEOUT_SECS` | `request_timeout_secs`       | `600`                                       | Timeout per attempt in seconds                          |
+
+### Configuration File (`~/.gemini/config/agy-gyro.toml`)
+
+You can persist your API key and preferred settings in `~/.gemini/config/agy-gyro.toml`:
+
+```toml
+api_key = "your-gemini-api-key"
+max_retries = 15
+log_file = "/tmp/gyro.log"
+```
 
 ## Quick Start with Antigravity (`agy`)
 

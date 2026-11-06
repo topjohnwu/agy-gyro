@@ -1,7 +1,10 @@
 // SPDX-License-Identifier: MIT
 
-use clap::{Args, Parser, Subcommand};
-use std::path::PathBuf;
+use clap::parser::ValueSource;
+use clap::{ArgMatches, Args, CommandFactory, FromArgMatches, Parser, Subcommand};
+use serde::Deserialize;
+use std::ffi::OsString;
+use std::path::{Path, PathBuf};
 
 /// Fallback list of Gemini models if dynamic discovery fails.
 pub const DEFAULT_GATEWAY_MODELS: &[&str] = &["gemini-4-argon", "gemini-3.8-flash"];
@@ -41,6 +44,123 @@ pub struct Cli {
 
     #[command(flatten)]
     pub wrapper_args: WrapperArgs,
+}
+
+/// Configuration loaded from `~/.gemini/config/agy-gyro.toml`.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct FileConfig {
+    pub host: Option<String>,
+    pub port: Option<u16>,
+    pub upstream: Option<String>,
+    #[serde(alias = "api-key")]
+    pub api_key: Option<String>,
+    #[serde(alias = "agy-path")]
+    pub agy_path: Option<String>,
+    #[serde(alias = "log-file")]
+    pub log_file: Option<PathBuf>,
+    #[serde(alias = "max-retries")]
+    pub max_retries: Option<u32>,
+    #[serde(alias = "initial-delay-ms")]
+    pub initial_delay_ms: Option<u64>,
+    #[serde(alias = "max-delay-ms")]
+    pub max_delay_ms: Option<u64>,
+    #[serde(alias = "no-jitter")]
+    pub no_jitter: Option<bool>,
+    #[serde(alias = "no-buffer")]
+    pub no_buffer: Option<bool>,
+    #[serde(alias = "request-timeout-secs")]
+    pub request_timeout_secs: Option<u64>,
+}
+
+/// Returns the default configuration file path: `~/.gemini/config/agy-gyro.toml`.
+pub fn default_config_path() -> Option<PathBuf> {
+    std::env::home_dir().map(|home| home.join(".gemini").join("config").join("agy-gyro.toml"))
+}
+
+impl FileConfig {
+    /// Loads and parses a TOML configuration file if it exists at `path`.
+    pub fn load_from_path(path: &Path) -> Result<Option<Self>, String> {
+        match std::fs::read_to_string(path) {
+            Ok(contents) => toml::from_str::<Self>(&contents)
+                .map(Some)
+                .map_err(|e| format!("Failed to parse {}: {}", path.display(), e)),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(err) => Err(format!("Failed to read {}: {}", path.display(), err)),
+        }
+    }
+}
+
+fn is_explicit_source(matches: &ArgMatches, id: &str) -> bool {
+    matches!(
+        matches.value_source(id),
+        Some(ValueSource::CommandLine | ValueSource::EnvVariable)
+    )
+}
+
+impl Cli {
+    /// Parses CLI arguments, environment variables, and `~/.gemini/config/agy-gyro.toml`,
+    /// exiting on error.
+    pub fn load() -> Self {
+        Self::try_parse_with_config_from(std::env::args_os(), default_config_path().as_deref())
+            .unwrap_or_else(|e| e.exit())
+    }
+
+    /// Parses from an iterator of arguments along with an optional TOML configuration file path.
+    ///
+    /// Precedence order (highest to lowest):
+    /// 1. Command-line flags
+    /// 2. Environment variables
+    /// 3. Configuration file (`~/.gemini/config/agy-gyro.toml`)
+    /// 4. Built-in default values
+    pub fn try_parse_with_config_from<I, T>(
+        itr: I,
+        config_path: Option<&Path>,
+    ) -> Result<Self, clap::Error>
+    where
+        I: IntoIterator<Item = T>,
+        T: Into<OsString> + Clone,
+    {
+        let matches = Self::command().try_get_matches_from(itr)?;
+        let mut cli = Self::from_arg_matches(&matches)?;
+
+        let file_config = match config_path {
+            Some(path) => FileConfig::load_from_path(path).map_err(|msg| {
+                Self::command().error(clap::error::ErrorKind::ValueValidation, msg)
+            })?,
+            None => None,
+        };
+
+        if let Some(ref fc) = file_config {
+            match cli.command {
+                Some(Commands::Server(ref mut server_args)) => {
+                    let sub_matches = matches.subcommand_matches("server").unwrap_or(&matches);
+                    server_args.config.apply_file_config(sub_matches, fc);
+                }
+                Some(Commands::Run(ref mut wrapper_args)) => {
+                    let sub_matches = matches.subcommand_matches("run").unwrap_or(&matches);
+                    wrapper_args.apply_file_config(sub_matches, fc);
+                }
+                None => {
+                    cli.wrapper_args.apply_file_config(&matches, fc);
+                }
+            }
+        }
+
+        let active_config = match &cli.command {
+            Some(Commands::Server(s)) => &s.config,
+            Some(Commands::Run(w)) => &w.config,
+            None => &cli.wrapper_args.config,
+        };
+
+        if active_config.api_key.trim().is_empty() {
+            return Err(Self::command().error(
+                clap::error::ErrorKind::MissingRequiredArgument,
+                "the following required arguments were not provided:\n  --api-key <API_KEY> (via --api-key, GEMINI_API_KEY, or ~/.gemini/config/agy-gyro.toml)",
+            ));
+        }
+
+        Ok(cli)
+    }
 }
 
 #[derive(Subcommand, Debug, Clone)]
@@ -84,6 +204,18 @@ pub struct WrapperArgs {
 impl WrapperArgs {
     pub fn resolved_port(&self) -> u16 {
         self.config.port.unwrap_or(0)
+    }
+
+    pub fn apply_file_config(&mut self, matches: &ArgMatches, file: &FileConfig) {
+        self.config.apply_file_config(matches, file);
+        if !is_explicit_source(matches, "agy_path")
+            && let Some(ref v) = file.agy_path
+        {
+            self.agy_path = v.clone();
+        }
+        if !is_explicit_source(matches, "log_file") && self.log_file.is_none() {
+            self.log_file = file.log_file.clone();
+        }
     }
 }
 
@@ -135,7 +267,6 @@ pub struct Config {
         long,
         env = "GEMINI_API_KEY",
         hide_env_values = true,
-        required = true,
         default_value = "",
         hide_default_value = true
     )]
@@ -149,5 +280,56 @@ impl Config {
 
     pub fn is_buffer_enabled(&self) -> bool {
         !self.no_buffer
+    }
+
+    pub fn apply_file_config(&mut self, matches: &ArgMatches, file: &FileConfig) {
+        if !is_explicit_source(matches, "host")
+            && let Some(ref v) = file.host
+        {
+            self.host = v.clone();
+        }
+        if !is_explicit_source(matches, "port") && self.port.is_none() {
+            self.port = file.port;
+        }
+        if !is_explicit_source(matches, "upstream")
+            && let Some(ref v) = file.upstream
+        {
+            self.upstream = v.clone();
+        }
+        if !is_explicit_source(matches, "max_retries")
+            && let Some(v) = file.max_retries
+        {
+            self.max_retries = v;
+        }
+        if !is_explicit_source(matches, "initial_delay_ms")
+            && let Some(v) = file.initial_delay_ms
+        {
+            self.initial_delay_ms = v;
+        }
+        if !is_explicit_source(matches, "max_delay_ms")
+            && let Some(v) = file.max_delay_ms
+        {
+            self.max_delay_ms = v;
+        }
+        if !is_explicit_source(matches, "no_jitter")
+            && let Some(v) = file.no_jitter
+        {
+            self.no_jitter = v;
+        }
+        if !is_explicit_source(matches, "no_buffer")
+            && let Some(v) = file.no_buffer
+        {
+            self.no_buffer = v;
+        }
+        if !is_explicit_source(matches, "request_timeout_secs")
+            && let Some(v) = file.request_timeout_secs
+        {
+            self.request_timeout_secs = v;
+        }
+        if (!is_explicit_source(matches, "api_key") || self.api_key.trim().is_empty())
+            && let Some(ref v) = file.api_key
+        {
+            self.api_key = v.clone();
+        }
     }
 }

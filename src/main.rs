@@ -3,14 +3,13 @@
 use agy_gyro::config::{Cli, Commands, ServerArgs};
 use agy_gyro::proxy::{ProxyState, create_router};
 use agy_gyro::runner::run_wrapper;
-use clap::Parser;
 use std::sync::Arc;
 use tracing::info;
 use tracing_subscriber::{EnvFilter, layer::SubscriberExt, util::SubscriberInitExt};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let cli = Cli::parse();
+    let cli = Cli::load();
 
     match cli.command {
         Some(Commands::Server(server_args)) => run_server(server_args).await,
