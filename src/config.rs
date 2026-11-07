@@ -6,6 +6,9 @@ use serde::Deserialize;
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 
+/// Default TCP port for the local gateway server and monitor (`6470` = `GYRO` in leetspeak).
+pub const DEFAULT_PORT: u16 = 6470;
+
 /// Fallback list of Gemini models if dynamic discovery fails.
 pub const DEFAULT_GATEWAY_MODELS: &[&str] = &["gemini-4-argon", "gemini-3.8-flash"];
 
@@ -140,6 +143,10 @@ impl Cli {
                     let sub_matches = matches.subcommand_matches("run").unwrap_or(&matches);
                     wrapper_args.apply_file_config(sub_matches, fc);
                 }
+                Some(Commands::Monitor(ref mut monitor_args)) => {
+                    let sub_matches = matches.subcommand_matches("monitor").unwrap_or(&matches);
+                    monitor_args.apply_file_config(sub_matches, fc);
+                }
                 None => {
                     cli.wrapper_args.apply_file_config(&matches, fc);
                 }
@@ -147,12 +154,15 @@ impl Cli {
         }
 
         let active_config = match &cli.command {
-            Some(Commands::Server(s)) => &s.config,
-            Some(Commands::Run(w)) => &w.config,
-            None => &cli.wrapper_args.config,
+            Some(Commands::Server(s)) => Some(&s.config),
+            Some(Commands::Run(w)) => Some(&w.config),
+            Some(Commands::Monitor(_)) => None,
+            None => Some(&cli.wrapper_args.config),
         };
 
-        if active_config.api_key.trim().is_empty() {
+        if let Some(cfg) = active_config
+            && cfg.api_key.trim().is_empty()
+        {
             return Err(Self::command().error(
                 clap::error::ErrorKind::MissingRequiredArgument,
                 "the following required arguments were not provided:\n  --api-key <API_KEY> (via --api-key, GEMINI_API_KEY, or ~/.gemini/config/agy-gyro.toml)",
@@ -169,18 +179,57 @@ pub enum Commands {
     Server(ServerArgs),
     /// Run agy CLI wrapped with the local proxy (default mode)
     Run(WrapperArgs),
+    /// Monitor live token usage and cost in a terminal UI dashboard
+    Monitor(MonitorArgs),
+}
+
+#[derive(Args, Debug, Clone)]
+pub struct MonitorArgs {
+    /// Target agy-gyro gateway URL or /usage endpoint URL
+    #[arg(short = 'u', long, env = "AGY_GYRO_URL")]
+    pub url: Option<String>,
+
+    /// Host address of the local agy-gyro server
+    #[arg(short = 'H', long, env = "AGY_GYRO_HOST", default_value = "127.0.0.1")]
+    pub host: String,
+
+    /// Port of the local agy-gyro server
+    #[arg(short = 'p', long, env = "AGY_GYRO_PORT", default_value_t = DEFAULT_PORT)]
+    pub port: u16,
+}
+
+impl MonitorArgs {
+    pub fn apply_file_config(&mut self, matches: &ArgMatches, file: &FileConfig) {
+        if !is_explicit_source(matches, "host")
+            && let Some(ref v) = file.host
+        {
+            self.host = v.clone();
+        }
+        if !is_explicit_source(matches, "port")
+            && let Some(v) = file.port
+        {
+            self.port = v;
+        }
+    }
+
+    pub fn resolve_endpoint_url(&self) -> String {
+        if let Some(ref u) = self.url {
+            crate::tui::resolve_usage_endpoint_url(u)
+        } else {
+            let host = if self.host == "0.0.0.0" {
+                "127.0.0.1"
+            } else {
+                &self.host
+            };
+            format!("http://{}:{}/usage", host, self.port)
+        }
+    }
 }
 
 #[derive(Args, Debug, Clone)]
 pub struct ServerArgs {
     #[command(flatten)]
     pub config: Config,
-}
-
-impl ServerArgs {
-    pub fn resolved_port(&self) -> u16 {
-        self.config.port.unwrap_or(8080)
-    }
 }
 
 #[derive(Args, Debug, Clone)]
@@ -202,10 +251,6 @@ pub struct WrapperArgs {
 }
 
 impl WrapperArgs {
-    pub fn resolved_port(&self) -> u16 {
-        self.config.port.unwrap_or(0)
-    }
-
     pub fn apply_file_config(&mut self, matches: &ArgMatches, file: &FileConfig) {
         self.config.apply_file_config(matches, file);
         if !is_explicit_source(matches, "agy_path")
@@ -225,9 +270,9 @@ pub struct Config {
     #[arg(short = 'H', long, env = "AGY_GYRO_HOST", default_value = "127.0.0.1")]
     pub host: String,
 
-    /// Port to listen on (default: dynamic free port in wrapper mode, 8080 in server mode)
-    #[arg(short = 'p', long, env = "AGY_GYRO_PORT")]
-    pub port: Option<u16>,
+    /// Port to listen on
+    #[arg(short = 'p', long, env = "AGY_GYRO_PORT", default_value_t = DEFAULT_PORT)]
+    pub port: u16,
 
     /// Upstream Gemini API base URL
     #[arg(
@@ -288,8 +333,10 @@ impl Config {
         {
             self.host = v.clone();
         }
-        if !is_explicit_source(matches, "port") && self.port.is_none() {
-            self.port = file.port;
+        if !is_explicit_source(matches, "port")
+            && let Some(v) = file.port
+        {
+            self.port = v;
         }
         if !is_explicit_source(matches, "upstream")
             && let Some(ref v) = file.upstream

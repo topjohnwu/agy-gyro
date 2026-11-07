@@ -3,6 +3,8 @@
 use agy_gyro::config::{Cli, Commands, ServerArgs};
 use agy_gyro::proxy::{ProxyState, create_router};
 use agy_gyro::runner::run_wrapper;
+use agy_gyro::tui::run_monitor;
+use agy_gyro::usage::{DEFAULT_PRICING_URL, UsageLogLayer, fetch_model_pricing};
 use std::sync::Arc;
 use tracing::info;
 use tracing_subscriber::{EnvFilter, layer::SubscriberExt, util::SubscriberInitExt};
@@ -13,6 +15,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     match cli.command {
         Some(Commands::Server(server_args)) => run_server(server_args).await,
+        Some(Commands::Monitor(monitor_args)) => run_monitor(monitor_args).await,
         Some(Commands::Run(wrapper_args)) => {
             let code = run_wrapper(wrapper_args).await?;
             std::process::exit(code);
@@ -32,11 +35,13 @@ async fn run_server(server_args: ServerArgs) -> Result<(), Box<dyn std::error::E
     let _ = tracing_subscriber::registry()
         .with(env_filter)
         .with(tracing_subscriber::fmt::layer())
+        .with(UsageLogLayer)
         .try_init();
 
-    let port = server_args.resolved_port();
-    let mut config = server_args.config;
-    config.port = Some(port);
+    let config = server_args.config;
+
+    let client = agy_gyro::proxy::build_http_client(&config)?;
+    let state = Arc::new(ProxyState::new(config.clone(), client.clone()));
 
     info!("Starting agy-gyro local Antigravity Enterprise Gateway server");
     info!("Upstream URL: {}", config.upstream);
@@ -48,14 +53,17 @@ async fn run_server(server_args: ServerArgs) -> Result<(), Box<dyn std::error::E
         config.is_jitter_enabled()
     );
 
-    let client = agy_gyro::proxy::build_http_client(&config)?;
-    let gateway_models = agy_gyro::proxy::resolve_gateway_models(&client, &config).await;
-    let state = Arc::new(ProxyState::new(config.clone(), client));
+    let (gateway_models, pricing) = tokio::join!(
+        agy_gyro::proxy::resolve_gateway_models(&client, &config),
+        fetch_model_pricing(&client, DEFAULT_PRICING_URL)
+    );
+    state.usage.set_pricing(pricing);
 
     let app = create_router(state);
 
-    let addr = format!("{}:{}", config.host, port);
+    let addr = format!("{}:{}", config.host, config.port);
     let listener = tokio::net::TcpListener::bind(&addr).await?;
+    let bound_addr = listener.local_addr()?;
 
     let model_list: Vec<_> = gateway_models
         .split(',')
@@ -63,7 +71,11 @@ async fn run_server(server_args: ServerArgs) -> Result<(), Box<dyn std::error::E
         .map(|m| format!("      {{ \"modelId\": \"{}\" }}", m))
         .collect();
 
-    info!("agy-gyro gateway listening on http://{}", addr);
+    info!("agy-gyro gateway listening on http://{}", bound_addr);
+    info!(
+        "Live usage endpoint: http://{}/usage (run `agy-gyro monitor` for live TUI dashboard)",
+        bound_addr
+    );
     info!(
         "To configure via environment variables:\n  export AGY_LLM_GATEWAY_URL=http://{}\n  export AGY_LLM_GATEWAY_WIRE_PROTOCOL=genai\n  export AGY_LLM_GATEWAY_API_KEY=agy-gyro\n  export AGY_LLM_GATEWAY_MODELS=\"{}\"\n",
         addr, gateway_models

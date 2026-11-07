@@ -34,7 +34,7 @@ async fn spawn_test_proxy_with_keep_alive(
 ) -> String {
     let config = Config {
         host: "127.0.0.1".to_string(),
-        port: Some(0), // OS assigns random available port
+        port: 0, // OS assigns random available port
         upstream: upstream_url,
         max_retries,
         initial_delay_ms: 10, // fast retries in tests
@@ -264,7 +264,7 @@ fn test_cli_parse_server_command() {
     .unwrap();
     assert!(matches!(cli.command, Some(Commands::Server(_))));
     if let Some(Commands::Server(server_args)) = cli.command {
-        assert_eq!(server_args.resolved_port(), 9090);
+        assert_eq!(server_args.config.port, 9090);
         assert_eq!(server_args.config.api_key, "test-key");
     }
 }
@@ -289,6 +289,7 @@ fn test_cli_parse_wrapper_default_and_passthrough() {
     .unwrap();
 
     assert!(cli.command.is_none());
+    assert_eq!(cli.wrapper_args.config.port, 6470);
     assert_eq!(cli.wrapper_args.config.api_key, "test-key");
     assert_eq!(
         cli.wrapper_args
@@ -505,7 +506,7 @@ async fn test_run_wrapper_executes_child_and_propagates_exit_code() {
     let wrapper_args = WrapperArgs {
         config: Config {
             host: "127.0.0.1".to_string(),
-            port: Some(0),
+            port: 0,
             upstream: mock_server.uri(),
             max_retries: 3,
             initial_delay_ms: 10,
@@ -578,7 +579,7 @@ async fn test_resolve_gateway_models_fetches_and_expands_models() {
 
     let config = Config {
         host: "127.0.0.1".to_string(),
-        port: Some(0),
+        port: 0,
         upstream: mock_server.uri(),
         max_retries: 3,
         initial_delay_ms: 10,
@@ -688,7 +689,7 @@ request_timeout_secs = 120
     // 1. Config loaded purely from TOML file (wrapper mode)
     let cli = Cli::try_parse_with_config_from(["agy-gyro"], Some(&temp_path)).unwrap();
     assert_eq!(cli.wrapper_args.config.host, "192.168.1.10");
-    assert_eq!(cli.wrapper_args.resolved_port(), 7070);
+    assert_eq!(cli.wrapper_args.config.port, 7070);
     assert_eq!(
         cli.wrapper_args.config.upstream,
         "https://custom.googleapis.com"
@@ -716,7 +717,7 @@ request_timeout_secs = 120
         Cli::try_parse_with_config_from(["agy-gyro", "server"], Some(&temp_path)).unwrap();
     if let Some(Commands::Server(server_args)) = cli_server.command {
         assert_eq!(server_args.config.api_key, "toml-gemini-key");
-        assert_eq!(server_args.resolved_port(), 7070);
+        assert_eq!(server_args.config.port, 7070);
         assert_eq!(server_args.config.max_retries, 25);
     } else {
         panic!("expected server command");
@@ -752,7 +753,7 @@ request_timeout_secs = 120
     assert!(cli.wrapper_args.config.is_buffer_enabled());
     assert_eq!(cli.wrapper_args.config.api_key, "env-gemini-key-123");
     // TOML still applies for fields not set via CLI or Env
-    assert_eq!(cli.wrapper_args.resolved_port(), 7070);
+    assert_eq!(cli.wrapper_args.config.port, 7070);
     assert_eq!(cli.wrapper_args.config.initial_delay_ms, 500);
 
     // 4. Unknown TOML keys are ignored
@@ -1007,4 +1008,223 @@ async fn test_gzip_compressed_error_response_decompressed_cleanly() {
     let json: serde_json::Value = serde_json::from_str(utf8_str).unwrap();
     assert_eq!(json["error"]["code"], 400);
     assert_eq!(json["error"]["message"], "Invalid argument");
+}
+
+#[tokio::test]
+async fn test_live_usage_endpoint_tracks_tokens_retries_and_cost() {
+    use agy_gyro::tui::{fetch_logs_snapshot, fetch_usage_snapshot, reset_remote_usage};
+
+    let mock_server = MockServer::start().await;
+
+    // 1. First request to gemini-4-argon: fails once with 429, then succeeds with SSE stream containing usageMetadata
+    Mock::given(method("POST"))
+        .and(path("/v1beta/models/gemini-4-argon:streamGenerateContent"))
+        .respond_with(
+            ResponseTemplate::new(429)
+                .set_body_string("RESOURCE_EXHAUSTED")
+                .insert_header("retry-after", "0"),
+        )
+        .up_to_n_times(1)
+        .expect(1)
+        .mount(&mock_server)
+        .await;
+
+    Mock::given(method("POST"))
+        .and(path("/v1beta/models/gemini-4-argon:streamGenerateContent"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "text/event-stream")
+                .set_body_string(concat!(
+                    "data: {\"candidates\": [{\"content\": {\"parts\": [{\"text\": \"Part 1\"}]}}], \"usageMetadata\": {\"promptTokenCount\": 100000, \"cachedContentTokenCount\": 80000}, \"modelVersion\": \"gemini-4-argon\"}\n\n",
+                    "data: {\"candidates\": [{\"content\": {\"parts\": [{\"text\": \"Part 2\"}]}}], \"usageMetadata\": {\"promptTokenCount\": 100000, \"cachedContentTokenCount\": 80000, \"candidatesTokenCount\": 2000, \"thoughtsTokenCount\": 3000, \"totalTokenCount\": 105000}, \"modelVersion\": \"gemini-4-argon\"}\n\n"
+                )),
+        )
+        .expect(1)
+        .mount(&mock_server)
+        .await;
+
+    // 2. Second request to gemini-2.5-pro: non-streaming generateContent
+    Mock::given(method("POST"))
+        .and(path("/v1beta/models/gemini-2.5-pro:generateContent"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "application/json")
+                .set_body_json(serde_json::json!({
+                    "candidates": [{
+                        "content": { "parts": [{ "text": "Done" }] }
+                    }],
+                    "usageMetadata": {
+                        "promptTokenCount": 50000,
+                        "cachedContentTokenCount": 10000,
+                        "candidatesTokenCount": 1000,
+                        "thoughtsTokenCount": 0,
+                        "totalTokenCount": 51000
+                    },
+                    "modelVersion": "gemini-2.5-pro"
+                })),
+        )
+        .expect(1)
+        .mount(&mock_server)
+        .await;
+
+    let proxy_url = spawn_test_proxy(mock_server.uri(), 3).await;
+    let client = Client::new();
+
+    // Execute both requests through the proxy
+    let r1 = client
+        .post(format!(
+            "{}/v1beta/models/gemini-4-argon:streamGenerateContent?alt=sse",
+            proxy_url
+        ))
+        .body(r#"{"contents":[]}"#)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r1.status(), 200);
+    let _ = r1.text().await.unwrap();
+
+    let r2 = client
+        .post(format!(
+            "{}/v1beta/models/gemini-2.5-pro:generateContent",
+            proxy_url
+        ))
+        .body(r#"{"contents":[]}"#)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r2.status(), 200);
+    let _ = r2.text().await.unwrap();
+
+    // Query live /usage endpoint
+    let usage_url = format!("{}/usage", proxy_url);
+    let snap = fetch_usage_snapshot(&client, &usage_url).await.unwrap();
+
+    assert_eq!(snap.total_requests, 2);
+    assert_eq!(snap.successful_requests, 2);
+    assert_eq!(snap.failed_requests, 0);
+    assert_eq!(snap.total_retries, 1);
+    assert_eq!(snap.active_requests, 0);
+
+    // Verify aggregated token counts:
+    // Request 1: input=100k (20k uncached, 80k cached), output=5k (2k cand + 3k thoughts), total=105k
+    // Request 2: input=50k (40k uncached, 10k cached), output=1k (1k cand + 0 thoughts), total=51k
+    assert_eq!(snap.totals.input_tokens, 150_000);
+    assert_eq!(snap.totals.uncached_input_tokens, 60_000);
+    assert_eq!(snap.totals.cached_input_tokens, 90_000);
+    assert_eq!(snap.totals.output_tokens, 6_000);
+    assert_eq!(snap.totals.candidates_tokens, 3_000);
+    assert_eq!(snap.totals.thoughts_tokens, 3_000);
+    assert_eq!(snap.totals.total_tokens, 156_000);
+
+    // Verify per-model cost for gemini-4-argon ($2/1M in, $0.10/1M cached, $10/1M out):
+    // uncached: 20k * $2/1M = $0.04; cached: 80k * $0.10/1M = $0.008; output: 5k * $10/1M = $0.05 -> total = $0.098
+    let argon = &snap.models["gemini-4-argon"];
+    assert_eq!(argon.totals.requests, 1);
+    assert_eq!(argon.totals.retries, 1);
+    assert!((argon.totals.uncached_input_cost_usd - 0.04).abs() < 1e-9);
+    assert!((argon.totals.cached_input_cost_usd - 0.008).abs() < 1e-9);
+    assert!((argon.totals.output_cost_usd - 0.05).abs() < 1e-9);
+    assert!((argon.totals.total_cost_usd - 0.098).abs() < 1e-9);
+
+    // Verify per-model cost for gemini-2.5-pro ($1.25/1M in, $0.125/1M cached, $10/1M out):
+    // uncached: 40k * $1.25/1M = $0.05; cached: 10k * $0.125/1M = $0.00125; output: 1k * $10/1M = $0.01 -> total = $0.06125
+    let pro = &snap.models["gemini-2.5-pro"];
+    assert_eq!(pro.totals.requests, 1);
+    assert!((pro.totals.total_cost_usd - 0.06125).abs() < 1e-9);
+
+    // Verify total cost across both models: $0.098 + $0.06125 = $0.15925
+    assert!((snap.totals.total_cost_usd - 0.15925).abs() < 1e-9);
+
+    // Verify real-time tracing logs (including 429 retry warning and completed request logs) are streamed on /logs
+    let logs_url = format!("{}/logs", proxy_url);
+    let logs = fetch_logs_snapshot(&client, &logs_url).await.unwrap();
+    assert!(!logs.is_empty());
+    assert!(
+        logs.iter()
+            .any(|l| l.level == "WARN" && l.message.contains("429"))
+    );
+    assert!(logs.iter().any(|l| l.level == "INFO"
+        && l.message.contains("gemini-4-argon")
+        && l.message.contains("cost=$0.098000")));
+
+    // Verify reset endpoint clears counters and logs
+    let reset_snap = reset_remote_usage(&client, &usage_url).await.unwrap();
+    assert_eq!(reset_snap.total_requests, 0);
+    assert_eq!(reset_snap.totals.total_tokens, 0);
+    assert_eq!(reset_snap.models.len(), 0);
+
+    let reset_logs = fetch_logs_snapshot(&client, &logs_url).await.unwrap();
+    assert!(
+        !reset_logs
+            .iter()
+            .any(|l| l.message.contains("cost=$0.098000"))
+    );
+}
+
+#[tokio::test]
+async fn test_no_buffer_passthrough_mode_records_usage_on_stream_completion() {
+    use agy_gyro::tui::fetch_usage_snapshot;
+
+    let mock_server = MockServer::start().await;
+
+    Mock::given(method("POST"))
+        .and(path("/v1beta/models/gemini-3.8-flash:streamGenerateContent"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "text/event-stream")
+                .set_body_string(
+                    "data: {\"candidates\": [{\"content\": {\"parts\": [{\"text\": \"Fast\"}]}}], \"usageMetadata\": {\"promptTokenCount\": 20000, \"cachedContentTokenCount\": 5000, \"candidatesTokenCount\": 500, \"thoughtsTokenCount\": 500, \"totalTokenCount\": 21000}, \"modelVersion\": \"gemini-3.8-flash\"}\n\n",
+                ),
+        )
+        .expect(1)
+        .mount(&mock_server)
+        .await;
+
+    let proxy_url = spawn_test_proxy_opts(mock_server.uri(), 3, true).await;
+    let client = Client::new();
+
+    let res = client
+        .post(format!(
+            "{}/v1beta/models/gemini-3.8-flash:streamGenerateContent?alt=sse",
+            proxy_url
+        ))
+        .body(r#"{"contents":[]}"#)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 200);
+    let _ = res.text().await.unwrap();
+
+    let snap = fetch_usage_snapshot(&client, &format!("{}/usage", proxy_url))
+        .await
+        .unwrap();
+    assert_eq!(snap.totals.input_tokens, 20_000);
+    assert_eq!(snap.totals.uncached_input_tokens, 15_000);
+    assert_eq!(snap.totals.cached_input_tokens, 5_000);
+    assert_eq!(snap.totals.output_tokens, 1_000);
+    assert!(snap.totals.total_cost_usd > 0.0);
+}
+
+#[test]
+fn test_cli_parse_monitor_subcommand_without_api_key() {
+    use agy_gyro::config::{Cli, Commands};
+
+    let cli_default = Cli::try_parse_with_config_from(["agy-gyro", "monitor"], None).unwrap();
+    match cli_default.command {
+        Some(Commands::Monitor(args)) => {
+            assert_eq!(args.port, 6470);
+            assert_eq!(args.resolve_endpoint_url(), "http://127.0.0.1:6470/usage");
+        }
+        _ => panic!("expected Monitor command"),
+    }
+
+    let cli = Cli::try_parse_with_config_from(["agy-gyro", "monitor", "-p", "9090"], None).unwrap();
+
+    match cli.command {
+        Some(Commands::Monitor(args)) => {
+            assert_eq!(args.port, 9090);
+            assert_eq!(args.resolve_endpoint_url(), "http://127.0.0.1:9090/usage");
+        }
+        _ => panic!("expected Monitor command"),
+    }
 }

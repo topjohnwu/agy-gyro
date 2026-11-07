@@ -2,6 +2,7 @@
 
 use crate::config::WrapperArgs;
 use crate::proxy::{ProxyState, build_http_client, create_router, resolve_gateway_models};
+use crate::usage::{DEFAULT_PRICING_URL, UsageLogLayer, fetch_model_pricing};
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
@@ -33,6 +34,7 @@ pub fn init_wrapper_tracing(log_file: Option<&Path>) -> Result<(), Box<dyn std::
                     .with_writer(file)
                     .with_ansi(false),
             )
+            .with(UsageLogLayer)
             .try_init();
     } else {
         let _ = tracing_subscriber::registry()
@@ -42,6 +44,7 @@ pub fn init_wrapper_tracing(log_file: Option<&Path>) -> Result<(), Box<dyn std::
                     .with_writer(std::io::sink)
                     .with_ansi(false),
             )
+            .with(UsageLogLayer)
             .try_init();
     }
 
@@ -52,31 +55,36 @@ pub fn init_wrapper_tracing(log_file: Option<&Path>) -> Result<(), Box<dyn std::
 pub async fn run_wrapper(wrapper_args: WrapperArgs) -> Result<i32, Box<dyn std::error::Error>> {
     init_wrapper_tracing(wrapper_args.log_file.as_deref())?;
 
-    let mut config = wrapper_args.config.clone();
-    let port = wrapper_args.resolved_port();
-    config.port = Some(port);
+    let config = wrapper_args.config.clone();
 
-    // Bind listener to dynamic port (port 0 by default) or user-specified port
-    let addr = format!("{}:{}", config.host, port);
+    let addr = format!("{}:{}", config.host, config.port);
     let listener = tokio::net::TcpListener::bind(&addr).await?;
     let bound_addr = listener.local_addr()?;
 
+    let client = build_http_client(&config)?;
+    let state = Arc::new(ProxyState::new(config.clone(), client.clone()));
+
     info!(
-        "agy-gyro wrapper gateway listening on http://{}",
-        bound_addr
+        "agy-gyro wrapper gateway listening on http://{} (usage: http://{}/usage)",
+        bound_addr, bound_addr
     );
 
-    let client = build_http_client(&config)?;
-
-    let gateway_models = match std::env::var("AGY_LLM_GATEWAY_MODELS")
+    let env_models = std::env::var("AGY_LLM_GATEWAY_MODELS")
         .ok()
-        .filter(|s| !s.trim().is_empty())
-    {
-        Some(models) => models,
-        None => resolve_gateway_models(&client, &config).await,
+        .filter(|s| !s.trim().is_empty());
+
+    let (gateway_models, pricing) = match env_models {
+        Some(models) => {
+            let pricing = fetch_model_pricing(&client, DEFAULT_PRICING_URL).await;
+            (models, pricing)
+        }
+        None => tokio::join!(
+            resolve_gateway_models(&client, &config),
+            fetch_model_pricing(&client, DEFAULT_PRICING_URL)
+        ),
     };
 
-    let state = Arc::new(ProxyState::new(config, client));
+    state.usage.set_pricing(pricing);
     let app = create_router(state);
 
     let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();

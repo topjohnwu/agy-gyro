@@ -46,6 +46,8 @@ toml = { version = "1.0", default-features = false, features = [
     "parse",
     "serde",
 ] }
+ratatui = { version = "0.30", default-features = false, features = ["crossterm"] }
+crossterm = "0.29"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

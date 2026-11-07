@@ -38,7 +38,7 @@ By default, the Antigravity CLI (`agy`) does not implement automatic retry loops
 ```mermaid
 flowchart LR
     AGY["Antigravity CLI\n(agy)"]
-    GYRO["agy-gyro\n(127.0.0.1:8080)"]
+    GYRO["agy-gyro\n(127.0.0.1:6470)"]
     GEMINI["Google Gemini API\n(generativelanguage.googleapis.com)"]
 
     AGY -- "1. Prompt / stream request\ngenai Gateway Wire Protocol" --> GYRO
@@ -60,11 +60,11 @@ Prebuilt executables for Linux, macOS, and Windows are also available in the [la
 
 ## Configuration & Modes
 
-`agy-gyro` operates in two modes: **Wrapper Mode** (default) and **Standalone Server Mode**.
+`agy-gyro` operates in three modes: **Wrapper Mode** (default), **Standalone Server Mode**, and **Live TUI Monitor Mode**.
 
 ### Mode 1: Wrapper Mode (Default)
 
-Running `agy-gyro` without subcommands automatically starts an in-process Enterprise Gateway server on a dynamic TCP port (`127.0.0.1:0`), configures `AGY_LLM_GATEWAY_URL`, `AGY_LLM_GATEWAY_WIRE_PROTOCOL=genai`, `AGY_LLM_GATEWAY_API_KEY`, `AGY_LLM_GATEWAY_MODELS`, and `AGY_ENABLE_HUB=1`, and launches `agy`.
+Running `agy-gyro` without subcommands automatically starts an in-process Enterprise Gateway server on `127.0.0.1:6470` (configurable via `-p` / `--port`), configures `AGY_LLM_GATEWAY_URL`, `AGY_LLM_GATEWAY_WIRE_PROTOCOL=genai`, `AGY_LLM_GATEWAY_API_KEY`, `AGY_LLM_GATEWAY_MODELS`, and `AGY_ENABLE_HUB=1`, and launches `agy`.
 
 ```bash
 # Simply launch agy wrapped with agy-gyro gateway:
@@ -82,7 +82,33 @@ agy-gyro --log-file /tmp/gyro.log
 To run `agy-gyro` as a persistent background daemon or standalone Enterprise Gateway server:
 
 ```bash
-agy-gyro server --port 8080
+agy-gyro server
+```
+
+### Mode 3: Live Usage & Cost TUI Dashboard (`agy-gyro monitor`)
+
+`agy-gyro` exposes two real-time Server-Sent Events (SSE) endpoints:
+- `GET /usage` (resettable via `DELETE /usage`): streams live token usage, request counters, and USD cost breakdowns (`UsageSnapshot`).
+- `GET /logs`: streams real-time gateway tracing logs (`Vec<LogEntry>`).
+
+It fetches live Gemini model pricing from `https://models.dev/api.json` on startup (with a built-in fallback pricing table).
+
+In a second terminal, launch the interactive TUI dashboard (which connects to both `/usage` and `/logs` on `127.0.0.1:6470` by default):
+
+```bash
+# Connect to the default gateway port (127.0.0.1:6470, or port configured in agy-gyro.toml):
+agy-gyro monitor
+
+# Or connect to a specific port or URL:
+agy-gyro monitor --port 9090
+agy-gyro monitor --url http://127.0.0.1:9090/usage
+```
+
+You can also subscribe to either SSE stream directly at any time:
+
+```bash
+curl -N http://127.0.0.1:6470/usage
+curl -N http://127.0.0.1:6470/logs
 ```
 
 ### Options & Flags
@@ -92,7 +118,7 @@ Options are resolved in order of precedence: **CLI flags > Environment variables
 | Flag                     | Environment Variable            | Config Key (`agy-gyro.toml`) | Default                                     | Description                                             |
 | :----------------------- | :------------------------------ | :--------------------------- | :------------------------------------------ | :------------------------------------------------------ |
 | `-H`, `--host`           | `AGY_GYRO_HOST`                 | `host`                       | `127.0.0.1`                                 | Host address to bind the gateway server                 |
-| `-p`, `--port`           | `AGY_GYRO_PORT`                 | `port`                       | `0` (wrapper) / `8080` (server)             | Port to listen on (`0` = OS-assigned free port)         |
+| `-p`, `--port`           | `AGY_GYRO_PORT`                 | `port`                       | `6470`                                      | Port to listen on or connect to (`0` = OS-assigned port)|
 | `-u`, `--upstream`       | `AGY_GYRO_UPSTREAM_URL`         | `upstream`                   | `https://generativelanguage.googleapis.com` | Target upstream Gemini API base URL                     |
 | `--api-key`              | `GEMINI_API_KEY`                | `api_key`                    | _Required_                                  | Gemini API key for authenticating upstream requests     |
 | `--agy-path`             | `AGY_GYRO_AGY_PATH`             | `agy_path`                   | `agy`                                       | Executable path for Antigravity CLI                     |
@@ -125,7 +151,7 @@ export GEMINI_API_KEY="your-gemini-api-key"
 agy-gyro
 ```
 
-`agy-gyro` handles local gateway startup, dynamic port binding, `AGY_LLM_GATEWAY_*` environment variable setup, protocol translation, and signal forwarding seamlessly!
+`agy-gyro` handles local gateway startup, `AGY_LLM_GATEWAY_*` environment variable setup, protocol translation, and signal forwarding seamlessly!
 
 ### Antigravity Hub Web UI (`--hub`)
 

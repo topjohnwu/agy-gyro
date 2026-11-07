@@ -5,18 +5,25 @@ use crate::retry::{
     calculate_backoff, is_retriable_error, is_retriable_status, parse_in_stream_error,
     parse_retry_after,
 };
+use crate::usage::{
+    PricingTable, StreamUsageExtractor, UsageLogLayer, UsageSnapshot, UsageTracker,
+    extract_model_from_path, extract_usage_from_chunks,
+};
 use axum::{
-    Router,
+    Json, Router,
     body::{Body, Bytes},
     extract::{DefaultBodyLimit, OriginalUri, State},
     http::{HeaderMap, HeaderName, Method, StatusCode},
-    response::{IntoResponse, Response},
-    routing::any,
+    response::{
+        IntoResponse, Response,
+        sse::{Event, Sse},
+    },
+    routing::{any, get},
 };
 use futures_util::StreamExt;
 use serde::Deserialize;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tracing::{debug, error, info, warn};
 
 #[derive(Debug, Clone, Deserialize)]
@@ -179,21 +186,37 @@ pub struct ProxyState {
     pub client: reqwest::Client,
     pub upstream_base: String,
     pub keep_alive_interval: Duration,
+    pub usage: Arc<UsageTracker>,
 }
 
 impl ProxyState {
     pub fn new(config: Config, client: reqwest::Client) -> Self {
+        use tracing_subscriber::{EnvFilter, layer::SubscriberExt, util::SubscriberInitExt};
+
+        let _ = tracing_subscriber::registry()
+            .with(EnvFilter::new("info,agy_gyro=debug"))
+            .with(UsageLogLayer)
+            .try_init();
+
         let upstream_base = config.upstream.trim_end_matches('/').to_string();
+        let usage = Arc::new(UsageTracker::default());
+        usage.register_global_logger();
         Self {
             config,
             client,
             upstream_base,
             keep_alive_interval: DEFAULT_KEEP_ALIVE_INTERVAL,
+            usage,
         }
     }
 
     pub fn with_keep_alive_interval(mut self, interval: Duration) -> Self {
         self.keep_alive_interval = interval;
+        self
+    }
+
+    pub fn with_pricing(self, pricing: PricingTable) -> Self {
+        self.usage.set_pricing(pricing);
         self
     }
 }
@@ -210,8 +233,75 @@ pub fn build_http_client(config: &Config) -> reqwest::Result<reqwest::Client> {
         .build()
 }
 
+async fn usage_handler(
+    State(state): State<Arc<ProxyState>>,
+) -> Sse<impl futures_util::Stream<Item = Result<Event, std::convert::Infallible>>> {
+    let tracker = state.usage.clone();
+    let rx = tracker.subscribe();
+    let mut ticker = tokio::time::interval_at(
+        tokio::time::Instant::now() + Duration::from_secs(1),
+        Duration::from_secs(1),
+    );
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+
+    let stream = futures_util::stream::unfold(
+        (tracker, rx, ticker, true),
+        |(tracker, mut rx, mut ticker, is_first)| async move {
+            if !is_first {
+                tokio::select! {
+                    res = rx.changed() => {
+                        if res.is_err() {
+                            return None;
+                        }
+                    }
+                    _ = ticker.tick() => {}
+                }
+            }
+            let _ = rx.borrow_and_update();
+            let snap = tracker.snapshot();
+            let json = serde_json::to_string(&snap).unwrap_or_else(|_| "{}".to_string());
+            Some((
+                Ok(Event::default().data(json)),
+                (tracker, rx, ticker, false),
+            ))
+        },
+    );
+
+    Sse::new(stream)
+}
+
+async fn reset_usage_handler(State(state): State<Arc<ProxyState>>) -> Json<UsageSnapshot> {
+    state.usage.reset();
+    Json(state.usage.snapshot())
+}
+
+async fn logs_handler(
+    State(state): State<Arc<ProxyState>>,
+) -> Sse<impl futures_util::Stream<Item = Result<Event, std::convert::Infallible>>> {
+    let tracker = state.usage.clone();
+    let rx = tracker.subscribe_logs();
+
+    let stream = futures_util::stream::unfold(
+        (tracker, rx, true),
+        |(tracker, mut rx, is_first)| async move {
+            if !is_first && rx.changed().await.is_err() {
+                return None;
+            }
+            let _ = rx.borrow_and_update();
+            let logs = tracker.logs_snapshot();
+            let json = serde_json::to_string(&logs).unwrap_or_else(|_| "[]".to_string());
+            Some((Ok(Event::default().data(json)), (tracker, rx, false)))
+        },
+    );
+
+    Sse::new(stream)
+        .keep_alive(axum::response::sse::KeepAlive::new().interval(Duration::from_secs(15)))
+}
+
 pub fn create_router(state: Arc<ProxyState>) -> Router {
     Router::new()
+        .route("/usage", get(usage_handler).delete(reset_usage_handler))
+        .route("/logs", get(logs_handler))
         .route("/", any(proxy_handler))
         .route("/{*path}", any(proxy_handler))
         .layer(DefaultBodyLimit::disable())
@@ -413,6 +503,12 @@ async fn execute_proxy_request(
     headers: HeaderMap,
     body: Bytes,
 ) -> UpstreamOutcome {
+    let req_start = Instant::now();
+    let model_from_path = extract_model_from_path(target_url.path());
+    let active_guard = model_from_path
+        .as_ref()
+        .map(|_| state.usage.begin_request());
+
     let initial_delay = Duration::from_millis(state.config.initial_delay_ms);
     let max_delay = Duration::from_millis(state.config.max_delay_ms);
     let with_jitter = state.config.is_jitter_enabled();
@@ -485,6 +581,9 @@ async fn execute_proxy_request(
                             snippet
                         );
 
+                        if model_from_path.is_some() {
+                            state.usage.record_retry();
+                        }
                         tokio::time::sleep(delay).await;
                         attempt += 1;
                         continue;
@@ -552,7 +651,8 @@ async fn execute_proxy_request(
                         }
                     }
 
-                    if let Some((chunk_idx, in_stream_status, err_msg)) = in_stream_err_details {
+                    if let Some((chunk_idx, in_stream_status, ref err_msg)) = in_stream_err_details
+                    {
                         if attempt < max_retries {
                             let delay = calculate_backoff(
                                 attempt,
@@ -574,6 +674,9 @@ async fn execute_proxy_request(
                                 max_retries
                             );
 
+                            if model_from_path.is_some() {
+                                state.usage.record_retry();
+                            }
                             tokio::time::sleep(delay).await;
                             attempt += 1;
                             continue;
@@ -604,6 +707,9 @@ async fn execute_proxy_request(
                                 max_retries
                             );
 
+                            if model_from_path.is_some() {
+                                state.usage.record_retry();
+                            }
                             tokio::time::sleep(delay).await;
                             attempt += 1;
                             continue;
@@ -615,11 +721,40 @@ async fn execute_proxy_request(
                                 target_url,
                                 err
                             );
+                            drop(active_guard);
+                            if let Some(ref req_model) = model_from_path {
+                                state.usage.record_completed_request(
+                                    req_model,
+                                    StatusCode::BAD_GATEWAY.as_u16(),
+                                    attempt,
+                                    req_start.elapsed(),
+                                    None,
+                                );
+                            }
                             return UpstreamOutcome::bad_gateway(format!(
                                 "Bad Gateway: upstream stream read failed: {}",
                                 err
                             ));
                         }
+                    }
+
+                    drop(active_guard);
+                    if let Some(ref req_model) = model_from_path {
+                        let (raw_usage, resp_model) = extract_usage_from_chunks(&buffered_chunks);
+                        let effective_model = resp_model.as_deref().unwrap_or(req_model);
+                        let effective_status =
+                            if let Some((_, in_stream_status, _)) = in_stream_err_details {
+                                in_stream_status.as_u16()
+                            } else {
+                                status.as_u16()
+                            };
+                        state.usage.record_completed_request(
+                            effective_model,
+                            effective_status,
+                            attempt,
+                            req_start.elapsed(),
+                            raw_usage.as_ref(),
+                        );
                     }
 
                     return UpstreamOutcome {
@@ -657,6 +792,9 @@ async fn execute_proxy_request(
                                     max_retries
                                 );
 
+                                if model_from_path.is_some() {
+                                    state.usage.record_retry();
+                                }
                                 tokio::time::sleep(delay).await;
                                 attempt += 1;
                                 continue;
@@ -674,10 +812,76 @@ async fn execute_proxy_request(
                         })
                         .chain(stream.map(|res| res.map_err(std::io::Error::other)));
 
+                        let passthrough_stream: BoxByteStream =
+                            if let Some(req_model) = model_from_path {
+                                let tracker = state.usage.clone();
+                                let initial_status = status.as_u16();
+                                let retries_used = attempt;
+                                let extractor = StreamUsageExtractor::new();
+                                let inner_stream: BoxByteStream = Box::pin(full_stream);
+                                Box::pin(futures_util::stream::unfold(
+                                    (inner_stream, extractor, active_guard, initial_status),
+                                    move |(mut s, mut ext, mut guard, mut eff_status)| {
+                                        let tracker = tracker.clone();
+                                        let req_model = req_model.clone();
+                                        async move {
+                                            match s.next().await {
+                                                Some(Ok(chunk)) => {
+                                                    if (200..300).contains(&eff_status)
+                                                        && let Some((in_stream_status, _)) =
+                                                            parse_in_stream_error(&chunk)
+                                                    {
+                                                        eff_status = in_stream_status.as_u16();
+                                                    }
+                                                    ext.feed_chunk(&chunk);
+                                                    Some((Ok(chunk), (s, ext, guard, eff_status)))
+                                                }
+                                                Some(Err(err)) => {
+                                                    if guard.take().is_some() {
+                                                        let raw_usage = ext.finish(None);
+                                                        let effective_model = ext
+                                                            .model_version
+                                                            .as_deref()
+                                                            .unwrap_or(&req_model);
+                                                        tracker.record_completed_request(
+                                                            effective_model,
+                                                            StatusCode::BAD_GATEWAY.as_u16(),
+                                                            retries_used,
+                                                            req_start.elapsed(),
+                                                            raw_usage.as_ref(),
+                                                        );
+                                                    }
+                                                    Some((Err(err), (s, ext, guard, eff_status)))
+                                                }
+                                                None => {
+                                                    if guard.take().is_some() {
+                                                        let raw_usage = ext.finish(None);
+                                                        let effective_model = ext
+                                                            .model_version
+                                                            .as_deref()
+                                                            .unwrap_or(&req_model);
+                                                        tracker.record_completed_request(
+                                                            effective_model,
+                                                            eff_status,
+                                                            retries_used,
+                                                            req_start.elapsed(),
+                                                            raw_usage.as_ref(),
+                                                        );
+                                                    }
+                                                    None
+                                                }
+                                            }
+                                        }
+                                    },
+                                ))
+                            } else {
+                                Box::pin(full_stream)
+                            };
+
                         return UpstreamOutcome {
                             status,
                             headers: res_headers,
-                            body: UpstreamBody::Passthrough(Box::pin(full_stream)),
+                            body: UpstreamBody::Passthrough(passthrough_stream),
                         };
                     }
                     Some(Err(err)) => {
@@ -700,6 +904,9 @@ async fn execute_proxy_request(
                                 max_retries
                             );
 
+                            if model_from_path.is_some() {
+                                state.usage.record_retry();
+                            }
                             tokio::time::sleep(delay).await;
                             attempt += 1;
                             continue;
@@ -708,6 +915,16 @@ async fn execute_proxy_request(
                                 "Upstream error reading initial stream chunk for {} {}: {}",
                                 method, target_url, err
                             );
+                            drop(active_guard);
+                            if let Some(ref req_model) = model_from_path {
+                                state.usage.record_completed_request(
+                                    req_model,
+                                    StatusCode::BAD_GATEWAY.as_u16(),
+                                    attempt,
+                                    req_start.elapsed(),
+                                    None,
+                                );
+                            }
                             return UpstreamOutcome::bad_gateway(format!(
                                 "Bad Gateway: upstream stream read failed: {}",
                                 err
@@ -715,6 +932,16 @@ async fn execute_proxy_request(
                         }
                     }
                     None => {
+                        drop(active_guard);
+                        if let Some(ref req_model) = model_from_path {
+                            state.usage.record_completed_request(
+                                req_model,
+                                status.as_u16(),
+                                attempt,
+                                req_start.elapsed(),
+                                None,
+                            );
+                        }
                         return UpstreamOutcome {
                             status,
                             headers: res_headers,
@@ -738,6 +965,9 @@ async fn execute_proxy_request(
                         max_retries
                     );
 
+                    if model_from_path.is_some() {
+                        state.usage.record_retry();
+                    }
                     tokio::time::sleep(delay).await;
                     attempt += 1;
                     continue;
@@ -746,6 +976,16 @@ async fn execute_proxy_request(
                         "Upstream error for {} {}: {} (retries exhausted or non-retriable)",
                         method, target_url, err
                     );
+                    drop(active_guard);
+                    if let Some(ref req_model) = model_from_path {
+                        state.usage.record_completed_request(
+                            req_model,
+                            StatusCode::BAD_GATEWAY.as_u16(),
+                            attempt,
+                            req_start.elapsed(),
+                            None,
+                        );
+                    }
                     return UpstreamOutcome::bad_gateway(format!(
                         "Bad Gateway: upstream request failed: {}",
                         err
