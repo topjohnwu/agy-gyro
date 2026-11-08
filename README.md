@@ -64,7 +64,7 @@ Prebuilt executables for Linux, macOS, and Windows are also available in the [la
 
 ### Launching Antigravity (`agy`)
 
-Running `agy-gyro` without subcommands ensures the background daemon is running, configures the environment (`AGY_LLM_GATEWAY_*` and `AGY_ENABLE_HUB=1`), and launches `agy`:
+Running `agy-gyro` (when the first argument is not `server`, `stop`, or `monitor`) ensures the background daemon is running, configures the environment (`AGY_LLM_GATEWAY_*` and `AGY_ENABLE_HUB=1`), and launches `agy` with all arguments transparently passed through:
 
 ```bash
 export GEMINI_API_KEY="your-gemini-api-key"
@@ -72,8 +72,8 @@ export GEMINI_API_KEY="your-gemini-api-key"
 # Launch agy connected to the agy-gyro gateway:
 agy-gyro
 
-# Pass arguments directly through to agy:
-agy-gyro -- --dangerously-skip-permissions
+# Arguments are transparently passed through to agy:
+agy-gyro --dangerously-skip-permissions
 ```
 
 ### Live Usage & Cost TUI Dashboard (`agy-gyro monitor`)
@@ -81,12 +81,7 @@ agy-gyro -- --dangerously-skip-permissions
 `agy-gyro monitor` provides an interactive TUI frontend for real-time token usage, request statistics, estimated USD costs, and gateway logs (use `Tab` or `←`/`→` to switch between `[All Sessions]` and individual `agy` sessions):
 
 ```bash
-# Connect to the default gateway port (127.0.0.1:6470, or port configured in agy-gyro.toml):
 agy-gyro monitor
-
-# Or connect to a specific port or URL:
-agy-gyro monitor --port 9090
-agy-gyro monitor --url http://127.0.0.1:9090
 ```
 
 ### Managing the Background Daemon (`agy-gyro server` / `agy-gyro stop`)
@@ -106,7 +101,7 @@ agy-gyro stop
 `agy-gyro` automatically sets `AGY_ENABLE_HUB=1` when launching `agy`, unlocking Antigravity's local Hub web interface (which requires Enterprise Gateway mode):
 
 ```bash
-agy-gyro -- --hub [--hub-port 4400]
+agy-gyro --hub [--hub-port 4400]
 ```
 
 Once the server is running, open the Hub UI in your browser with `?useWebSocket=true`:
@@ -119,24 +114,22 @@ http://localhost:4400/?useWebSocket=true
 
 ## Configuration
 
-### Options & Flags
+Settings are resolved in order of precedence: **Environment variables > `~/.gemini/config/agy-gyro.toml` > Defaults**. Each configuration key maps to `AGY_GYRO_<KEY>` in uppercase (e.g. `max_retries` -> `AGY_GYRO_MAX_RETRIES`), with `GEMINI_API_KEY` also supported for `api_key`.
 
-Options are resolved in order of precedence: **CLI flags > Environment variables > `~/.gemini/config/agy-gyro.toml` > Defaults**.
-
-| Flag                     | Environment Variable            | Config Key (`agy-gyro.toml`) | Default                                     | Description                                             |
-| :----------------------- | :------------------------------ | :--------------------------- | :------------------------------------------ | :------------------------------------------------------ |
-| `-H`, `--host`           | `AGY_GYRO_HOST`                 | `host`                       | `127.0.0.1`                                 | Host address to bind the gateway server                 |
-| `-p`, `--port`           | `AGY_GYRO_PORT`                 | `port`                       | `6470`                                      | Port to listen on or connect to (`0` = OS-assigned port)|
-| `-u`, `--upstream`       | `AGY_GYRO_UPSTREAM_URL`         | `upstream`                   | `https://generativelanguage.googleapis.com` | Target upstream Gemini API base URL                     |
-| `--api-key`              | `GEMINI_API_KEY`                | `api_key`                    | _Required_                                  | Gemini API key for authenticating upstream requests     |
-| `--agy-path`             | `AGY_GYRO_AGY_PATH`             | `agy_path`                   | `agy`                                       | Executable path for Antigravity CLI                     |
-| `--log-file`             | `AGY_GYRO_LOG_FILE`             | `log_file`                   | _None_                                      | Path to log file for daemon proxy tracing logs          |
-| `--max-retries`          | `AGY_GYRO_MAX_RETRIES`          | `max_retries`                | `15`                                        | Maximum number of retry attempts for retriable errors   |
-| `--initial-delay-ms`     | `AGY_GYRO_INITIAL_DELAY_MS`     | `initial_delay_ms`           | `1000`                                      | Initial retry backoff delay in milliseconds             |
-| `--max-delay-ms`         | `AGY_GYRO_MAX_DELAY_MS`         | `max_delay_ms`               | `60000`                                     | Maximum backoff delay cap in milliseconds               |
-| `--no-jitter`            | `AGY_GYRO_NO_JITTER`            | `no_jitter`                  | `false`                                     | Disable randomized jitter in backoff calculation        |
-| `--no-buffer`            | `AGY_GYRO_NO_BUFFER`            | `no_buffer`                  | `false`                                     | Disable full stream buffering (stream chunks immediately)|
-| `--request-timeout-secs` | `AGY_GYRO_REQUEST_TIMEOUT_SECS` | `request_timeout_secs`       | `600`                                       | Timeout per attempt in seconds                          |
+| Config Key (`agy-gyro.toml`) | Default                                     | Description                                              |
+| :--------------------------- | :------------------------------------------ | :------------------------------------------------------- |
+| `host`                       | `127.0.0.1`                                 | Host address to bind or connect to the gateway server    |
+| `port`                       | `6470`                                      | Port to listen on or connect to (`0` = OS-assigned port) |
+| `upstream`                   | `https://generativelanguage.googleapis.com` | Target upstream Gemini API base URL                      |
+| `api_key`                    | _Required_                                  | Gemini API key for authenticating upstream requests      |
+| `agy_path`                   | `agy`                                       | Executable path for Antigravity CLI                      |
+| `log_file`                   | _None_                                      | Path to log file for daemon proxy tracing logs           |
+| `max_retries`                | `15`                                        | Maximum number of retry attempts for retriable errors    |
+| `initial_delay_ms`           | `1000`                                      | Initial retry backoff delay in milliseconds              |
+| `max_delay_ms`               | `60000`                                     | Maximum backoff delay cap in milliseconds                |
+| `no_jitter`                  | `false`                                     | Disable randomized jitter in backoff calculation         |
+| `no_buffer`                  | `false`                                     | Disable full stream buffering (stream chunks immediately)|
+| `request_timeout_secs`       | `600`                                       | Timeout per attempt in seconds                           |
 
 ### Configuration File (`~/.gemini/config/agy-gyro.toml`)
 
@@ -158,9 +151,9 @@ In default mode, `agy-gyro` buffers all incoming stream chunks before delivering
 3. **Automatic Keep-Alive Heartbeats**: If buffering or retry backoff exceeds 15 seconds, `agy-gyro` commits `200 OK` headers and streams periodic keep-alive heartbeats (`: keep-alive\n\n` for SSE) to satisfy `agy`'s 60-second `ResponseHeaderTimeout` while continuing to buffer and retry in the background.
 4. **Flawless Delivery**: `agy` only receives verified, complete streams without partial output or syntax errors.
 
-### Passthrough Mode (`--no-buffer`)
+### Passthrough Mode (`no_buffer = true`)
 
-When running with `--no-buffer`, `agy-gyro` verifies Chunk 1 and immediately streams subsequent tokens to minimize time-to-first-token latency:
+When `no_buffer = true` (or `AGY_GYRO_NO_BUFFER=true`), `agy-gyro` verifies Chunk 1 and immediately streams subsequent tokens to minimize time-to-first-token latency:
 - **Chunk 1 Error**: Retried seamlessly before sending headers to `agy`.
 - **Mid-Stream Error (Chunk $N > 1$)**: Forwarded downstream to prevent duplicated tokens.
 

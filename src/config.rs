@@ -1,10 +1,9 @@
 // SPDX-License-Identifier: MIT
 
-use clap::parser::ValueSource;
-use clap::{ArgMatches, Args, CommandFactory, FromArgMatches, Parser, Subcommand};
 use serde::Deserialize;
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
+use std::str::FromStr;
 
 /// Default TCP port for the local gateway server and monitor (`6470` = `GYRO` in leetspeak).
 pub const DEFAULT_PORT: u16 = 6470;
@@ -33,19 +32,9 @@ pub const EXCLUDED_MODELS: &[&str] = &[
     "gemini-3.7-flash",
 ];
 
-#[derive(Parser, Debug, Clone)]
-#[command(
-    name = "agy-gyro",
-    author,
-    version,
-    about = "Local Antigravity Enterprise Gateway and Gemini API retry proxy for Antigravity CLI (agy)",
-    subcommand_negates_reqs = true
-)]
+#[derive(Debug, Clone)]
 pub struct Cli {
-    #[command(subcommand)]
     pub command: Option<Commands>,
-
-    #[command(flatten)]
     pub wrapper_args: WrapperArgs,
 }
 
@@ -93,91 +82,174 @@ impl FileConfig {
     }
 }
 
-fn is_explicit_source(matches: &ArgMatches, id: &str) -> bool {
-    matches!(
-        matches.value_source(id),
-        Some(ValueSource::CommandLine | ValueSource::EnvVariable)
-    )
+fn env_non_empty(name: &str) -> Option<String> {
+    std::env::var(name).ok().filter(|v| !v.trim().is_empty())
+}
+
+fn env_parse<T: FromStr>(name: &str) -> Result<Option<T>, String>
+where
+    T::Err: std::fmt::Display,
+{
+    match env_non_empty(name) {
+        Some(raw) => raw
+            .trim()
+            .parse::<T>()
+            .map(Some)
+            .map_err(|e| format!("Invalid value '{}' for {}: {}", raw, name, e)),
+        None => Ok(None),
+    }
+}
+
+fn env_bool(name: &str) -> Result<Option<bool>, String> {
+    match env_non_empty(name) {
+        Some(raw) => match raw.trim().to_ascii_lowercase().as_str() {
+            "true" | "1" | "yes" => Ok(Some(true)),
+            "false" | "0" | "no" => Ok(Some(false)),
+            _ => Err(format!("Invalid boolean value '{}' for {}", raw, name)),
+        },
+        None => Ok(None),
+    }
 }
 
 impl Cli {
-    /// Parses CLI arguments, environment variables, and `~/.gemini/config/agy-gyro.toml`,
-    /// exiting on error.
+    /// Loads action from the first CLI argument and settings from environment variables
+    /// and `~/.gemini/config/agy-gyro.toml`, exiting on error.
     pub fn load() -> Self {
         Self::try_parse_with_config_from(std::env::args_os(), default_config_path().as_deref())
-            .unwrap_or_else(|e| e.exit())
+            .unwrap_or_else(|e| {
+                eprintln!("error: {e}");
+                std::process::exit(2);
+            })
     }
 
-    /// Parses from an iterator of arguments along with an optional TOML configuration file path.
+    /// Parses the action from the first argument of `itr` (or passes arguments through to `agy`)
+    /// and resolves settings from environment variables and an optional TOML configuration file.
     ///
-    /// Precedence order (highest to lowest):
-    /// 1. Command-line flags
-    /// 2. Environment variables
-    /// 3. Configuration file (`~/.gemini/config/agy-gyro.toml`)
-    /// 4. Built-in default values
+    /// Settings precedence order (highest to lowest):
+    /// 1. Environment variables
+    /// 2. Configuration file (`~/.gemini/config/agy-gyro.toml`)
+    /// 3. Built-in default values
     pub fn try_parse_with_config_from<I, T>(
         itr: I,
         config_path: Option<&Path>,
-    ) -> Result<Self, clap::Error>
+    ) -> Result<Self, String>
     where
         I: IntoIterator<Item = T>,
-        T: Into<OsString> + Clone,
+        T: Into<OsString>,
     {
-        let matches = Self::command().try_get_matches_from(itr)?;
-        let mut cli = Self::from_arg_matches(&matches)?;
+        let args: Vec<String> = itr
+            .into_iter()
+            .skip(1)
+            .map(|a| a.into().to_string_lossy().into_owned())
+            .collect();
 
         let file_config = match config_path {
-            Some(path) => FileConfig::load_from_path(path).map_err(|msg| {
-                Self::command().error(clap::error::ErrorKind::ValueValidation, msg)
-            })?,
-            None => None,
+            Some(path) => FileConfig::load_from_path(path)?.unwrap_or_default(),
+            None => FileConfig::default(),
         };
 
-        if let Some(ref fc) = file_config {
-            match cli.command {
-                Some(Commands::Server(ref mut server_args)) => {
-                    let sub_matches = matches.subcommand_matches("server").unwrap_or(&matches);
-                    server_args.apply_file_config(sub_matches, fc);
-                }
-                Some(Commands::Run(ref mut wrapper_args)) => {
-                    let sub_matches = matches.subcommand_matches("run").unwrap_or(&matches);
-                    wrapper_args.apply_file_config(sub_matches, fc);
-                }
-                Some(Commands::Monitor(ref mut monitor_args)) => {
-                    let sub_matches = matches.subcommand_matches("monitor").unwrap_or(&matches);
-                    monitor_args.apply_file_config(sub_matches, fc);
-                }
-                Some(Commands::Stop(ref mut stop_args)) => {
-                    let sub_matches = matches.subcommand_matches("stop").unwrap_or(&matches);
-                    stop_args.apply_file_config(sub_matches, fc);
-                }
-                None => {
-                    cli.wrapper_args.apply_file_config(&matches, fc);
-                }
-            }
-        }
+        let host = env_non_empty("AGY_GYRO_HOST")
+            .or(file_config.host)
+            .unwrap_or_else(|| "127.0.0.1".to_string());
+        let port = env_parse::<u16>("AGY_GYRO_PORT")?
+            .or(file_config.port)
+            .unwrap_or(DEFAULT_PORT);
+        let upstream = env_non_empty("AGY_GYRO_UPSTREAM")
+            .or_else(|| env_non_empty("AGY_GYRO_UPSTREAM_URL"))
+            .or(file_config.upstream)
+            .unwrap_or_else(|| "https://generativelanguage.googleapis.com".to_string());
+        let max_retries = env_parse::<u32>("AGY_GYRO_MAX_RETRIES")?
+            .or(file_config.max_retries)
+            .unwrap_or(15);
+        let initial_delay_ms = env_parse::<u64>("AGY_GYRO_INITIAL_DELAY_MS")?
+            .or(file_config.initial_delay_ms)
+            .unwrap_or(1000);
+        let max_delay_ms = env_parse::<u64>("AGY_GYRO_MAX_DELAY_MS")?
+            .or(file_config.max_delay_ms)
+            .unwrap_or(60000);
+        let no_jitter = env_bool("AGY_GYRO_NO_JITTER")?
+            .or(file_config.no_jitter)
+            .unwrap_or(false);
+        let no_buffer = env_bool("AGY_GYRO_NO_BUFFER")?
+            .or(file_config.no_buffer)
+            .unwrap_or(false);
+        let request_timeout_secs = env_parse::<u64>("AGY_GYRO_REQUEST_TIMEOUT_SECS")?
+            .or(file_config.request_timeout_secs)
+            .unwrap_or(600);
+        let api_key = env_non_empty("GEMINI_API_KEY")
+            .or_else(|| env_non_empty("AGY_GYRO_API_KEY"))
+            .or(file_config.api_key)
+            .unwrap_or_default();
+        let agy_path = env_non_empty("AGY_GYRO_AGY_PATH")
+            .or(file_config.agy_path)
+            .unwrap_or_else(|| "agy".to_string());
+        let log_file = env_non_empty("AGY_GYRO_LOG_FILE")
+            .map(PathBuf::from)
+            .or(file_config.log_file);
+        let url = env_non_empty("AGY_GYRO_URL");
 
-        let active_config = match &cli.command {
-            Some(Commands::Server(s)) => Some(&s.config),
-            Some(Commands::Run(w)) => Some(&w.config),
-            Some(Commands::Monitor(_) | Commands::Stop(_)) => None,
-            None => Some(&cli.wrapper_args.config),
+        let config = Config {
+            host: host.clone(),
+            port,
+            upstream,
+            max_retries,
+            initial_delay_ms,
+            max_delay_ms,
+            no_jitter,
+            no_buffer,
+            request_timeout_secs,
+            api_key,
         };
 
-        if let Some(cfg) = active_config
-            && cfg.api_key.trim().is_empty()
-        {
-            return Err(Self::command().error(
-                clap::error::ErrorKind::MissingRequiredArgument,
-                "the following required arguments were not provided:\n  --api-key <API_KEY> (via --api-key, GEMINI_API_KEY, or ~/.gemini/config/agy-gyro.toml)",
-            ));
+        let command = match args.first().map(|s| s.as_str()) {
+            Some("server") => Some(Commands::Server(ServerArgs {
+                config: config.clone(),
+                log_file: log_file.clone(),
+            })),
+            Some("monitor") => Some(Commands::Monitor(MonitorArgs {
+                url: url.clone(),
+                host: host.clone(),
+                port,
+            })),
+            Some("stop") => Some(Commands::Stop(MonitorArgs { url, host, port })),
+            _ => None,
+        };
+
+        let agy_args = if command.is_some() {
+            Vec::new()
+        } else if args.first().map(|s| s.as_str()) == Some("--") {
+            args[1..].to_vec()
+        } else {
+            args
+        };
+
+        let wrapper_args = WrapperArgs {
+            config,
+            agy_path,
+            log_file,
+            agy_args,
+        };
+
+        let requires_api_key = matches!(
+            command,
+            Some(Commands::Server(_)) | Some(Commands::Run(_)) | None
+        );
+
+        if requires_api_key && wrapper_args.config.api_key.trim().is_empty() {
+            return Err(
+                "missing Gemini API key: set GEMINI_API_KEY or configure `api_key` in ~/.gemini/config/agy-gyro.toml"
+                    .to_string(),
+            );
         }
 
-        Ok(cli)
+        Ok(Self {
+            command,
+            wrapper_args,
+        })
     }
 }
 
-#[derive(Subcommand, Debug, Clone)]
+#[derive(Debug, Clone)]
 pub enum Commands {
     /// Start the background agy-gyro daemon (if not already running)
     Server(ServerArgs),
@@ -189,35 +261,17 @@ pub enum Commands {
     Stop(MonitorArgs),
 }
 
-#[derive(Args, Debug, Clone)]
+#[derive(Debug, Clone)]
 pub struct MonitorArgs {
     /// Target agy-gyro gateway URL or /usage endpoint URL
-    #[arg(short = 'u', long, env = "AGY_GYRO_URL")]
     pub url: Option<String>,
-
     /// Host address of the local agy-gyro server
-    #[arg(short = 'H', long, env = "AGY_GYRO_HOST", default_value = "127.0.0.1")]
     pub host: String,
-
     /// Port of the local agy-gyro server
-    #[arg(short = 'p', long, env = "AGY_GYRO_PORT", default_value_t = DEFAULT_PORT)]
     pub port: u16,
 }
 
 impl MonitorArgs {
-    pub fn apply_file_config(&mut self, matches: &ArgMatches, file: &FileConfig) {
-        if !is_explicit_source(matches, "host")
-            && let Some(ref v) = file.host
-        {
-            self.host = v.clone();
-        }
-        if !is_explicit_source(matches, "port")
-            && let Some(v) = file.port
-        {
-            self.port = v;
-        }
-    }
-
     pub fn resolve_base_url(&self) -> String {
         if let Some(ref u) = self.url {
             let trimmed = u.trim().trim_end_matches('/');
@@ -249,108 +303,45 @@ impl MonitorArgs {
     }
 }
 
-#[derive(Args, Debug, Clone)]
+#[derive(Debug, Clone)]
 pub struct ServerArgs {
-    #[command(flatten)]
     pub config: Config,
-
     /// Optional log file path for agy-gyro proxy tracing logs
-    #[arg(long, env = "AGY_GYRO_LOG_FILE")]
     pub log_file: Option<PathBuf>,
 }
 
-impl ServerArgs {
-    pub fn apply_file_config(&mut self, matches: &ArgMatches, file: &FileConfig) {
-        self.config.apply_file_config(matches, file);
-        if !is_explicit_source(matches, "log_file") && self.log_file.is_none() {
-            self.log_file = file.log_file.clone();
-        }
-    }
-}
-
-#[derive(Args, Debug, Clone)]
+#[derive(Debug, Clone)]
 pub struct WrapperArgs {
-    #[command(flatten)]
     pub config: Config,
-
     /// Executable path or command name for Antigravity CLI
-    #[arg(long, env = "AGY_GYRO_AGY_PATH", default_value = "agy")]
     pub agy_path: String,
-
     /// Optional log file path for agy-gyro proxy tracing logs
-    #[arg(long, env = "AGY_GYRO_LOG_FILE")]
     pub log_file: Option<PathBuf>,
-
     /// Raw arguments passed through directly to agy
-    #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
     pub agy_args: Vec<String>,
 }
 
-impl WrapperArgs {
-    pub fn apply_file_config(&mut self, matches: &ArgMatches, file: &FileConfig) {
-        self.config.apply_file_config(matches, file);
-        if !is_explicit_source(matches, "agy_path")
-            && let Some(ref v) = file.agy_path
-        {
-            self.agy_path = v.clone();
-        }
-        if !is_explicit_source(matches, "log_file") && self.log_file.is_none() {
-            self.log_file = file.log_file.clone();
-        }
-    }
-}
-
-#[derive(Args, Debug, Clone)]
+#[derive(Debug, Clone)]
 pub struct Config {
     /// Host address to bind the proxy server to
-    #[arg(short = 'H', long, env = "AGY_GYRO_HOST", default_value = "127.0.0.1")]
     pub host: String,
-
     /// Port to listen on
-    #[arg(short = 'p', long, env = "AGY_GYRO_PORT", default_value_t = DEFAULT_PORT)]
     pub port: u16,
-
     /// Upstream Gemini API base URL
-    #[arg(
-        short = 'u',
-        long,
-        env = "AGY_GYRO_UPSTREAM_URL",
-        default_value = "https://generativelanguage.googleapis.com"
-    )]
     pub upstream: String,
-
     /// Maximum retry attempts on retriable errors
-    #[arg(long, env = "AGY_GYRO_MAX_RETRIES", default_value_t = 15)]
     pub max_retries: u32,
-
     /// Initial retry backoff delay in milliseconds
-    #[arg(long, env = "AGY_GYRO_INITIAL_DELAY_MS", default_value_t = 1000)]
     pub initial_delay_ms: u64,
-
     /// Maximum retry backoff delay in milliseconds
-    #[arg(long, env = "AGY_GYRO_MAX_DELAY_MS", default_value_t = 60000)]
     pub max_delay_ms: u64,
-
     /// Disable jitter in exponential backoff calculation
-    #[arg(long, env = "AGY_GYRO_NO_JITTER", default_value_t = false)]
     pub no_jitter: bool,
-
     /// Disable full stream chunk buffering (stream chunks immediately to client after first chunk)
-    #[arg(long, env = "AGY_GYRO_NO_BUFFER", default_value_t = false)]
     pub no_buffer: bool,
-
     /// Client request timeout in seconds (for long thinking / generation requests)
-    #[arg(long, env = "AGY_GYRO_REQUEST_TIMEOUT_SECS", default_value_t = 600)]
     pub request_timeout_secs: u64,
-
     /// Gemini API key for authenticating upstream requests
-    #[arg(
-        long,
-        env = "GEMINI_API_KEY",
-        hide_env_values = true,
-        default_value = "",
-        hide_default_value = true
-    )]
     pub api_key: String,
 }
 
@@ -361,58 +352,5 @@ impl Config {
 
     pub fn is_buffer_enabled(&self) -> bool {
         !self.no_buffer
-    }
-
-    pub fn apply_file_config(&mut self, matches: &ArgMatches, file: &FileConfig) {
-        if !is_explicit_source(matches, "host")
-            && let Some(ref v) = file.host
-        {
-            self.host = v.clone();
-        }
-        if !is_explicit_source(matches, "port")
-            && let Some(v) = file.port
-        {
-            self.port = v;
-        }
-        if !is_explicit_source(matches, "upstream")
-            && let Some(ref v) = file.upstream
-        {
-            self.upstream = v.clone();
-        }
-        if !is_explicit_source(matches, "max_retries")
-            && let Some(v) = file.max_retries
-        {
-            self.max_retries = v;
-        }
-        if !is_explicit_source(matches, "initial_delay_ms")
-            && let Some(v) = file.initial_delay_ms
-        {
-            self.initial_delay_ms = v;
-        }
-        if !is_explicit_source(matches, "max_delay_ms")
-            && let Some(v) = file.max_delay_ms
-        {
-            self.max_delay_ms = v;
-        }
-        if !is_explicit_source(matches, "no_jitter")
-            && let Some(v) = file.no_jitter
-        {
-            self.no_jitter = v;
-        }
-        if !is_explicit_source(matches, "no_buffer")
-            && let Some(v) = file.no_buffer
-        {
-            self.no_buffer = v;
-        }
-        if !is_explicit_source(matches, "request_timeout_secs")
-            && let Some(v) = file.request_timeout_secs
-        {
-            self.request_timeout_secs = v;
-        }
-        if (!is_explicit_source(matches, "api_key") || self.api_key.trim().is_empty())
-            && let Some(ref v) = file.api_key
-        {
-            self.api_key = v.clone();
-        }
     }
 }
