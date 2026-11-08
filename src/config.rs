@@ -137,7 +137,7 @@ impl Cli {
             match cli.command {
                 Some(Commands::Server(ref mut server_args)) => {
                     let sub_matches = matches.subcommand_matches("server").unwrap_or(&matches);
-                    server_args.config.apply_file_config(sub_matches, fc);
+                    server_args.apply_file_config(sub_matches, fc);
                 }
                 Some(Commands::Run(ref mut wrapper_args)) => {
                     let sub_matches = matches.subcommand_matches("run").unwrap_or(&matches);
@@ -230,6 +230,19 @@ impl MonitorArgs {
 pub struct ServerArgs {
     #[command(flatten)]
     pub config: Config,
+
+    /// Optional log file path for agy-gyro proxy tracing logs
+    #[arg(long, env = "AGY_GYRO_LOG_FILE")]
+    pub log_file: Option<PathBuf>,
+}
+
+impl ServerArgs {
+    pub fn apply_file_config(&mut self, matches: &ArgMatches, file: &FileConfig) {
+        self.config.apply_file_config(matches, file);
+        if !is_explicit_source(matches, "log_file") && self.log_file.is_none() {
+            self.log_file = file.log_file.clone();
+        }
+    }
 }
 
 #[derive(Args, Debug, Clone)]

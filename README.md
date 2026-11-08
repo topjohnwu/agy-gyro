@@ -62,9 +62,9 @@ Prebuilt executables for Linux, macOS, and Windows are also available in the [la
 
 `agy-gyro` operates in three modes: **Wrapper Mode** (default), **Standalone Server Mode**, and **Live TUI Monitor Mode**.
 
-### Mode 1: Wrapper Mode (Default)
+### Mode 1: Launcher Mode (Default)
 
-Running `agy-gyro` without subcommands automatically starts an in-process Enterprise Gateway server on `127.0.0.1:6470` (configurable via `-p` / `--port`), configures `AGY_LLM_GATEWAY_URL`, `AGY_LLM_GATEWAY_WIRE_PROTOCOL=genai`, `AGY_LLM_GATEWAY_API_KEY`, `AGY_LLM_GATEWAY_MODELS`, and `AGY_ENABLE_HUB=1`, and launches `agy`.
+Running `agy-gyro` without subcommands connects to the local Enterprise Gateway daemon on `127.0.0.1:6470` (automatically spawning a single persistent background daemon if none is running yet), registers a session for the current process PID, configures `AGY_LLM_GATEWAY_URL`, `AGY_LLM_GATEWAY_WIRE_PROTOCOL=genai`, `AGY_LLM_GATEWAY_API_KEY`, `AGY_LLM_GATEWAY_MODELS`, and `AGY_ENABLE_HUB=1`, and replaces itself in-place with `agy` (`execvp` on Unix). No wrapper process remains—only a single shared background daemon process runs across all `agy` instances, tracking each session's token usage, cost, and OS process liveness independently.
 
 ```bash
 # Simply launch agy wrapped with agy-gyro gateway:
@@ -88,12 +88,12 @@ agy-gyro server
 ### Mode 3: Live Usage & Cost TUI Dashboard (`agy-gyro monitor`)
 
 `agy-gyro` exposes two real-time Server-Sent Events (SSE) endpoints:
-- `GET /usage` (resettable via `DELETE /usage`): streams live token usage, request counters, and USD cost breakdowns (`UsageSnapshot`).
+- `GET /usage` (resettable via `DELETE /usage` or `DELETE /usage?session=<id>`): streams live token usage, request counters, and USD cost breakdowns across all sessions and per `agy` session (`UsageSnapshot`).
 - `GET /logs`: streams real-time gateway tracing logs (`Vec<LogEntry>`).
 
 It fetches live Gemini model pricing from `https://models.dev/api.json` on startup (with a built-in fallback pricing table).
 
-In a second terminal, launch the interactive TUI dashboard (which connects to both `/usage` and `/logs` on `127.0.0.1:6470` by default):
+In a second terminal, launch the interactive TUI dashboard (use `Tab` or `←`/`→` to switch between `[All Sessions]` and individual `agy` sessions):
 
 ```bash
 # Connect to the default gateway port (127.0.0.1:6470, or port configured in agy-gyro.toml):

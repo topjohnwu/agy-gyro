@@ -498,42 +498,50 @@ async fn test_no_buffer_mode_passes_through_midstream_error() {
 
 #[tokio::test]
 async fn test_run_wrapper_executes_child_and_propagates_exit_code() {
-    use agy_gyro::config::{Config, WrapperArgs};
-    use agy_gyro::runner::run_wrapper;
+    use agy_gyro::tui::fetch_usage_snapshot;
 
     let mock_server = MockServer::start().await;
+    let proxy_url = spawn_test_proxy(mock_server.uri(), 3).await;
+    let port = reqwest::Url::parse(&proxy_url)
+        .unwrap()
+        .port()
+        .expect("proxy port");
 
-    let wrapper_args = WrapperArgs {
-        config: Config {
-            host: "127.0.0.1".to_string(),
-            port: 0,
-            upstream: mock_server.uri(),
-            max_retries: 3,
-            initial_delay_ms: 10,
-            max_delay_ms: 100,
-            no_jitter: true,
-            no_buffer: false,
-            request_timeout_secs: 10,
-            api_key: "test-gemini-key".to_string(),
-        },
-        agy_path: "sh".to_string(),
-        log_file: None,
-        agy_args: vec![
-            "-c".to_string(),
+    let status = tokio::process::Command::new(env!("CARGO_BIN_EXE_agy-gyro"))
+        .args([
+            "-H",
+            "127.0.0.1",
+            "-p",
+            &port.to_string(),
+            "--api-key",
+            "test-gemini-key",
+            "--agy-path",
+            "sh",
+            "--",
+            "-c",
             r#"
                 test -n "$AGY_LLM_GATEWAY_URL" &&
                 test "$AGY_LLM_GATEWAY_WIRE_PROTOCOL" = "genai" &&
-                test "$AGY_LLM_GATEWAY_API_KEY" = "agy-gyro" &&
+                case "$AGY_LLM_GATEWAY_API_KEY" in "gyro:1:$$:"*) ;; *) exit 1 ;; esac &&
                 test -n "$AGY_LLM_GATEWAY_MODELS" &&
                 test "$AGY_ENABLE_HUB" = "1" &&
                 exit 42
-            "#
-            .to_string(),
-        ],
-    };
+            "#,
+        ])
+        .status()
+        .await
+        .unwrap();
 
-    let exit_code = run_wrapper(wrapper_args).await.unwrap();
-    assert_eq!(exit_code, 42);
+    assert_eq!(status.code(), Some(42));
+
+    // OS-level process monitor detects that the replaced `sh` process ($$) has exited
+    let client = Client::new();
+    let snap = fetch_usage_snapshot(&client, &format!("{}/usage", proxy_url))
+        .await
+        .unwrap();
+    assert_eq!(snap.sessions.len(), 1);
+    assert_eq!(snap.sessions[0].id, "1");
+    assert!(!snap.sessions[0].active);
 }
 
 #[tokio::test]
@@ -1227,4 +1235,145 @@ fn test_cli_parse_monitor_subcommand_without_api_key() {
         }
         _ => panic!("expected Monitor command"),
     }
+}
+
+#[tokio::test]
+async fn test_multi_session_registration_attribution_and_exit() {
+    use agy_gyro::proxy::{RegisterSessionRequest, RegisterSessionResponse};
+    use agy_gyro::tui::{fetch_usage_snapshot, reset_remote_session_usage};
+
+    let mock_server = MockServer::start().await;
+
+    Mock::given(method("POST"))
+        .and(path("/v1beta/models/gemini-4-argon:generateContent"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "application/json")
+                .set_body_json(serde_json::json!({
+                    "candidates": [{ "content": { "parts": [{ "text": "OK" }] } }],
+                    "usageMetadata": {
+                        "promptTokenCount": 50000,
+                        "cachedContentTokenCount": 25000,
+                        "candidatesTokenCount": 1000,
+                        "thoughtsTokenCount": 1000,
+                        "totalTokenCount": 52000
+                    },
+                    "modelVersion": "gemini-4-argon"
+                })),
+        )
+        .expect(2)
+        .mount(&mock_server)
+        .await;
+
+    let proxy_url = spawn_test_proxy(mock_server.uri(), 3).await;
+    let client = Client::new();
+
+    // Spawn a short-lived OS process to represent Session 2's `agy` instance
+    let mut dummy_proc = tokio::process::Command::new("sh")
+        .args(["-c", "sleep 10"])
+        .spawn()
+        .unwrap();
+    let session2_pid = dummy_proc.id().expect("dummy process pid");
+
+    // Register Session 1 (current test process PID, stays alive) and Session 2 (dummy process PID)
+    let reg1: RegisterSessionResponse = client
+        .post(format!("{}/sessions", proxy_url))
+        .json(&RegisterSessionRequest {
+            pid: Some(std::process::id()),
+            label: "workspace-one".to_string(),
+        })
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(reg1.session_id, "1");
+
+    // Re-registering with the same active PID is idempotent and returns session #1
+    let reg1_dup: RegisterSessionResponse = client
+        .post(format!("{}/sessions", proxy_url))
+        .json(&RegisterSessionRequest {
+            pid: Some(std::process::id()),
+            label: "workspace-one".to_string(),
+        })
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(reg1_dup.session_id, "1");
+
+    let reg2: RegisterSessionResponse = client
+        .post(format!("{}/sessions", proxy_url))
+        .json(&RegisterSessionRequest {
+            pid: Some(session2_pid),
+            label: "workspace-two".to_string(),
+        })
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(reg2.session_id, "2");
+    assert_eq!(
+        reg2.api_key,
+        format!("gyro:2:{}:workspace-two", session2_pid)
+    );
+
+    // Send 1 request for each session
+    for api_key in [&reg1.api_key, &reg2.api_key] {
+        let res = client
+            .post(format!(
+                "{}/v1beta/models/gemini-4-argon:generateContent",
+                proxy_url
+            ))
+            .header("Authorization", format!("Bearer {}", api_key))
+            .body(r#"{"contents":[]}"#)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(res.status(), 200);
+    }
+
+    // Terminate Session 2's OS process and reap it so OS-level process monitoring sees it exited
+    dummy_proc.kill().await.unwrap();
+    let _ = dummy_proc.wait().await;
+
+    let usage_url = format!("{}/usage", proxy_url);
+    let snap = fetch_usage_snapshot(&client, &usage_url).await.unwrap();
+    assert_eq!(snap.total_requests, 2);
+    assert_eq!(snap.totals.input_tokens, 100_000);
+    assert_eq!(snap.sessions.len(), 2);
+    assert_eq!(snap.sessions[0].id, "1");
+    assert_eq!(snap.sessions[0].label, "workspace-one");
+    assert!(snap.sessions[0].active);
+    assert_eq!(snap.sessions[0].totals.input_tokens, 50_000);
+
+    assert_eq!(snap.sessions[1].id, "2");
+    assert_eq!(snap.sessions[1].label, "workspace-two");
+    assert!(!snap.sessions[1].active);
+    assert_eq!(snap.sessions[1].totals.input_tokens, 50_000);
+
+    // Selectively resetting exited session 2 removes it and subtracts its tokens from global totals
+    let snap_after = reset_remote_session_usage(&client, &usage_url, Some("2"))
+        .await
+        .unwrap();
+    assert_eq!(snap_after.sessions.len(), 1);
+    assert_eq!(snap_after.sessions[0].id, "1");
+    assert_eq!(snap_after.total_requests, 1);
+    assert_eq!(snap_after.totals.input_tokens, 50_000);
+
+    // Unconditionally removing session 1 via DELETE /sessions/1 removes it even while active
+    let del_res = client
+        .delete(format!("{}/sessions/1", proxy_url))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(del_res.status(), 204);
+    let snap_empty = fetch_usage_snapshot(&client, &usage_url).await.unwrap();
+    assert!(snap_empty.sessions.is_empty());
+    assert_eq!(snap_empty.total_requests, 0);
 }

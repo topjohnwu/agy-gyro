@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
 
 use crate::config::MonitorArgs;
-use crate::usage::{LogEntry, ModelUsageStats, UsageSnapshot};
+use crate::usage::{LogEntry, ModelUsageStats, SessionUsageStats, UsageSnapshot};
 use crossterm::{
     event::{self, Event, KeyCode, KeyEventKind, KeyModifiers},
     execute,
@@ -142,8 +142,22 @@ pub async fn reset_remote_usage(
     client: &reqwest::Client,
     endpoint_url: &str,
 ) -> Result<UsageSnapshot, String> {
+    reset_remote_session_usage(client, endpoint_url, None).await
+}
+
+/// Resets usage statistics for all sessions (`None`) or a single session (`Some(session_id)`)
+/// via `DELETE /usage` or `DELETE /usage?session=<id>`.
+pub async fn reset_remote_session_usage(
+    client: &reqwest::Client,
+    endpoint_url: &str,
+    session_id: Option<&str>,
+) -> Result<UsageSnapshot, String> {
+    let url = match session_id {
+        Some(sid) => format!("{}?session={}", endpoint_url, sid),
+        None => endpoint_url.to_string(),
+    };
     let res = client
-        .delete(endpoint_url)
+        .delete(&url)
         .timeout(Duration::from_secs(2))
         .send()
         .await
@@ -163,6 +177,7 @@ pub struct DashboardState {
     pub endpoint_url: String,
     pub snapshot: Option<UsageSnapshot>,
     pub logs: Vec<LogEntry>,
+    pub selected_session: Option<String>,
     pub connected: bool,
     pub last_error: Option<String>,
     pub status_message: Option<(String, Instant)>,
@@ -178,6 +193,7 @@ impl DashboardState {
             endpoint_url,
             snapshot: None,
             logs: Vec::new(),
+            selected_session: None,
             connected: false,
             last_error: None,
             status_message: None,
@@ -187,11 +203,83 @@ impl DashboardState {
         }
     }
 
+    /// Returns the currently selected [`SessionUsageStats`] if a specific session tab is active.
+    pub fn active_session(&self) -> Option<&SessionUsageStats> {
+        let sid = self.selected_session.as_deref()?;
+        self.snapshot
+            .as_ref()?
+            .sessions
+            .iter()
+            .find(|s| s.id == sid)
+    }
+
+    /// Switches to the next session tab (`[All Sessions]` -> `#1` -> `#2` -> ... -> `[All Sessions]`).
+    pub fn select_next_session(&mut self) {
+        let Some(ref snap) = self.snapshot else {
+            self.selected_session = None;
+            return;
+        };
+        if snap.sessions.is_empty() {
+            self.selected_session = None;
+            return;
+        }
+        match self.selected_session.as_deref() {
+            None => {
+                self.selected_session = Some(snap.sessions[0].id.clone());
+            }
+            Some(cur) => {
+                if let Some(pos) = snap.sessions.iter().position(|s| s.id == cur) {
+                    if pos + 1 < snap.sessions.len() {
+                        self.selected_session = Some(snap.sessions[pos + 1].id.clone());
+                    } else {
+                        self.selected_session = None;
+                    }
+                } else {
+                    self.selected_session = None;
+                }
+            }
+        }
+        self.log_scroll_from_bottom = 0;
+    }
+
+    /// Switches to the previous session tab (`[All Sessions]` <- `#1` <- `#2` <- ...).
+    pub fn select_prev_session(&mut self) {
+        let Some(ref snap) = self.snapshot else {
+            self.selected_session = None;
+            return;
+        };
+        if snap.sessions.is_empty() {
+            self.selected_session = None;
+            return;
+        }
+        match self.selected_session.as_deref() {
+            None => {
+                self.selected_session = snap.sessions.last().map(|s| s.id.clone());
+            }
+            Some(cur) => {
+                if let Some(pos) = snap.sessions.iter().position(|s| s.id == cur) {
+                    if pos > 0 {
+                        self.selected_session = Some(snap.sessions[pos - 1].id.clone());
+                    } else {
+                        self.selected_session = None;
+                    }
+                } else {
+                    self.selected_session = None;
+                }
+            }
+        }
+        self.log_scroll_from_bottom = 0;
+    }
+
     pub fn sorted_models(&self) -> Vec<&ModelUsageStats> {
         let Some(ref snap) = self.snapshot else {
             return Vec::new();
         };
-        let mut list: Vec<&ModelUsageStats> = snap.models.values().collect();
+        let models_map = match self.active_session() {
+            Some(sess) => &sess.models,
+            None => &snap.models,
+        };
+        let mut list: Vec<&ModelUsageStats> = models_map.values().collect();
         list.sort_by(|a, b| {
             b.totals
                 .total_cost_usd
@@ -203,10 +291,22 @@ impl DashboardState {
         list
     }
 
+    /// Returns log entries filtered by the active session tab (or all logs when `[All Sessions]` is selected).
+    pub fn visible_logs(&self) -> Vec<&LogEntry> {
+        match self.selected_session.as_deref() {
+            Some(sid) => self
+                .logs
+                .iter()
+                .filter(|l| l.session_id.as_deref() == Some(sid))
+                .collect(),
+            None => self.logs.iter().collect(),
+        }
+    }
+
     /// Maximum number of lines the log panel can scroll up from the bottom
     /// while keeping the viewport full (`logs[0]` at the top row).
     pub fn max_log_scroll(&self) -> usize {
-        self.logs
+        self.visible_logs()
             .len()
             .saturating_sub(self.log_viewport_height.max(1))
     }
@@ -235,21 +335,27 @@ impl DashboardState {
 
     /// Updates the log buffer while keeping the viewport anchored on the same log lines when paused.
     pub fn set_logs(&mut self, new_logs: Vec<LogEntry>) {
-        if self.log_scroll_from_bottom > 0 && !self.logs.is_empty() {
-            let max_prev_scroll = self.max_log_scroll();
-            let effective_prev_scroll = self.log_scroll_from_bottom.min(max_prev_scroll);
-            let prev_end_idx = self.logs.len().saturating_sub(effective_prev_scroll);
-            if prev_end_idx > 0
-                && let Some(anchor_id) = self.logs.get(prev_end_idx - 1).map(|l| l.id)
-            {
-                self.logs = new_logs;
-                if let Some(pos) = self.logs.iter().position(|l| l.id == anchor_id) {
-                    let new_scroll = self.logs.len().saturating_sub(pos + 1);
-                    self.log_scroll_from_bottom = new_scroll.min(self.max_log_scroll());
-                } else {
-                    self.log_scroll_from_bottom = self.max_log_scroll();
+        if self.log_scroll_from_bottom > 0 {
+            let visible = self.visible_logs();
+            if !visible.is_empty() {
+                let max_prev_scroll = visible
+                    .len()
+                    .saturating_sub(self.log_viewport_height.max(1));
+                let effective_prev_scroll = self.log_scroll_from_bottom.min(max_prev_scroll);
+                let prev_end_idx = visible.len().saturating_sub(effective_prev_scroll);
+                if prev_end_idx > 0
+                    && let Some(anchor_id) = visible.get(prev_end_idx - 1).map(|l| l.id)
+                {
+                    self.logs = new_logs;
+                    let new_visible = self.visible_logs();
+                    if let Some(pos) = new_visible.iter().position(|l| l.id == anchor_id) {
+                        let new_scroll = new_visible.len().saturating_sub(pos + 1);
+                        self.log_scroll_from_bottom = new_scroll.min(self.max_log_scroll());
+                    } else {
+                        self.log_scroll_from_bottom = self.max_log_scroll();
+                    }
+                    return;
                 }
-                return;
             }
         }
         self.logs = new_logs;
@@ -298,7 +404,7 @@ fn dashboard_chunks(area: Rect) -> std::rc::Rc<[Rect]> {
     Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(3),  // Header bar
+            Constraint::Length(4),  // Header bar + Session tab bar
             Constraint::Length(6),  // 4 Summary cards
             Constraint::Length(10), // Per-model breakdown table
             Constraint::Min(8),     // Real-time gateway logs
@@ -322,12 +428,18 @@ fn render_header(frame: &mut Frame, area: Rect, state: &DashboardState) {
     let spinner_frames = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
     let spinner = spinner_frames[(state.tick_count as usize) % spinner_frames.len()];
 
+    let active_in_flight = state
+        .active_session()
+        .map(|s| s.active_requests)
+        .or_else(|| state.snapshot.as_ref().map(|s| s.active_requests))
+        .unwrap_or(0);
+
     let (status_span, uptime_str, pricing_src, active_span) =
         match (&state.snapshot, state.connected) {
             (Some(snap), true) => {
-                let active = if snap.active_requests > 0 {
+                let active = if active_in_flight > 0 {
                     Span::styled(
-                        format!(" {} {} in-flight ", spinner, snap.active_requests),
+                        format!(" {} {} in-flight ", spinner, active_in_flight),
                         Style::default()
                             .fg(Color::Black)
                             .bg(Color::Cyan)
@@ -381,12 +493,85 @@ fn render_header(frame: &mut Frame, area: Rect, state: &DashboardState) {
         active_span,
     ]);
 
+    let mut session_spans = vec![Span::styled(
+        " Sessions (Tab/←/→): ",
+        Style::default().fg(Color::DarkGray),
+    )];
+
+    let all_selected = state.selected_session.is_none();
+    let total_sessions = state
+        .snapshot
+        .as_ref()
+        .map(|s| s.sessions.len())
+        .unwrap_or(0);
+    let all_cost = state
+        .snapshot
+        .as_ref()
+        .map(|s| s.totals.total_cost_usd)
+        .unwrap_or(0.0);
+    let all_label = format!(
+        " All Sessions ({}) · {} ",
+        total_sessions,
+        format_usd(all_cost)
+    );
+    session_spans.push(Span::styled(
+        all_label,
+        if all_selected {
+            Style::default()
+                .fg(Color::Black)
+                .bg(Color::Cyan)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(Color::White)
+        },
+    ));
+
+    if let Some(ref snap) = state.snapshot {
+        for sess in &snap.sessions {
+            session_spans.push(Span::raw("  "));
+            let is_selected = state.selected_session.as_deref() == Some(sess.id.as_str());
+            let indicator = if sess.active_requests > 0 {
+                spinner
+            } else if sess.active {
+                "●"
+            } else {
+                "○"
+            };
+            let suffix = if !sess.active {
+                " [exited]".to_string()
+            } else if let Some(pid) = sess.pid {
+                format!(" ({})", pid)
+            } else {
+                String::new()
+            };
+            let tab_text = format!(
+                " {} #{} {}{} · {} ",
+                indicator,
+                sess.id,
+                sess.label,
+                suffix,
+                format_usd(sess.totals.total_cost_usd)
+            );
+            let style = if is_selected {
+                Style::default()
+                    .fg(Color::Black)
+                    .bg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD)
+            } else if sess.active {
+                Style::default().fg(Color::Green)
+            } else {
+                Style::default().fg(Color::DarkGray)
+            };
+            session_spans.push(Span::styled(tab_text, style));
+        }
+    }
+
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(Style::default().fg(Color::Cyan))
         .title(" Antigravity Enterprise Gateway — Live Token & Price Monitor ");
 
-    let paragraph = Paragraph::new(header_line).block(block);
+    let paragraph = Paragraph::new(vec![header_line, Line::from(session_spans)]).block(block);
     frame.render_widget(paragraph, area);
 }
 
@@ -401,10 +586,11 @@ fn render_summary_cards(frame: &mut Frame, area: Rect, state: &DashboardState) {
         ])
         .split(area);
 
-    let totals = state
-        .snapshot
-        .as_ref()
+    let active_sess = state.active_session();
+
+    let totals = active_sess
         .map(|s| s.totals.clone())
+        .or_else(|| state.snapshot.as_ref().map(|s| s.totals.clone()))
         .unwrap_or_default();
 
     let cache_hit_pct = if totals.input_tokens > 0 {
@@ -419,10 +605,14 @@ fn render_summary_cards(frame: &mut Frame, area: Rect, state: &DashboardState) {
         0.0
     };
 
-    let (ok_reqs, failed_reqs, total_retries) = state
-        .snapshot
-        .as_ref()
+    let (ok_reqs, failed_reqs, total_retries) = active_sess
         .map(|s| (s.successful_requests, s.failed_requests, s.total_retries))
+        .or_else(|| {
+            state
+                .snapshot
+                .as_ref()
+                .map(|s| (s.successful_requests, s.failed_requests, s.total_retries))
+        })
         .unwrap_or((0, 0, 0));
 
     // Card 1: Input Tokens
@@ -730,7 +920,7 @@ fn render_models_table(frame: &mut Frame, area: Rect, state: &DashboardState) {
 }
 
 fn render_logs_panel(frame: &mut Frame, area: Rect, state: &DashboardState) {
-    let logs = state.logs.as_slice();
+    let logs = state.visible_logs();
 
     let visible_rows = area.height.saturating_sub(2) as usize;
     let total = logs.len();
@@ -799,6 +989,11 @@ fn render_logs_panel(frame: &mut Frame, area: Rect, state: &DashboardState) {
 }
 
 fn render_footer(frame: &mut Frame, area: Rect, state: &DashboardState) {
+    let reset_label = if state.selected_session.is_some() {
+        " Reset Session  "
+    } else {
+        " Reset All  "
+    };
     let mut spans = vec![
         Span::styled(
             " q / Esc ",
@@ -809,13 +1004,21 @@ fn render_footer(frame: &mut Frame, area: Rect, state: &DashboardState) {
         ),
         Span::raw(" Quit  "),
         Span::styled(
+            " Tab / ←/→ ",
+            Style::default()
+                .fg(Color::Black)
+                .bg(Color::White)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::raw(" Switch Session  "),
+        Span::styled(
             " r ",
             Style::default()
                 .fg(Color::Black)
                 .bg(Color::Cyan)
                 .add_modifier(Modifier::BOLD),
         ),
-        Span::raw(" Reset Stats  "),
+        Span::raw(reset_label),
         Span::styled(
             " ↑/↓ / PgUp/PgDn ",
             Style::default()
@@ -1003,6 +1206,11 @@ async fn run_monitor_loop(
         while let Ok(update) = rx.try_recv() {
             match update {
                 SseUpdate::Snapshot(snapshot) => {
+                    if let Some(ref sid) = state.selected_session
+                        && !snapshot.sessions.iter().any(|s| &s.id == sid)
+                    {
+                        state.selected_session = None;
+                    }
                     state.snapshot = Some(*snapshot);
                     state.connected = true;
                     state.last_error = None;
@@ -1031,6 +1239,12 @@ async fn run_monitor_loop(
                 KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                     return Ok(());
                 }
+                KeyCode::Tab | KeyCode::Right | KeyCode::Char('l') => {
+                    state.select_next_session();
+                }
+                KeyCode::BackTab | KeyCode::Left | KeyCode::Char('h') => {
+                    state.select_prev_session();
+                }
                 KeyCode::Up | KeyCode::Char('k') => state.scroll_logs_up(1),
                 KeyCode::Down | KeyCode::Char('j') => state.scroll_logs_down(1),
                 KeyCode::PageUp | KeyCode::Char('[') => state.scroll_logs_up(5),
@@ -1042,10 +1256,28 @@ async fn run_monitor_loop(
                     state.log_scroll_from_bottom = 0;
                 }
                 KeyCode::Char('r') => {
-                    match reset_remote_usage(cmd_client, &state.endpoint_url).await {
+                    let target_session = state.selected_session.clone();
+                    match reset_remote_session_usage(
+                        cmd_client,
+                        &state.endpoint_url,
+                        target_session.as_deref(),
+                    )
+                    .await
+                    {
                         Ok(snap) => {
+                            if let Some(ref sid) = state.selected_session
+                                && !snap.sessions.iter().any(|s| &s.id == sid)
+                            {
+                                state.selected_session = None;
+                            }
+                            if let Some(ref sid) = target_session {
+                                state
+                                    .logs
+                                    .retain(|l| l.session_id.as_deref() != Some(sid.as_str()));
+                            } else {
+                                state.logs.clear();
+                            }
                             state.snapshot = Some(snap);
-                            state.logs.clear();
                             state.connected = true;
                             state.last_error = None;
                             state.log_scroll_from_bottom = 0;
@@ -1142,6 +1374,7 @@ mod tests {
             },
         );
 
+        let totals = models["gemini-4-argon"].totals.clone();
         state.snapshot = Some(UsageSnapshot {
             uptime_secs: 95,
             active_requests: 1,
@@ -1150,8 +1383,21 @@ mod tests {
             failed_requests: 0,
             total_retries: 1,
             pricing_source: "models.dev (live)".to_string(),
-            totals: models["gemini-4-argon"].totals.clone(),
-            models,
+            totals: totals.clone(),
+            models: models.clone(),
+            sessions: vec![SessionUsageStats {
+                id: "1".to_string(),
+                label: "agy-gyro".to_string(),
+                pid: Some(48210),
+                active: true,
+                active_requests: 1,
+                total_requests: 5,
+                successful_requests: 5,
+                failed_requests: 0,
+                total_retries: 1,
+                totals,
+                models,
+            }],
         });
         state.logs = vec![LogEntry {
             id: 1,
@@ -1159,6 +1405,7 @@ mod tests {
             level: "INFO".to_string(),
             target: "agy_gyro::proxy".to_string(),
             message: "Request #5 [gemini-4-argon] status=200".to_string(),
+            session_id: Some("1".to_string()),
         }];
 
         let backend = TestBackend::new(140, 38);
@@ -1177,6 +1424,8 @@ mod tests {
         }
 
         assert!(rendered.contains("CONNECTED"));
+        assert!(rendered.contains("All Sessions (1)"));
+        assert!(rendered.contains("#1 agy-gyro (48210)"));
         assert!(rendered.contains("gemini-4-argon"));
         assert!(rendered.contains("150,000"));
         assert!(rendered.contains("120,000"));
@@ -1184,6 +1433,14 @@ mod tests {
         assert!(!rendered.contains("Recent Requests Activity"));
         assert!(rendered.contains("Live Gateway Logs"));
         assert!(rendered.contains("Request #5 [gemini-4-argon] status=200"));
+
+        // Verify session tab navigation
+        state.select_next_session();
+        assert_eq!(state.selected_session.as_deref(), Some("1"));
+        state.select_next_session();
+        assert_eq!(state.selected_session, None);
+        state.select_prev_session();
+        assert_eq!(state.selected_session.as_deref(), Some("1"));
     }
 
     #[test]
@@ -1204,6 +1461,7 @@ mod tests {
                 level: "INFO".to_string(),
                 target: "agy_gyro".to_string(),
                 message: format!("Log {}", id),
+                session_id: None,
             })
             .collect();
         state.scroll_logs_up(1);
@@ -1217,6 +1475,7 @@ mod tests {
                 level: "INFO".to_string(),
                 target: "agy_gyro".to_string(),
                 message: format!("Log {}", id),
+                session_id: None,
             })
             .collect();
         state.scroll_logs_up(100);
@@ -1234,6 +1493,7 @@ mod tests {
                 level: "INFO".to_string(),
                 target: "agy_gyro".to_string(),
                 message: format!("Log {}", id),
+                session_id: None,
             })
             .collect();
         state.set_logs(new_logs);

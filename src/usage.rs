@@ -673,6 +673,152 @@ impl TokenUsageTotals {
         self.total_cost_usd += cost.total_cost_usd;
         self.cache_savings_usd += cost.cache_savings_usd;
     }
+
+    pub fn subtract(&mut self, other: &TokenUsageTotals) {
+        self.requests = self.requests.saturating_sub(other.requests);
+        self.retries = self.retries.saturating_sub(other.retries);
+        self.input_tokens = self.input_tokens.saturating_sub(other.input_tokens);
+        self.uncached_input_tokens = self
+            .uncached_input_tokens
+            .saturating_sub(other.uncached_input_tokens);
+        self.cached_input_tokens = self
+            .cached_input_tokens
+            .saturating_sub(other.cached_input_tokens);
+        self.output_tokens = self.output_tokens.saturating_sub(other.output_tokens);
+        self.candidates_tokens = self
+            .candidates_tokens
+            .saturating_sub(other.candidates_tokens);
+        self.thoughts_tokens = self.thoughts_tokens.saturating_sub(other.thoughts_tokens);
+        self.total_tokens = self.total_tokens.saturating_sub(other.total_tokens);
+        self.uncached_input_cost_usd =
+            (self.uncached_input_cost_usd - other.uncached_input_cost_usd).max(0.0);
+        self.cached_input_cost_usd =
+            (self.cached_input_cost_usd - other.cached_input_cost_usd).max(0.0);
+        self.input_cost_usd = (self.input_cost_usd - other.input_cost_usd).max(0.0);
+        self.output_cost_usd = (self.output_cost_usd - other.output_cost_usd).max(0.0);
+        self.total_cost_usd = (self.total_cost_usd - other.total_cost_usd).max(0.0);
+        self.cache_savings_usd = (self.cache_savings_usd - other.cache_savings_usd).max(0.0);
+    }
+}
+
+/// Metadata identifying an individual `agy` instance connected to the gateway.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionMeta {
+    pub id: String,
+    pub label: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pid: Option<u32>,
+}
+
+/// Sanitizes a session label (such as a workspace directory name) for header encoding and display.
+pub fn sanitize_session_label(raw: &str) -> String {
+    let cleaned: String = raw
+        .trim()
+        .chars()
+        .map(|c| if c == ':' || c.is_control() { '-' } else { c })
+        .take(40)
+        .collect();
+    if cleaned.is_empty() {
+        "agy".to_string()
+    } else {
+        cleaned
+    }
+}
+
+/// Encodes session metadata into the `AGY_LLM_GATEWAY_API_KEY` token format (`gyro:<id>:<pid>:<label>`).
+pub fn format_session_api_key(session_id: &str, pid: Option<u32>, label: &str) -> String {
+    format!(
+        "gyro:{}:{}:{}",
+        session_id.trim(),
+        pid.unwrap_or(0),
+        sanitize_session_label(label)
+    )
+}
+
+/// Parses a `gyro:<id>:<pid>:<label>` token from an `Authorization` or `x-goog-api-key` value.
+pub fn parse_session_api_key(raw_token: &str) -> Option<SessionMeta> {
+    let trimmed = raw_token.trim();
+    let token = trimmed
+        .strip_prefix("Bearer ")
+        .or_else(|| trimmed.strip_prefix("bearer "))
+        .map(str::trim)
+        .unwrap_or(trimmed);
+
+    let rest = token.strip_prefix("gyro:")?;
+    let mut parts = rest.splitn(3, ':');
+    let id = parts.next()?.trim();
+    if id.is_empty() {
+        return None;
+    }
+    let pid_str = parts.next().unwrap_or("0").trim();
+    let pid = pid_str.parse::<u32>().ok().filter(|&p| p > 0);
+    let label = sanitize_session_label(parts.next().unwrap_or("agy"));
+
+    Some(SessionMeta {
+        id: id.to_string(),
+        label,
+        pid,
+    })
+}
+
+/// Extracts session metadata from request headers (`Authorization: Bearer gyro:...` or `x-goog-api-key`).
+pub fn extract_session_from_headers(headers: &axum::http::HeaderMap) -> Option<SessionMeta> {
+    if let Some(auth) = headers
+        .get(axum::http::header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        && let Some(meta) = parse_session_api_key(auth)
+    {
+        return Some(meta);
+    }
+    if let Some(key) = headers.get("x-goog-api-key").and_then(|v| v.to_str().ok())
+        && let Some(meta) = parse_session_api_key(key)
+    {
+        return Some(meta);
+    }
+    None
+}
+
+fn is_pid_alive(pid: u32) -> bool {
+    if pid == 0 {
+        return false;
+    }
+    #[cfg(unix)]
+    {
+        let rc = unsafe { libc::kill(pid as libc::pid_t, 0) };
+        if rc == 0 {
+            return true;
+        }
+        std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+    }
+    #[cfg(windows)]
+    {
+        const PROCESS_QUERY_LIMITED_INFORMATION: u32 = 0x1000;
+        const STILL_ACTIVE: u32 = 259;
+        unsafe extern "system" {
+            fn OpenProcess(
+                dwDesiredAccess: u32,
+                bInheritHandle: i32,
+                dwProcessId: u32,
+            ) -> *mut std::ffi::c_void;
+            fn GetExitCodeProcess(hProcess: *mut std::ffi::c_void, lpExitCode: *mut u32) -> i32;
+            fn CloseHandle(hObject: *mut std::ffi::c_void) -> i32;
+        }
+        unsafe {
+            let handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+            if handle.is_null() {
+                return false;
+            }
+            let mut exit_code: u32 = 0;
+            let ok = GetExitCodeProcess(handle, &mut exit_code);
+            CloseHandle(handle);
+            ok != 0 && exit_code == STILL_ACTIVE
+        }
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = pid;
+        true
+    }
 }
 
 /// Per-model usage and cost breakdown returned in [`UsageSnapshot`].
@@ -685,6 +831,23 @@ pub struct ModelUsageStats {
     pub pricing: Option<ModelPricing>,
 }
 
+/// Per-session (`agy` instance) usage, cost, and lifecycle breakdown returned in [`UsageSnapshot`].
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SessionUsageStats {
+    pub id: String,
+    pub label: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pid: Option<u32>,
+    pub active: bool,
+    pub active_requests: u64,
+    pub total_requests: u64,
+    pub successful_requests: u64,
+    pub failed_requests: u64,
+    pub total_retries: u64,
+    pub totals: TokenUsageTotals,
+    pub models: BTreeMap<String, ModelUsageStats>,
+}
+
 /// A single real-time tracing log entry streamed by `GET /logs`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LogEntry {
@@ -693,6 +856,8 @@ pub struct LogEntry {
     pub level: String,
     pub target: String,
     pub message: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<String>,
 }
 
 /// Point-in-time JSON payload streamed by `GET /usage`.
@@ -707,12 +872,21 @@ pub struct UsageSnapshot {
     pub pricing_source: String,
     pub totals: TokenUsageTotals,
     pub models: BTreeMap<String, ModelUsageStats>,
+    #[serde(default)]
+    pub sessions: Vec<SessionUsageStats>,
+}
+
+#[derive(Debug, Clone)]
+struct SessionEntry {
+    stats: SessionUsageStats,
+    track_pid_liveness: bool,
 }
 
 #[derive(Debug, Default)]
 struct UsageInner {
     totals: TokenUsageTotals,
     models: BTreeMap<String, ModelUsageStats>,
+    sessions: BTreeMap<String, SessionEntry>,
     logs: VecDeque<LogEntry>,
 }
 
@@ -725,6 +899,7 @@ pub struct UsageTracker {
     failed_requests: AtomicU64,
     total_retries: AtomicU64,
     next_request_id: AtomicU64,
+    next_session_id: AtomicU64,
     next_log_id: AtomicU64,
     pricing: RwLock<PricingTable>,
     inner: RwLock<UsageInner>,
@@ -750,6 +925,7 @@ impl UsageTracker {
             failed_requests: AtomicU64::new(0),
             total_retries: AtomicU64::new(0),
             next_request_id: AtomicU64::new(1),
+            next_session_id: AtomicU64::new(1),
             next_log_id: AtomicU64::new(1),
             pricing: RwLock::new(pricing),
             inner: RwLock::new(UsageInner::default()),
@@ -786,8 +962,85 @@ impl UsageTracker {
         }
     }
 
+    /// Spawns a background task that monitors OS-level process liveness for active sessions
+    /// and marks sessions as exited when their `agy` process terminates.
+    pub fn spawn_process_monitor(self: &Arc<Self>) {
+        if tokio::runtime::Handle::try_current().is_err() {
+            return;
+        }
+        let weak = Arc::downgrade(self);
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_millis(250));
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            loop {
+                interval.tick().await;
+                let Some(tracker) = weak.upgrade() else {
+                    break;
+                };
+                tracker.check_session_processes();
+            }
+        });
+    }
+
+    /// Checks OS-level process liveness for all active tracked sessions, transitioning any
+    /// session whose process has terminated to `active = false`.
+    pub fn check_session_processes(&self) {
+        let has_exited = self.inner.read().ok().is_some_and(|inner| {
+            inner.sessions.values().any(|e| {
+                e.stats.active
+                    && e.track_pid_liveness
+                    && e.stats.active_requests == 0
+                    && e.stats.pid.is_some_and(|p| !is_pid_alive(p))
+            })
+        });
+
+        if !has_exited {
+            return;
+        }
+
+        let mut exited_sessions = Vec::new();
+        if let Ok(mut inner) = self.inner.write() {
+            for entry in inner.sessions.values_mut() {
+                if entry.stats.active
+                    && entry.track_pid_liveness
+                    && entry.stats.active_requests == 0
+                    && let Some(pid) = entry.stats.pid
+                    && !is_pid_alive(pid)
+                {
+                    entry.stats.active = false;
+                    entry.track_pid_liveness = false;
+                    exited_sessions.push((entry.stats.id.clone(), entry.stats.label.clone(), pid));
+                }
+            }
+        }
+
+        if !exited_sessions.is_empty() {
+            for (id, label, pid) in exited_sessions {
+                info!(
+                    session_id = %id,
+                    "[#{} {}] Session exited (pid={})",
+                    id,
+                    label,
+                    pid
+                );
+            }
+            self.notify_usage_change();
+        }
+    }
+
     /// Appends a real-time log entry and notifies `GET /logs` SSE subscribers.
     pub fn record_log(&self, level: &str, target: &str, message: impl Into<String>) {
+        self.record_log_with_session(level, target, None, message);
+    }
+
+    /// Appends a real-time log entry associated with an optional `session_id` and notifies `GET /logs` subscribers.
+    pub fn record_log_with_session(
+        &self,
+        level: &str,
+        target: &str,
+        session_id: Option<String>,
+        message: impl Into<String>,
+    ) {
         let log_id = self.next_log_id.fetch_add(1, Ordering::Relaxed);
         let timestamp_secs = self.started_at.elapsed().as_secs();
         let entry = LogEntry {
@@ -796,6 +1049,7 @@ impl UsageTracker {
             level: level.to_string(),
             target: target.to_string(),
             message: message.into(),
+            session_id,
         };
 
         if let Ok(mut inner) = self.inner.write() {
@@ -823,20 +1077,196 @@ impl UsageTracker {
         self.notify_usage_change();
     }
 
+    /// Registers a new `agy` wrapper session and returns its allocated [`SessionMeta`].
+    /// If an active session with the same positive `pid` is already registered, returns
+    /// that existing session's metadata (idempotent per active OS process).
+    pub fn register_session(&self, pid: Option<u32>, label: &str) -> SessionMeta {
+        let clean_label = sanitize_session_label(label);
+        let track_pid_liveness = pid.is_some_and(is_pid_alive);
+
+        if let Ok(mut inner) = self.inner.write()
+            && let Some(p) = pid.filter(|&p| p > 0)
+            && let Some(existing) = inner
+                .sessions
+                .values_mut()
+                .find(|e| e.stats.active && e.stats.pid == Some(p))
+        {
+            existing.stats.label = clean_label.clone();
+            existing.track_pid_liveness = track_pid_liveness;
+            return SessionMeta {
+                id: existing.stats.id.clone(),
+                label: clean_label,
+                pid,
+            };
+        }
+
+        let id = self
+            .next_session_id
+            .fetch_add(1, Ordering::Relaxed)
+            .to_string();
+
+        if let Ok(mut inner) = self.inner.write() {
+            inner.sessions.insert(
+                id.clone(),
+                SessionEntry {
+                    stats: SessionUsageStats {
+                        id: id.clone(),
+                        label: clean_label.clone(),
+                        pid,
+                        active: true,
+                        active_requests: 0,
+                        total_requests: 0,
+                        successful_requests: 0,
+                        failed_requests: 0,
+                        total_retries: 0,
+                        totals: TokenUsageTotals::default(),
+                        models: BTreeMap::new(),
+                    },
+                    track_pid_liveness,
+                },
+            );
+        }
+
+        info!(
+            session_id = %id,
+            "[#{} {}] Session started (pid={})",
+            id,
+            clean_label,
+            pid.map(|p| p.to_string()).unwrap_or_else(|| "n/a".to_string())
+        );
+        self.notify_usage_change();
+
+        SessionMeta {
+            id,
+            label: clean_label,
+            pid,
+        }
+    }
+
+    /// Unconditionally marks a session as inactive and removes its stats and logs.
+    /// Used to clean up a pre-registered session if launching `agy` fails.
+    pub fn remove_session(&self, session_id: &str) {
+        if let Ok(mut inner) = self.inner.write()
+            && let Some(entry) = inner.sessions.get_mut(session_id)
+        {
+            entry.stats.active = false;
+            entry.track_pid_liveness = false;
+        }
+        self.reset_session(session_id);
+    }
+
+    /// Marks an existing session as exited (`active = false`) while preserving its accumulated stats.
+    pub fn mark_session_exited(&self, session_id: &str) -> bool {
+        let mut label_opt = None;
+        if let Ok(mut inner) = self.inner.write()
+            && let Some(entry) = inner.sessions.get_mut(session_id)
+        {
+            entry.stats.active = false;
+            entry.track_pid_liveness = false;
+            label_opt = Some(entry.stats.label.clone());
+        }
+
+        if let Some(label) = label_opt {
+            info!(
+                session_id = %session_id,
+                "[#{} {}] Session exited",
+                session_id,
+                label
+            );
+            self.notify_usage_change();
+            true
+        } else {
+            false
+        }
+    }
+
+    fn ensure_session_entry<'a>(
+        &self,
+        inner: &'a mut UsageInner,
+        meta: &SessionMeta,
+    ) -> &'a mut SessionEntry {
+        if let Ok(num_id) = meta.id.parse::<u64>() {
+            let _ = self
+                .next_session_id
+                .fetch_max(num_id.saturating_add(1), Ordering::Relaxed);
+        }
+
+        inner
+            .sessions
+            .entry(meta.id.clone())
+            .and_modify(|e| {
+                e.stats.active = true;
+                if meta.pid.is_some() {
+                    e.stats.pid = meta.pid;
+                }
+                if !meta.label.is_empty() && meta.label != "agy" {
+                    e.stats.label = meta.label.clone();
+                }
+            })
+            .or_insert_with(|| SessionEntry {
+                stats: SessionUsageStats {
+                    id: meta.id.clone(),
+                    label: meta.label.clone(),
+                    pid: meta.pid,
+                    active: true,
+                    active_requests: 0,
+                    total_requests: 0,
+                    successful_requests: 0,
+                    failed_requests: 0,
+                    total_retries: 0,
+                    totals: TokenUsageTotals::default(),
+                    models: BTreeMap::new(),
+                },
+                track_pid_liveness: meta.pid.is_some_and(is_pid_alive),
+            })
+    }
+
     /// Marks the start of an in-flight proxy request and returns an RAII guard that
     /// decrements `active_requests` when dropped.
     pub fn begin_request(self: &Arc<Self>) -> ActiveRequestGuard {
+        self.begin_session_request(None)
+    }
+
+    /// Marks the start of an in-flight proxy request for an optional session and returns an RAII guard.
+    pub fn begin_session_request(
+        self: &Arc<Self>,
+        session: Option<&SessionMeta>,
+    ) -> ActiveRequestGuard {
         self.total_requests.fetch_add(1, Ordering::Relaxed);
         self.active_requests.fetch_add(1, Ordering::Relaxed);
+
+        let session_id = if let Some(meta) = session {
+            if let Ok(mut inner) = self.inner.write() {
+                let entry = self.ensure_session_entry(&mut inner, meta);
+                entry.stats.total_requests += 1;
+                entry.stats.active_requests += 1;
+            }
+            Some(meta.id.clone())
+        } else {
+            None
+        };
+
         self.notify_usage_change();
         ActiveRequestGuard {
             tracker: Arc::clone(self),
+            session_id,
         }
     }
 
     /// Increments the global retry counter when a request attempt is retried.
     pub fn record_retry(&self) {
+        self.record_session_retry(None);
+    }
+
+    /// Increments the global and per-session retry counter when a request attempt is retried.
+    pub fn record_session_retry(&self, session: Option<&SessionMeta>) {
         self.total_retries.fetch_add(1, Ordering::Relaxed);
+        if let Some(meta) = session
+            && let Ok(mut inner) = self.inner.write()
+        {
+            let entry = self.ensure_session_entry(&mut inner, meta);
+            entry.stats.total_retries += 1;
+        }
         self.notify_usage_change();
     }
 
@@ -849,7 +1279,21 @@ impl UsageTracker {
         duration: Duration,
         raw_usage: Option<&RawUsageMetadata>,
     ) {
-        if (200..300).contains(&status) {
+        self.record_session_completed_request(None, model, status, retries, duration, raw_usage);
+    }
+
+    /// Records a completed request for an optional session along with its extracted token usage.
+    pub fn record_session_completed_request(
+        &self,
+        session: Option<&SessionMeta>,
+        model: &str,
+        status: u16,
+        retries: u32,
+        duration: Duration,
+        raw_usage: Option<&RawUsageMetadata>,
+    ) {
+        let is_ok = (200..300).contains(&status);
+        if is_ok {
             self.successful_requests.fetch_add(1, Ordering::Relaxed);
         } else {
             self.failed_requests.fetch_add(1, Ordering::Relaxed);
@@ -893,38 +1337,171 @@ impl UsageTracker {
                     pricing: pricing.clone(),
                 });
             if model_entry.pricing.is_none() && pricing.is_some() {
-                model_entry.pricing = pricing;
+                model_entry.pricing = pricing.clone();
             }
             model_entry.totals.record(&usage, &cost, retries);
+
+            if let Some(meta) = session {
+                let sess_entry = self.ensure_session_entry(&mut inner, meta);
+                if is_ok {
+                    sess_entry.stats.successful_requests += 1;
+                } else {
+                    sess_entry.stats.failed_requests += 1;
+                }
+                sess_entry.stats.totals.record(&usage, &cost, retries);
+                let sess_model = sess_entry
+                    .stats
+                    .models
+                    .entry(canonical_model.clone())
+                    .or_insert_with(|| ModelUsageStats {
+                        model: canonical_model.clone(),
+                        totals: TokenUsageTotals::default(),
+                        pricing: pricing.clone(),
+                    });
+                if sess_model.pricing.is_none() && pricing.is_some() {
+                    sess_model.pricing = pricing;
+                }
+                sess_model.totals.record(&usage, &cost, retries);
+            }
         }
 
-        info!(
-            "Request #{} [{}] status={} duration={}ms retries={} | in={} (uncached={}, cached={}) out={} (think={}) | cost=${:.6}",
-            req_id,
-            canonical_model,
-            status,
-            duration.as_millis(),
-            retries,
-            usage.input_tokens(),
-            usage.uncached_input_tokens(),
-            usage.cached_input_tokens(),
-            usage.output_tokens(),
-            usage.thoughts_token_count,
-            cost.total_cost_usd
-        );
+        if let Some(meta) = session {
+            info!(
+                session_id = %meta.id,
+                "[#{} {}] Request #{} [{}] status={} duration={}ms retries={} | in={} (uncached={}, cached={}) out={} (think={}) | cost=${:.6}",
+                meta.id,
+                meta.label,
+                req_id,
+                canonical_model,
+                status,
+                duration.as_millis(),
+                retries,
+                usage.input_tokens(),
+                usage.uncached_input_tokens(),
+                usage.cached_input_tokens(),
+                usage.output_tokens(),
+                usage.thoughts_token_count,
+                cost.total_cost_usd
+            );
+        } else {
+            info!(
+                "Request #{} [{}] status={} duration={}ms retries={} | in={} (uncached={}, cached={}) out={} (think={}) | cost=${:.6}",
+                req_id,
+                canonical_model,
+                status,
+                duration.as_millis(),
+                retries,
+                usage.input_tokens(),
+                usage.uncached_input_tokens(),
+                usage.cached_input_tokens(),
+                usage.output_tokens(),
+                usage.thoughts_token_count,
+                cost.total_cost_usd
+            );
+        }
         self.notify_usage_change();
     }
 
-    /// Resets all accumulated session metrics and buffered logs while preserving `active_requests` and `pricing`.
+    /// Resets all accumulated metrics and buffered logs across all sessions.
+    /// Exited sessions are removed while active sessions are retained with zeroed counters.
     pub fn reset(&self) {
-        self.total_requests.store(0, Ordering::Relaxed);
+        let active_reqs = self.active_requests.load(Ordering::Relaxed);
+        self.total_requests.store(active_reqs, Ordering::Relaxed);
         self.successful_requests.store(0, Ordering::Relaxed);
         self.failed_requests.store(0, Ordering::Relaxed);
         self.total_retries.store(0, Ordering::Relaxed);
         self.next_request_id.store(1, Ordering::Relaxed);
         self.next_log_id.store(1, Ordering::Relaxed);
         if let Ok(mut inner) = self.inner.write() {
-            *inner = UsageInner::default();
+            inner.totals = TokenUsageTotals::default();
+            inner.models.clear();
+            inner.logs.clear();
+            inner
+                .sessions
+                .retain(|_, entry| entry.stats.active || entry.stats.active_requests > 0);
+            for entry in inner.sessions.values_mut() {
+                entry.stats.total_requests = entry.stats.active_requests;
+                entry.stats.successful_requests = 0;
+                entry.stats.failed_requests = 0;
+                entry.stats.total_retries = 0;
+                entry.stats.totals = TokenUsageTotals::default();
+                entry.stats.models.clear();
+            }
+            if inner.sessions.is_empty() {
+                self.next_session_id.store(1, Ordering::Relaxed);
+            }
+        }
+        self.notify_usage_change();
+        self.notify_log_change();
+    }
+
+    /// Resets a single session's accumulated stats (or removes the session if it has already exited),
+    /// subtracting its contribution from the global totals.
+    pub fn reset_session(&self, session_id: &str) {
+        if let Ok(mut inner) = self.inner.write() {
+            let Some(entry) = inner.sessions.get_mut(session_id) else {
+                return;
+            };
+
+            let completed_reqs = entry
+                .stats
+                .total_requests
+                .saturating_sub(entry.stats.active_requests);
+            let _ = self
+                .total_requests
+                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |cur| {
+                    Some(cur.saturating_sub(completed_reqs))
+                });
+            let _ = self.successful_requests.fetch_update(
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+                |cur| Some(cur.saturating_sub(entry.stats.successful_requests)),
+            );
+            let _ =
+                self.failed_requests
+                    .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |cur| {
+                        Some(cur.saturating_sub(entry.stats.failed_requests))
+                    });
+            let _ = self
+                .total_retries
+                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |cur| {
+                    Some(cur.saturating_sub(entry.stats.total_retries))
+                });
+
+            let sess_totals = entry.stats.totals.clone();
+            let sess_models = std::mem::take(&mut entry.stats.models);
+            let keep_session = entry.stats.active || entry.stats.active_requests > 0;
+
+            if keep_session {
+                entry.stats.total_requests = entry.stats.active_requests;
+                entry.stats.successful_requests = 0;
+                entry.stats.failed_requests = 0;
+                entry.stats.total_retries = 0;
+                entry.stats.totals = TokenUsageTotals::default();
+            } else {
+                inner.sessions.remove(session_id);
+            }
+
+            inner.totals.subtract(&sess_totals);
+            for (model_name, model_stats) in &sess_models {
+                let mut remove_model = false;
+                if let Some(global_model) = inner.models.get_mut(model_name) {
+                    global_model.totals.subtract(&model_stats.totals);
+                    if global_model.totals.requests == 0 {
+                        remove_model = true;
+                    }
+                }
+                if remove_model {
+                    inner.models.remove(model_name);
+                }
+            }
+
+            inner
+                .logs
+                .retain(|l| l.session_id.as_deref() != Some(session_id));
+            if inner.sessions.is_empty() {
+                self.next_session_id.store(1, Ordering::Relaxed);
+            }
         }
         self.notify_usage_change();
         self.notify_log_change();
@@ -932,16 +1509,28 @@ impl UsageTracker {
 
     /// Returns a point-in-time [`UsageSnapshot`] for the `/usage` endpoint.
     pub fn snapshot(&self) -> UsageSnapshot {
+        self.check_session_processes();
+
         let pricing_source = self
             .pricing
             .read()
             .map(|p| p.source.clone())
             .unwrap_or_else(|_| "built-in".to_string());
 
-        let (totals, models) = match self.inner.read() {
-            Ok(inner) => (inner.totals.clone(), inner.models.clone()),
-            Err(_) => (TokenUsageTotals::default(), BTreeMap::new()),
+        let (totals, models, mut sessions) = match self.inner.read() {
+            Ok(inner) => {
+                let sessions: Vec<SessionUsageStats> =
+                    inner.sessions.values().map(|e| e.stats.clone()).collect();
+                (inner.totals.clone(), inner.models.clone(), sessions)
+            }
+            Err(_) => (TokenUsageTotals::default(), BTreeMap::new(), Vec::new()),
         };
+
+        sessions.sort_by(|a, b| {
+            let a_num = a.id.parse::<u64>().unwrap_or(u64::MAX);
+            let b_num = b.id.parse::<u64>().unwrap_or(u64::MAX);
+            a_num.cmp(&b_num).then_with(|| a.id.cmp(&b.id))
+        });
 
         UsageSnapshot {
             uptime_secs: self.started_at.elapsed().as_secs(),
@@ -953,6 +1542,7 @@ impl UsageTracker {
             pricing_source,
             totals,
             models,
+            sessions,
         }
     }
 }
@@ -965,6 +1555,7 @@ fn global_log_trackers() -> &'static RwLock<Vec<Weak<UsageTracker>>> {
 #[derive(Default)]
 struct LogEventVisitor {
     message: String,
+    session_id: Option<String>,
     fields: Vec<String>,
 }
 
@@ -972,6 +1563,8 @@ impl tracing::field::Visit for LogEventVisitor {
     fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
         if field.name() == "message" {
             self.message = format!("{:?}", value);
+        } else if field.name() == "session_id" {
+            self.session_id = Some(format!("{:?}", value).trim_matches('"').to_string());
         } else {
             self.fields.push(format!("{}={:?}", field.name(), value));
         }
@@ -980,6 +1573,8 @@ impl tracing::field::Visit for LogEventVisitor {
     fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
         if field.name() == "message" {
             self.message = value.to_string();
+        } else if field.name() == "session_id" {
+            self.session_id = Some(value.to_string());
         } else {
             self.fields.push(format!("{}={}", field.name(), value));
         }
@@ -1021,7 +1616,12 @@ impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for UsageLogLayer {
 
         if !text.is_empty() {
             for tracker in trackers {
-                tracker.record_log(meta.level().as_str(), meta.target(), text.clone());
+                tracker.record_log_with_session(
+                    meta.level().as_str(),
+                    meta.target(),
+                    visitor.session_id.clone(),
+                    text.clone(),
+                );
             }
         }
     }
@@ -1029,11 +1629,18 @@ impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for UsageLogLayer {
 
 pub struct ActiveRequestGuard {
     tracker: Arc<UsageTracker>,
+    session_id: Option<String>,
 }
 
 impl Drop for ActiveRequestGuard {
     fn drop(&mut self) {
         self.tracker.active_requests.fetch_sub(1, Ordering::Relaxed);
+        if let Some(ref sid) = self.session_id
+            && let Ok(mut inner) = self.tracker.inner.write()
+            && let Some(entry) = inner.sessions.get_mut(sid)
+        {
+            entry.stats.active_requests = entry.stats.active_requests.saturating_sub(1);
+        }
         self.tracker.notify_usage_change();
     }
 }
@@ -1146,5 +1753,73 @@ mod tests {
         assert_eq!(custom.input_over_200k_per_1m, Some(3.0));
         assert_eq!(custom.cached_over_200k_per_1m, Some(0.30));
         assert_eq!(custom.output_over_200k_per_1m, Some(12.0));
+    }
+
+    #[test]
+    fn test_session_tracking_and_selective_reset() {
+        let token = format_session_api_key("1", Some(48210), "my:workspace");
+        assert_eq!(token, "gyro:1:48210:my-workspace");
+
+        let parsed = parse_session_api_key(&format!("Bearer {}", token)).unwrap();
+        assert_eq!(parsed.id, "1");
+        assert_eq!(parsed.pid, Some(48210));
+        assert_eq!(parsed.label, "my-workspace");
+
+        let tracker = Arc::new(UsageTracker::default());
+        let s1 = tracker.register_session(None, "proj-alpha");
+        let s2 = tracker.register_session(None, "proj-beta");
+        assert_eq!(s1.id, "1");
+        assert_eq!(s2.id, "2");
+
+        let u1 = RawUsageMetadata {
+            prompt_token_count: 10_000,
+            candidates_token_count: 1_000,
+            ..Default::default()
+        };
+        let u2 = RawUsageMetadata {
+            prompt_token_count: 20_000,
+            candidates_token_count: 2_000,
+            ..Default::default()
+        };
+
+        {
+            let _g1 = tracker.begin_session_request(Some(&s1));
+            tracker.record_session_completed_request(
+                Some(&s1),
+                "gemini-4-argon",
+                200,
+                0,
+                Duration::from_millis(50),
+                Some(&u1),
+            );
+        }
+        {
+            let _g2 = tracker.begin_session_request(Some(&s2));
+            tracker.record_session_completed_request(
+                Some(&s2),
+                "gemini-4-argon",
+                200,
+                1,
+                Duration::from_millis(80),
+                Some(&u2),
+            );
+        }
+
+        tracker.mark_session_exited(&s2.id);
+
+        let snap = tracker.snapshot();
+        assert_eq!(snap.sessions.len(), 2);
+        assert!(snap.sessions[0].active);
+        assert!(!snap.sessions[1].active);
+        assert_eq!(snap.totals.input_tokens, 30_000);
+        assert_eq!(snap.sessions[0].totals.input_tokens, 10_000);
+        assert_eq!(snap.sessions[1].totals.input_tokens, 20_000);
+
+        // Resetting exited session #2 removes it and subtracts its tokens from global totals
+        tracker.reset_session(&s2.id);
+        let snap2 = tracker.snapshot();
+        assert_eq!(snap2.sessions.len(), 1);
+        assert_eq!(snap2.sessions[0].id, "1");
+        assert_eq!(snap2.totals.input_tokens, 10_000);
     }
 }

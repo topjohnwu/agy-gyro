@@ -7,22 +7,23 @@ use crate::retry::{
 };
 use crate::usage::{
     PricingTable, StreamUsageExtractor, UsageLogLayer, UsageSnapshot, UsageTracker,
-    extract_model_from_path, extract_usage_from_chunks,
+    extract_model_from_path, extract_session_from_headers, extract_usage_from_chunks,
+    format_session_api_key,
 };
 use axum::{
     Json, Router,
     body::{Body, Bytes},
-    extract::{DefaultBodyLimit, OriginalUri, State},
+    extract::{DefaultBodyLimit, OriginalUri, Path, Query, State},
     http::{HeaderMap, HeaderName, Method, StatusCode},
     response::{
         IntoResponse, Response,
         sse::{Event, Sse},
     },
-    routing::{any, get},
+    routing::{any, delete, get, post},
 };
 use futures_util::StreamExt;
-use serde::Deserialize;
-use std::sync::Arc;
+use serde::{Deserialize, Serialize};
+use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 use tracing::{debug, error, info, warn};
 
@@ -187,6 +188,7 @@ pub struct ProxyState {
     pub upstream_base: String,
     pub keep_alive_interval: Duration,
     pub usage: Arc<UsageTracker>,
+    pub gateway_models: RwLock<String>,
 }
 
 impl ProxyState {
@@ -201,12 +203,15 @@ impl ProxyState {
         let upstream_base = config.upstream.trim_end_matches('/').to_string();
         let usage = Arc::new(UsageTracker::default());
         usage.register_global_logger();
+        usage.spawn_process_monitor();
+        let default_models = expand_gateway_models(DEFAULT_GATEWAY_MODELS);
         Self {
             config,
             client,
             upstream_base,
             keep_alive_interval: DEFAULT_KEEP_ALIVE_INTERVAL,
             usage,
+            gateway_models: RwLock::new(default_models),
         }
     }
 
@@ -218,6 +223,19 @@ impl ProxyState {
     pub fn with_pricing(self, pricing: PricingTable) -> Self {
         self.usage.set_pricing(pricing);
         self
+    }
+
+    pub fn set_gateway_models(&self, models: impl Into<String>) {
+        if let Ok(mut guard) = self.gateway_models.write() {
+            *guard = models.into();
+        }
+    }
+
+    pub fn gateway_models(&self) -> String {
+        self.gateway_models
+            .read()
+            .map(|g| g.clone())
+            .unwrap_or_else(|_| expand_gateway_models(DEFAULT_GATEWAY_MODELS))
     }
 }
 
@@ -270,9 +288,58 @@ async fn usage_handler(
     Sse::new(stream)
 }
 
-async fn reset_usage_handler(State(state): State<Arc<ProxyState>>) -> Json<UsageSnapshot> {
-    state.usage.reset();
+#[derive(Debug, Default, Deserialize)]
+struct ResetUsageQuery {
+    session: Option<String>,
+}
+
+async fn reset_usage_handler(
+    State(state): State<Arc<ProxyState>>,
+    Query(query): Query<ResetUsageQuery>,
+) -> Json<UsageSnapshot> {
+    if let Some(ref session_id) = query.session {
+        state.usage.reset_session(session_id);
+    } else {
+        state.usage.reset();
+    }
     Json(state.usage.snapshot())
+}
+
+/// Request payload for `POST /sessions` when a wrapper registers an `agy` instance.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RegisterSessionRequest {
+    pub pid: Option<u32>,
+    pub label: String,
+}
+
+/// Response payload from `POST /sessions`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RegisterSessionResponse {
+    pub session_id: String,
+    pub api_key: String,
+    pub gateway_models: String,
+}
+
+async fn register_session_handler(
+    State(state): State<Arc<ProxyState>>,
+    Json(req): Json<RegisterSessionRequest>,
+) -> Json<RegisterSessionResponse> {
+    let meta = state.usage.register_session(req.pid, &req.label);
+    let api_key = format_session_api_key(&meta.id, meta.pid, &meta.label);
+    let gateway_models = state.gateway_models();
+    Json(RegisterSessionResponse {
+        session_id: meta.id,
+        api_key,
+        gateway_models,
+    })
+}
+
+async fn remove_session_handler(
+    State(state): State<Arc<ProxyState>>,
+    Path(id): Path<String>,
+) -> StatusCode {
+    state.usage.remove_session(&id);
+    StatusCode::NO_CONTENT
 }
 
 async fn logs_handler(
@@ -302,6 +369,8 @@ pub fn create_router(state: Arc<ProxyState>) -> Router {
     Router::new()
         .route("/usage", get(usage_handler).delete(reset_usage_handler))
         .route("/logs", get(logs_handler))
+        .route("/sessions", post(register_session_handler))
+        .route("/sessions/{id}", delete(remove_session_handler))
         .route("/", any(proxy_handler))
         .route("/{*path}", any(proxy_handler))
         .layer(DefaultBodyLimit::disable())
@@ -504,10 +573,16 @@ async fn execute_proxy_request(
     body: Bytes,
 ) -> UpstreamOutcome {
     let req_start = Instant::now();
+    let session = extract_session_from_headers(&headers);
+    let session_prefix = session
+        .as_ref()
+        .map(|s| format!("[#{} {}] ", s.id, s.label))
+        .unwrap_or_default();
+    let session_id_str = session.as_ref().map(|s| s.id.clone()).unwrap_or_default();
     let model_from_path = extract_model_from_path(target_url.path());
     let active_guard = model_from_path
         .as_ref()
-        .map(|_| state.usage.begin_request());
+        .map(|_| state.usage.begin_session_request(session.as_ref()));
 
     let initial_delay = Duration::from_millis(state.config.initial_delay_ms);
     let max_delay = Duration::from_millis(state.config.max_delay_ms);
@@ -571,7 +646,9 @@ async fn execute_proxy_request(
                         }
 
                         warn!(
-                            "Upstream returned retriable status {} for {} {}. Retrying in {:?} (attempt {}/{}). Response: {}",
+                            session_id = %session_id_str,
+                            "{}Upstream returned retriable status {} for {} {}. Retrying in {:?} (attempt {}/{}). Response: {}",
+                            session_prefix,
                             status,
                             method,
                             target_url,
@@ -582,7 +659,7 @@ async fn execute_proxy_request(
                         );
 
                         if model_from_path.is_some() {
-                            state.usage.record_retry();
+                            state.usage.record_session_retry(session.as_ref());
                         }
                         tokio::time::sleep(delay).await;
                         attempt += 1;
@@ -663,7 +740,9 @@ async fn execute_proxy_request(
                             );
 
                             warn!(
-                                "Upstream returned in-stream retriable error {} ({}) at chunk #{} for {} {}. Retrying in {:?} (attempt {}/{})...",
+                                session_id = %session_id_str,
+                                "{}Upstream returned in-stream retriable error {} ({}) at chunk #{} for {} {}. Retrying in {:?} (attempt {}/{})...",
+                                session_prefix,
                                 in_stream_status,
                                 err_msg,
                                 chunk_idx + 1,
@@ -675,15 +754,16 @@ async fn execute_proxy_request(
                             );
 
                             if model_from_path.is_some() {
-                                state.usage.record_retry();
+                                state.usage.record_session_retry(session.as_ref());
                             }
                             tokio::time::sleep(delay).await;
                             attempt += 1;
                             continue;
                         } else {
                             warn!(
-                                "Max retries ({}) reached for in-stream error {}. Forwarding buffered stream to client.",
-                                max_retries, in_stream_status
+                                session_id = %session_id_str,
+                                "{}Max retries ({}) reached for in-stream error {}. Forwarding buffered stream to client.",
+                                session_prefix, max_retries, in_stream_status
                             );
                         }
                     } else if let Some((chunk_idx, err)) = stream_error {
@@ -697,7 +777,9 @@ async fn execute_proxy_request(
                             );
 
                             warn!(
-                                "Upstream stream error at chunk #{} for {} {}: {}. Retrying in {:?} (attempt {}/{})...",
+                                session_id = %session_id_str,
+                                "{}Upstream stream error at chunk #{} for {} {}: {}. Retrying in {:?} (attempt {}/{})...",
+                                session_prefix,
                                 chunk_idx + 1,
                                 method,
                                 target_url,
@@ -708,14 +790,16 @@ async fn execute_proxy_request(
                             );
 
                             if model_from_path.is_some() {
-                                state.usage.record_retry();
+                                state.usage.record_session_retry(session.as_ref());
                             }
                             tokio::time::sleep(delay).await;
                             attempt += 1;
                             continue;
                         } else {
                             error!(
-                                "Upstream error reading stream at chunk #{} for {} {}: {}",
+                                session_id = %session_id_str,
+                                "{}Upstream error reading stream at chunk #{} for {} {}: {}",
+                                session_prefix,
                                 chunk_idx + 1,
                                 method,
                                 target_url,
@@ -723,7 +807,8 @@ async fn execute_proxy_request(
                             );
                             drop(active_guard);
                             if let Some(ref req_model) = model_from_path {
-                                state.usage.record_completed_request(
+                                state.usage.record_session_completed_request(
+                                    session.as_ref(),
                                     req_model,
                                     StatusCode::BAD_GATEWAY.as_u16(),
                                     attempt,
@@ -748,7 +833,8 @@ async fn execute_proxy_request(
                             } else {
                                 status.as_u16()
                             };
-                        state.usage.record_completed_request(
+                        state.usage.record_session_completed_request(
+                            session.as_ref(),
                             effective_model,
                             effective_status,
                             attempt,
@@ -782,7 +868,9 @@ async fn execute_proxy_request(
                                 );
 
                                 warn!(
-                                    "Upstream returned in-stream retriable error {} ({}) for {} {}. Retrying in {:?} (attempt {}/{})...",
+                                    session_id = %session_id_str,
+                                    "{}Upstream returned in-stream retriable error {} ({}) for {} {}. Retrying in {:?} (attempt {}/{})...",
+                                    session_prefix,
                                     in_stream_status,
                                     err_msg,
                                     method,
@@ -793,15 +881,16 @@ async fn execute_proxy_request(
                                 );
 
                                 if model_from_path.is_some() {
-                                    state.usage.record_retry();
+                                    state.usage.record_session_retry(session.as_ref());
                                 }
                                 tokio::time::sleep(delay).await;
                                 attempt += 1;
                                 continue;
                             } else {
                                 warn!(
-                                    "Max retries ({}) reached for in-stream error {}. Forwarding stream to client.",
-                                    max_retries, in_stream_status
+                                    session_id = %session_id_str,
+                                    "{}Max retries ({}) reached for in-stream error {}. Forwarding stream to client.",
+                                    session_prefix, max_retries, in_stream_status
                                 );
                             }
                         }
@@ -819,11 +908,13 @@ async fn execute_proxy_request(
                                 let retries_used = attempt;
                                 let extractor = StreamUsageExtractor::new();
                                 let inner_stream: BoxByteStream = Box::pin(full_stream);
+                                let session_for_stream = session.clone();
                                 Box::pin(futures_util::stream::unfold(
                                     (inner_stream, extractor, active_guard, initial_status),
                                     move |(mut s, mut ext, mut guard, mut eff_status)| {
                                         let tracker = tracker.clone();
                                         let req_model = req_model.clone();
+                                        let session_for_stream = session_for_stream.clone();
                                         async move {
                                             match s.next().await {
                                                 Some(Ok(chunk)) => {
@@ -843,7 +934,8 @@ async fn execute_proxy_request(
                                                             .model_version
                                                             .as_deref()
                                                             .unwrap_or(&req_model);
-                                                        tracker.record_completed_request(
+                                                        tracker.record_session_completed_request(
+                                                            session_for_stream.as_ref(),
                                                             effective_model,
                                                             StatusCode::BAD_GATEWAY.as_u16(),
                                                             retries_used,
@@ -860,7 +952,8 @@ async fn execute_proxy_request(
                                                             .model_version
                                                             .as_deref()
                                                             .unwrap_or(&req_model);
-                                                        tracker.record_completed_request(
+                                                        tracker.record_session_completed_request(
+                                                            session_for_stream.as_ref(),
                                                             effective_model,
                                                             eff_status,
                                                             retries_used,
@@ -895,7 +988,9 @@ async fn execute_proxy_request(
                             );
 
                             warn!(
-                                "Upstream stream error on initial chunk for {} {}: {}. Retrying in {:?} (attempt {}/{})...",
+                                session_id = %session_id_str,
+                                "{}Upstream stream error on initial chunk for {} {}: {}. Retrying in {:?} (attempt {}/{})...",
+                                session_prefix,
                                 method,
                                 target_url,
                                 err,
@@ -905,19 +1000,21 @@ async fn execute_proxy_request(
                             );
 
                             if model_from_path.is_some() {
-                                state.usage.record_retry();
+                                state.usage.record_session_retry(session.as_ref());
                             }
                             tokio::time::sleep(delay).await;
                             attempt += 1;
                             continue;
                         } else {
                             error!(
-                                "Upstream error reading initial stream chunk for {} {}: {}",
-                                method, target_url, err
+                                session_id = %session_id_str,
+                                "{}Upstream error reading initial stream chunk for {} {}: {}",
+                                session_prefix, method, target_url, err
                             );
                             drop(active_guard);
                             if let Some(ref req_model) = model_from_path {
-                                state.usage.record_completed_request(
+                                state.usage.record_session_completed_request(
+                                    session.as_ref(),
                                     req_model,
                                     StatusCode::BAD_GATEWAY.as_u16(),
                                     attempt,
@@ -934,7 +1031,8 @@ async fn execute_proxy_request(
                     None => {
                         drop(active_guard);
                         if let Some(ref req_model) = model_from_path {
-                            state.usage.record_completed_request(
+                            state.usage.record_session_completed_request(
+                                session.as_ref(),
                                 req_model,
                                 status.as_u16(),
                                 attempt,
@@ -956,7 +1054,9 @@ async fn execute_proxy_request(
                         calculate_backoff(attempt, initial_delay, max_delay, with_jitter, None);
 
                     warn!(
-                        "Upstream network error for {} {}: {}. Retrying in {:?} (attempt {}/{})...",
+                        session_id = %session_id_str,
+                        "{}Upstream network error for {} {}: {}. Retrying in {:?} (attempt {}/{})...",
+                        session_prefix,
                         method,
                         target_url,
                         err,
@@ -966,19 +1066,21 @@ async fn execute_proxy_request(
                     );
 
                     if model_from_path.is_some() {
-                        state.usage.record_retry();
+                        state.usage.record_session_retry(session.as_ref());
                     }
                     tokio::time::sleep(delay).await;
                     attempt += 1;
                     continue;
                 } else {
                     error!(
-                        "Upstream error for {} {}: {} (retries exhausted or non-retriable)",
-                        method, target_url, err
+                        session_id = %session_id_str,
+                        "{}Upstream error for {} {}: {} (retries exhausted or non-retriable)",
+                        session_prefix, method, target_url, err
                     );
                     drop(active_guard);
                     if let Some(ref req_model) = model_from_path {
-                        state.usage.record_completed_request(
+                        state.usage.record_session_completed_request(
+                            session.as_ref(),
                             req_model,
                             StatusCode::BAD_GATEWAY.as_u16(),
                             attempt,

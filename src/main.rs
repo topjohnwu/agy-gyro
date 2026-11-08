@@ -9,19 +9,28 @@ use std::sync::Arc;
 use tracing::info;
 use tracing_subscriber::{EnvFilter, layer::SubscriberExt, util::SubscriberInitExt};
 
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
+fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::load();
 
     match cli.command {
-        Some(Commands::Server(server_args)) => run_server(server_args).await,
-        Some(Commands::Monitor(monitor_args)) => run_monitor(monitor_args).await,
+        Some(Commands::Server(server_args)) => {
+            let rt = tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build()?;
+            rt.block_on(run_server(server_args))
+        }
+        Some(Commands::Monitor(monitor_args)) => {
+            let rt = tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build()?;
+            rt.block_on(run_monitor(monitor_args))
+        }
         Some(Commands::Run(wrapper_args)) => {
-            let code = run_wrapper(wrapper_args).await?;
+            let code = run_wrapper(wrapper_args)?;
             std::process::exit(code);
         }
         None => {
-            let code = run_wrapper(cli.wrapper_args).await?;
+            let code = run_wrapper(cli.wrapper_args)?;
             std::process::exit(code);
         }
     }
@@ -32,13 +41,37 @@ async fn run_server(server_args: ServerArgs) -> Result<(), Box<dyn std::error::E
     let env_filter =
         EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info,agy_gyro=debug"));
 
-    let _ = tracing_subscriber::registry()
-        .with(env_filter)
-        .with(tracing_subscriber::fmt::layer())
-        .with(UsageLogLayer)
-        .try_init();
+    if let Some(ref path) = server_args.log_file {
+        if let Some(parent) = path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)?;
+
+        let _ = tracing_subscriber::registry()
+            .with(env_filter)
+            .with(
+                tracing_subscriber::fmt::layer()
+                    .with_writer(file)
+                    .with_ansi(false),
+            )
+            .with(UsageLogLayer)
+            .try_init();
+    } else {
+        let _ = tracing_subscriber::registry()
+            .with(env_filter)
+            .with(tracing_subscriber::fmt::layer())
+            .with(UsageLogLayer)
+            .try_init();
+    }
 
     let config = server_args.config;
+
+    let addr = format!("{}:{}", config.host, config.port);
+    let listener = tokio::net::TcpListener::bind(&addr).await?;
+    let bound_addr = listener.local_addr()?;
 
     let client = agy_gyro::proxy::build_http_client(&config)?;
     let state = Arc::new(ProxyState::new(config.clone(), client.clone()));
@@ -53,17 +86,24 @@ async fn run_server(server_args: ServerArgs) -> Result<(), Box<dyn std::error::E
         config.is_jitter_enabled()
     );
 
-    let (gateway_models, pricing) = tokio::join!(
-        agy_gyro::proxy::resolve_gateway_models(&client, &config),
-        fetch_model_pricing(&client, DEFAULT_PRICING_URL)
-    );
+    let env_models = std::env::var("AGY_LLM_GATEWAY_MODELS")
+        .ok()
+        .filter(|s| !s.trim().is_empty());
+
+    let (gateway_models, pricing) = match env_models {
+        Some(models) => {
+            let pricing = fetch_model_pricing(&client, DEFAULT_PRICING_URL).await;
+            (models, pricing)
+        }
+        None => tokio::join!(
+            agy_gyro::proxy::resolve_gateway_models(&client, &config),
+            fetch_model_pricing(&client, DEFAULT_PRICING_URL)
+        ),
+    };
+    state.set_gateway_models(gateway_models.clone());
     state.usage.set_pricing(pricing);
 
     let app = create_router(state);
-
-    let addr = format!("{}:{}", config.host, config.port);
-    let listener = tokio::net::TcpListener::bind(&addr).await?;
-    let bound_addr = listener.local_addr()?;
 
     let model_list: Vec<_> = gateway_models
         .split(',')
