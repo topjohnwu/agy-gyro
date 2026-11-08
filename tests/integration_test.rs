@@ -1235,6 +1235,16 @@ fn test_cli_parse_monitor_subcommand_without_api_key() {
         }
         _ => panic!("expected Monitor command"),
     }
+
+    let cli_stop =
+        Cli::try_parse_with_config_from(["agy-gyro", "stop", "-p", "9090"], None).unwrap();
+    match cli_stop.command {
+        Some(Commands::Stop(args)) => {
+            assert_eq!(args.port, 9090);
+            assert_eq!(args.resolve_base_url(), "http://127.0.0.1:9090");
+        }
+        _ => panic!("expected Stop command"),
+    }
 }
 
 #[tokio::test]
@@ -1376,4 +1386,77 @@ async fn test_multi_session_registration_attribution_and_exit() {
     let snap_empty = fetch_usage_snapshot(&client, &usage_url).await.unwrap();
     assert!(snap_empty.sessions.is_empty());
     assert_eq!(snap_empty.total_requests, 0);
+
+    // POST /shutdown triggers daemon shutdown signal
+    let shutdown_res: agy_gyro::proxy::ShutdownResponse = client
+        .post(format!("{}/shutdown", proxy_url))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(shutdown_res.status, "stopping");
+    assert_eq!(shutdown_res.pid, std::process::id());
+}
+
+#[tokio::test]
+async fn test_server_and_stop_subcommands_spawn_and_stop_background_daemon() {
+    let mock_server = MockServer::start().await;
+    let free_port = {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.local_addr().unwrap().port()
+    };
+    let port_str = free_port.to_string();
+
+    // 1. `agy-gyro server` spawns background daemon and returns immediately without blocking
+    let out1 = tokio::process::Command::new(env!("CARGO_BIN_EXE_agy-gyro"))
+        .args([
+            "server",
+            "-H",
+            "127.0.0.1",
+            "-p",
+            &port_str,
+            "-u",
+            &mock_server.uri(),
+            "--api-key",
+            "test-gemini-key",
+        ])
+        .env("AGY_LLM_GATEWAY_MODELS", "gemini-4-argon-high")
+        .output()
+        .await
+        .unwrap();
+    assert!(out1.status.success());
+    let stdout1 = String::from_utf8_lossy(&out1.stdout);
+    assert!(stdout1.contains("Started agy-gyro daemon"));
+
+    // 2. Second `agy-gyro server` on the same port detects existing daemon and returns immediately
+    let out2 = tokio::process::Command::new(env!("CARGO_BIN_EXE_agy-gyro"))
+        .args([
+            "server",
+            "-H",
+            "127.0.0.1",
+            "-p",
+            &port_str,
+            "-u",
+            &mock_server.uri(),
+            "--api-key",
+            "test-gemini-key",
+        ])
+        .output()
+        .await
+        .unwrap();
+    assert!(out2.status.success());
+    let stdout2 = String::from_utf8_lossy(&out2.stdout);
+    assert!(stdout2.contains("already running"));
+
+    // 3. `agy-gyro stop` stops the background daemon and waits for port release
+    let out_stop = tokio::process::Command::new(env!("CARGO_BIN_EXE_agy-gyro"))
+        .args(["stop", "-H", "127.0.0.1", "-p", &port_str])
+        .output()
+        .await
+        .unwrap();
+    assert!(out_stop.status.success());
+    let stdout_stop = String::from_utf8_lossy(&out_stop.stdout);
+    assert!(stdout_stop.contains("Stopped agy-gyro daemon"));
 }

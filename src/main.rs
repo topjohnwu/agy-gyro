@@ -2,10 +2,11 @@
 
 use agy_gyro::config::{Cli, Commands, ServerArgs};
 use agy_gyro::proxy::{ProxyState, create_router};
-use agy_gyro::runner::run_wrapper;
+use agy_gyro::runner::{run_wrapper, start_daemon, stop_daemon};
 use agy_gyro::tui::run_monitor;
 use agy_gyro::usage::{DEFAULT_PRICING_URL, UsageLogLayer, fetch_model_pricing};
 use std::sync::Arc;
+use std::time::Duration;
 use tracing::info;
 use tracing_subscriber::{EnvFilter, layer::SubscriberExt, util::SubscriberInitExt};
 
@@ -14,16 +15,29 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     match cli.command {
         Some(Commands::Server(server_args)) => {
-            let rt = tokio::runtime::Builder::new_multi_thread()
-                .enable_all()
-                .build()?;
-            rt.block_on(run_server(server_args))
+            if std::env::var_os("AGY_GYRO_DAEMON_WORKER").is_some() {
+                let rt = tokio::runtime::Builder::new_multi_thread()
+                    .enable_all()
+                    .build()?;
+                rt.block_on(run_server(server_args))
+            } else {
+                let rt = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()?;
+                rt.block_on(start_daemon(server_args))
+            }
         }
         Some(Commands::Monitor(monitor_args)) => {
             let rt = tokio::runtime::Builder::new_multi_thread()
                 .enable_all()
                 .build()?;
             rt.block_on(run_monitor(monitor_args))
+        }
+        Some(Commands::Stop(stop_args)) => {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()?;
+            rt.block_on(stop_daemon(stop_args))
         }
         Some(Commands::Run(wrapper_args)) => {
             let code = run_wrapper(wrapper_args)?;
@@ -103,7 +117,8 @@ async fn run_server(server_args: ServerArgs) -> Result<(), Box<dyn std::error::E
     state.set_gateway_models(gateway_models.clone());
     state.usage.set_pricing(pricing);
 
-    let app = create_router(state);
+    let shutdown_rx = state.subscribe_shutdown();
+    let app = create_router(state.clone());
 
     let model_list: Vec<_> = gateway_models
         .split(',')
@@ -126,15 +141,28 @@ async fn run_server(server_args: ServerArgs) -> Result<(), Box<dyn std::error::E
         model_list.join(",\n")
     );
 
-    axum::serve(listener, app)
-        .with_graceful_shutdown(shutdown_signal())
-        .await?;
+    let serve_fut = axum::serve(listener, app)
+        .with_graceful_shutdown(shutdown_signal(state.clone(), shutdown_rx.clone()));
+
+    let mut force_rx = shutdown_rx;
+    tokio::select! {
+        res = serve_fut => {
+            res?;
+        }
+        _ = async move {
+            let _ = force_rx.wait_for(|&shutting_down| shutting_down).await;
+            tokio::time::sleep(Duration::from_millis(500)).await;
+        } => {}
+    }
 
     info!("agy-gyro server stopped gracefully.");
     Ok(())
 }
 
-async fn shutdown_signal() {
+async fn shutdown_signal(
+    state: Arc<ProxyState>,
+    mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
+) {
     let ctrl_c = async {
         tokio::signal::ctrl_c()
             .await
@@ -155,7 +183,9 @@ async fn shutdown_signal() {
     tokio::select! {
         _ = ctrl_c => {},
         _ = terminate => {},
+        _ = shutdown_rx.wait_for(|&shutting_down| shutting_down) => {},
     }
 
+    state.trigger_shutdown();
     info!("Shutdown signal received, shutting down gracefully...");
 }

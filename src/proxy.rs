@@ -189,6 +189,7 @@ pub struct ProxyState {
     pub keep_alive_interval: Duration,
     pub usage: Arc<UsageTracker>,
     pub gateway_models: RwLock<String>,
+    shutdown_tx: tokio::sync::watch::Sender<bool>,
 }
 
 impl ProxyState {
@@ -205,6 +206,7 @@ impl ProxyState {
         usage.register_global_logger();
         usage.spawn_process_monitor();
         let default_models = expand_gateway_models(DEFAULT_GATEWAY_MODELS);
+        let (shutdown_tx, _) = tokio::sync::watch::channel(false);
         Self {
             config,
             client,
@@ -212,6 +214,7 @@ impl ProxyState {
             keep_alive_interval: DEFAULT_KEEP_ALIVE_INTERVAL,
             usage,
             gateway_models: RwLock::new(default_models),
+            shutdown_tx,
         }
     }
 
@@ -237,6 +240,14 @@ impl ProxyState {
             .map(|g| g.clone())
             .unwrap_or_else(|_| expand_gateway_models(DEFAULT_GATEWAY_MODELS))
     }
+
+    pub fn subscribe_shutdown(&self) -> tokio::sync::watch::Receiver<bool> {
+        self.shutdown_tx.subscribe()
+    }
+
+    pub fn trigger_shutdown(&self) {
+        let _ = self.shutdown_tx.send(true);
+    }
 }
 
 /// Builds a tuned reqwest HTTP client from the proxy configuration.
@@ -256,6 +267,7 @@ async fn usage_handler(
 ) -> Sse<impl futures_util::Stream<Item = Result<Event, std::convert::Infallible>>> {
     let tracker = state.usage.clone();
     let rx = tracker.subscribe();
+    let shutdown_rx = state.subscribe_shutdown();
     let mut ticker = tokio::time::interval_at(
         tokio::time::Instant::now() + Duration::from_secs(1),
         Duration::from_secs(1),
@@ -263,12 +275,20 @@ async fn usage_handler(
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
     let stream = futures_util::stream::unfold(
-        (tracker, rx, ticker, true),
-        |(tracker, mut rx, mut ticker, is_first)| async move {
+        (tracker, rx, shutdown_rx, ticker, true),
+        |(tracker, mut rx, mut shutdown_rx, mut ticker, is_first)| async move {
+            if *shutdown_rx.borrow() {
+                return None;
+            }
             if !is_first {
                 tokio::select! {
                     res = rx.changed() => {
                         if res.is_err() {
+                            return None;
+                        }
+                    }
+                    _ = shutdown_rx.changed() => {
+                        if *shutdown_rx.borrow() {
                             return None;
                         }
                     }
@@ -280,7 +300,7 @@ async fn usage_handler(
             let json = serde_json::to_string(&snap).unwrap_or_else(|_| "{}".to_string());
             Some((
                 Ok(Event::default().data(json)),
-                (tracker, rx, ticker, false),
+                (tracker, rx, shutdown_rx, ticker, false),
             ))
         },
     );
@@ -320,6 +340,20 @@ pub struct RegisterSessionResponse {
     pub gateway_models: String,
 }
 
+/// Response payload from `GET /sessions` for checking daemon liveness and active model list.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DaemonStatusResponse {
+    pub pid: u32,
+    pub gateway_models: String,
+}
+
+async fn daemon_status_handler(State(state): State<Arc<ProxyState>>) -> Json<DaemonStatusResponse> {
+    Json(DaemonStatusResponse {
+        pid: std::process::id(),
+        gateway_models: state.gateway_models(),
+    })
+}
+
 async fn register_session_handler(
     State(state): State<Arc<ProxyState>>,
     Json(req): Json<RegisterSessionRequest>,
@@ -342,22 +376,57 @@ async fn remove_session_handler(
     StatusCode::NO_CONTENT
 }
 
+/// Response payload from `POST /shutdown`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ShutdownResponse {
+    pub status: String,
+    pub pid: u32,
+}
+
+async fn shutdown_handler(State(state): State<Arc<ProxyState>>) -> Json<ShutdownResponse> {
+    let pid = std::process::id();
+    info!("Shutdown requested via /shutdown endpoint (pid={})", pid);
+    state.trigger_shutdown();
+    Json(ShutdownResponse {
+        status: "stopping".to_string(),
+        pid,
+    })
+}
+
 async fn logs_handler(
     State(state): State<Arc<ProxyState>>,
 ) -> Sse<impl futures_util::Stream<Item = Result<Event, std::convert::Infallible>>> {
     let tracker = state.usage.clone();
     let rx = tracker.subscribe_logs();
+    let shutdown_rx = state.subscribe_shutdown();
 
     let stream = futures_util::stream::unfold(
-        (tracker, rx, true),
-        |(tracker, mut rx, is_first)| async move {
-            if !is_first && rx.changed().await.is_err() {
+        (tracker, rx, shutdown_rx, true),
+        |(tracker, mut rx, mut shutdown_rx, is_first)| async move {
+            if *shutdown_rx.borrow() {
                 return None;
+            }
+            if !is_first {
+                tokio::select! {
+                    res = rx.changed() => {
+                        if res.is_err() {
+                            return None;
+                        }
+                    }
+                    _ = shutdown_rx.changed() => {
+                        if *shutdown_rx.borrow() {
+                            return None;
+                        }
+                    }
+                }
             }
             let _ = rx.borrow_and_update();
             let logs = tracker.logs_snapshot();
             let json = serde_json::to_string(&logs).unwrap_or_else(|_| "[]".to_string());
-            Some((Ok(Event::default().data(json)), (tracker, rx, false)))
+            Some((
+                Ok(Event::default().data(json)),
+                (tracker, rx, shutdown_rx, false),
+            ))
         },
     );
 
@@ -369,8 +438,12 @@ pub fn create_router(state: Arc<ProxyState>) -> Router {
     Router::new()
         .route("/usage", get(usage_handler).delete(reset_usage_handler))
         .route("/logs", get(logs_handler))
-        .route("/sessions", post(register_session_handler))
+        .route(
+            "/sessions",
+            get(daemon_status_handler).post(register_session_handler),
+        )
         .route("/sessions/{id}", delete(remove_session_handler))
+        .route("/shutdown", post(shutdown_handler))
         .route("/", any(proxy_handler))
         .route("/{*path}", any(proxy_handler))
         .layer(DefaultBodyLimit::disable())

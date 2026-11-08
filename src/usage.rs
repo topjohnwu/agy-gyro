@@ -778,7 +778,8 @@ pub fn extract_session_from_headers(headers: &axum::http::HeaderMap) -> Option<S
     None
 }
 
-fn is_pid_alive(pid: u32) -> bool {
+/// Returns `true` if the OS process with the given `pid` is currently alive.
+pub fn is_pid_alive(pid: u32) -> bool {
     if pid == 0 {
         return false;
     }

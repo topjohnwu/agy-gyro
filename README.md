@@ -75,14 +75,20 @@ agy-gyro -- --dangerously-skip-permissions
 
 # Optionally write proxy logs to a file:
 agy-gyro --log-file /tmp/gyro.log
+
+# Stop the background daemon at any time:
+agy-gyro stop
 ```
 
-### Mode 2: Standalone Server Mode (`agy-gyro server`)
+### Mode 2: Background Daemon Mode (`agy-gyro server` / `agy-gyro stop`)
 
-To run `agy-gyro` as a persistent background daemon or standalone Enterprise Gateway server:
+To start the `agy-gyro` background daemon explicitly without launching `agy` (no-op if a daemon is already running on the configured port):
 
 ```bash
 agy-gyro server
+
+# Stop the background daemon at any time:
+agy-gyro stop
 ```
 
 ### Mode 3: Live Usage & Cost TUI Dashboard (`agy-gyro monitor`)

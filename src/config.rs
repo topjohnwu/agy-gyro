@@ -147,6 +147,10 @@ impl Cli {
                     let sub_matches = matches.subcommand_matches("monitor").unwrap_or(&matches);
                     monitor_args.apply_file_config(sub_matches, fc);
                 }
+                Some(Commands::Stop(ref mut stop_args)) => {
+                    let sub_matches = matches.subcommand_matches("stop").unwrap_or(&matches);
+                    stop_args.apply_file_config(sub_matches, fc);
+                }
                 None => {
                     cli.wrapper_args.apply_file_config(&matches, fc);
                 }
@@ -156,7 +160,7 @@ impl Cli {
         let active_config = match &cli.command {
             Some(Commands::Server(s)) => Some(&s.config),
             Some(Commands::Run(w)) => Some(&w.config),
-            Some(Commands::Monitor(_)) => None,
+            Some(Commands::Monitor(_) | Commands::Stop(_)) => None,
             None => Some(&cli.wrapper_args.config),
         };
 
@@ -175,12 +179,14 @@ impl Cli {
 
 #[derive(Subcommand, Debug, Clone)]
 pub enum Commands {
-    /// Run standalone proxy server in the foreground
+    /// Start the background agy-gyro daemon (if not already running)
     Server(ServerArgs),
     /// Run agy CLI wrapped with the local proxy (default mode)
     Run(WrapperArgs),
     /// Monitor live token usage and cost in a terminal UI dashboard
     Monitor(MonitorArgs),
+    /// Stop the running background agy-gyro daemon
+    Stop(MonitorArgs),
 }
 
 #[derive(Args, Debug, Clone)]
@@ -212,16 +218,33 @@ impl MonitorArgs {
         }
     }
 
-    pub fn resolve_endpoint_url(&self) -> String {
+    pub fn resolve_base_url(&self) -> String {
         if let Some(ref u) = self.url {
-            crate::tui::resolve_usage_endpoint_url(u)
+            let trimmed = u.trim().trim_end_matches('/');
+            let base = trimmed
+                .strip_suffix("/usage")
+                .or_else(|| trimmed.strip_suffix("/logs"))
+                .unwrap_or(trimmed);
+            if base.starts_with("http://") || base.starts_with("https://") {
+                base.to_string()
+            } else {
+                format!("http://{}", base)
+            }
         } else {
             let host = if self.host == "0.0.0.0" {
                 "127.0.0.1"
             } else {
                 &self.host
             };
-            format!("http://{}:{}/usage", host, self.port)
+            format!("http://{}:{}", host, self.port)
+        }
+    }
+
+    pub fn resolve_endpoint_url(&self) -> String {
+        if let Some(ref u) = self.url {
+            crate::tui::resolve_usage_endpoint_url(u)
+        } else {
+            format!("{}/usage", self.resolve_base_url())
         }
     }
 }

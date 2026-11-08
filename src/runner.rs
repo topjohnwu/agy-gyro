@@ -1,8 +1,10 @@
 // SPDX-License-Identifier: MIT
 
-use crate::config::WrapperArgs;
-use crate::proxy::{RegisterSessionRequest, RegisterSessionResponse};
-use crate::usage::sanitize_session_label;
+use crate::config::{Config, MonitorArgs, ServerArgs, WrapperArgs};
+use crate::proxy::{
+    DaemonStatusResponse, RegisterSessionRequest, RegisterSessionResponse, ShutdownResponse,
+};
+use crate::usage::{is_pid_alive, sanitize_session_label};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::{Duration, Instant};
@@ -57,6 +59,22 @@ async fn try_register_session(
         .map_err(|e| e.to_string())
 }
 
+async fn try_fetch_daemon_status(
+    client: &reqwest::Client,
+    daemon_base_url: &str,
+) -> Result<DaemonStatusResponse, String> {
+    let url = format!("{}/sessions", daemon_base_url.trim_end_matches('/'));
+    let res = client.get(&url).send().await.map_err(|e| e.to_string())?;
+
+    if !res.status().is_success() {
+        return Err(format!("HTTP {}", res.status()));
+    }
+
+    res.json::<DaemonStatusResponse>()
+        .await
+        .map_err(|e| e.to_string())
+}
+
 fn is_agy_gyro_binary(exe_path: &Path) -> bool {
     exe_path
         .file_stem()
@@ -88,14 +106,15 @@ fn resolve_daemon_exe() -> Result<PathBuf, Box<dyn std::error::Error>> {
 }
 
 fn spawn_background_daemon(
-    wrapper_args: &WrapperArgs,
+    cfg: &Config,
+    log_file: Option<&Path>,
     port: u16,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let exe = resolve_daemon_exe()?;
-    let cfg = &wrapper_args.config;
 
     let mut cmd = std::process::Command::new(exe);
     cmd.arg("server")
+        .env("AGY_GYRO_DAEMON_WORKER", "1")
         .env("AGY_GYRO_HOST", &cfg.host)
         .env("AGY_GYRO_PORT", port.to_string())
         .env("AGY_GYRO_UPSTREAM_URL", &cfg.upstream)
@@ -116,7 +135,7 @@ fn spawn_background_daemon(
         .stdout(Stdio::null())
         .stderr(Stdio::null());
 
-    if let Some(ref log_file) = wrapper_args.log_file {
+    if let Some(log_file) = log_file {
         cmd.env("AGY_GYRO_LOG_FILE", log_file);
     }
 
@@ -154,6 +173,74 @@ fn spawn_background_daemon(
     Ok(())
 }
 
+/// Ensures the background `agy-gyro` daemon is running on the configured port without blocking.
+/// If a daemon is already running on the configured port, prints its status and returns immediately.
+pub async fn start_daemon(server_args: ServerArgs) -> Result<(), Box<dyn std::error::Error>> {
+    let config = &server_args.config;
+    let client = build_registration_client()?;
+
+    let port = if config.port != 0 {
+        config.port
+    } else {
+        let listener = std::net::TcpListener::bind((connect_host(&config.host), 0))?;
+        listener.local_addr()?.port()
+    };
+
+    let daemon_url = format!("http://{}:{}", connect_host(&config.host), port);
+
+    if let Ok(status) = try_fetch_daemon_status(&client, &daemon_url).await {
+        println!(
+            "agy-gyro daemon (pid={}) is already running on {}",
+            status.pid, daemon_url
+        );
+        return Ok(());
+    }
+
+    spawn_background_daemon(config, server_args.log_file.as_deref(), port)?;
+
+    let env_models = std::env::var("AGY_LLM_GATEWAY_MODELS")
+        .ok()
+        .filter(|s| !s.trim().is_empty());
+
+    let start = Instant::now();
+    while start.elapsed() < Duration::from_secs(15) {
+        tokio::time::sleep(Duration::from_millis(40)).await;
+        if let Ok(status) = try_fetch_daemon_status(&client, &daemon_url).await {
+            let models = env_models.unwrap_or(status.gateway_models);
+            let model_list: Vec<_> = models
+                .split(',')
+                .filter(|m| !m.is_empty())
+                .map(|m| format!("      {{ \"modelId\": \"{}\" }}", m))
+                .collect();
+
+            println!(
+                "Started agy-gyro daemon (pid={}) on {}",
+                status.pid, daemon_url
+            );
+            println!(
+                "Live usage endpoint: {}/usage (run `agy-gyro monitor` for live TUI dashboard)\n",
+                daemon_url
+            );
+            println!(
+                "To configure via environment variables:\n  export AGY_LLM_GATEWAY_URL={}\n  export AGY_LLM_GATEWAY_WIRE_PROTOCOL=genai\n  export AGY_LLM_GATEWAY_API_KEY=agy-gyro\n  export AGY_LLM_GATEWAY_MODELS=\"{}\"\n",
+                daemon_url, models
+            );
+            println!(
+                "To configure via ~/.gemini/config/config.json:\n{{\n  \"gateway\": {{\n    \"enabled\": true,\n    \"url\": \"{}\",\n    \"apiKey\": \"agy-gyro\",\n    \"wireProtocol\": \"genai\"\n  }},\n  \"models\": {{\n    \"list\": [\n{}\n    ]\n  }}\n}}",
+                daemon_url,
+                model_list.join(",\n")
+            );
+            return Ok(());
+        }
+    }
+
+    Err(format!(
+        "Timed out waiting for background agy-gyro daemon on {}",
+        daemon_url
+    )
+    .into())
+}
+
 async fn ensure_daemon_and_register(
     wrapper_args: &WrapperArgs,
     pid: Option<u32>,
@@ -180,7 +267,7 @@ async fn ensure_daemon_and_register(
         return Ok((daemon_url, reg.session_id, reg.api_key, models));
     }
 
-    spawn_background_daemon(wrapper_args, port)?;
+    spawn_background_daemon(config, wrapper_args.log_file.as_deref(), port)?;
 
     let start = Instant::now();
     while start.elapsed() < Duration::from_secs(15) {
@@ -272,4 +359,63 @@ pub fn run_wrapper(wrapper_args: WrapperArgs) -> Result<i32, Box<dyn std::error:
             }
         }
     }
+}
+
+/// Stops a running `agy-gyro` background daemon at the target address configured by `args`.
+pub async fn stop_daemon(args: MonitorArgs) -> Result<(), Box<dyn std::error::Error>> {
+    let base_url = args.resolve_base_url();
+    let shutdown_url = format!("{}/shutdown", base_url);
+    let client = build_registration_client()?;
+
+    let res = match client
+        .post(&shutdown_url)
+        .timeout(Duration::from_secs(3))
+        .send()
+        .await
+    {
+        Ok(res) => res,
+        Err(err) if err.is_connect() => {
+            println!("No running agy-gyro daemon found at {}", base_url);
+            return Ok(());
+        }
+        Err(err) => {
+            return Err(
+                format!("Failed to contact agy-gyro daemon at {}: {}", base_url, err).into(),
+            );
+        }
+    };
+
+    if !res.status().is_success() {
+        return Err(format!(
+            "Daemon at {} returned unexpected status {}",
+            base_url,
+            res.status()
+        )
+        .into());
+    }
+
+    let payload = res.json::<ShutdownResponse>().await.ok();
+    let pid = payload.as_ref().map(|p| p.pid);
+
+    let start = Instant::now();
+    while start.elapsed() < Duration::from_secs(3) {
+        let pid_done = pid.is_none_or(|p| p == std::process::id() || !is_pid_alive(p));
+        let port_closed = client
+            .get(format!("{}/usage", base_url))
+            .timeout(Duration::from_millis(100))
+            .send()
+            .await
+            .is_err();
+        if pid_done && port_closed {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+
+    if let Some(p) = pid {
+        println!("Stopped agy-gyro daemon (pid={}) at {}", p, base_url);
+    } else {
+        println!("Stopped agy-gyro daemon at {}", base_url);
+    }
+    Ok(())
 }
