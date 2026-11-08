@@ -183,6 +183,7 @@ pub struct DashboardState {
     pub status_message: Option<(String, Instant)>,
     pub log_scroll_from_bottom: usize,
     pub log_viewport_height: usize,
+    pub log_viewport_width: usize,
     pub tick_count: u64,
 }
 
@@ -199,6 +200,7 @@ impl DashboardState {
             status_message: None,
             log_scroll_from_bottom: 0,
             log_viewport_height: 10,
+            log_viewport_width: 120,
             tick_count: 0,
         }
     }
@@ -303,17 +305,33 @@ impl DashboardState {
         }
     }
 
-    /// Maximum number of lines the log panel can scroll up from the bottom
-    /// while keeping the viewport full (`logs[0]` at the top row).
+    /// Returns all visible log entries pre-wrapped into visual terminal [`Line`]s for `inner_width`,
+    /// tagged with `(entry_id, subline_index, line)`.
+    pub fn visual_log_lines(&self, inner_width: usize) -> Vec<(u64, usize, Line<'static>)> {
+        let mut out = Vec::new();
+        for entry in self.visible_logs() {
+            for (sub_idx, line) in format_wrapped_log_entry(entry, inner_width)
+                .into_iter()
+                .enumerate()
+            {
+                out.push((entry.id, sub_idx, line));
+            }
+        }
+        out
+    }
+
+    /// Maximum number of visual lines the log panel can scroll up from the bottom
+    /// while keeping the viewport full.
     pub fn max_log_scroll(&self) -> usize {
-        self.visible_logs()
+        self.visual_log_lines(self.log_viewport_width)
             .len()
             .saturating_sub(self.log_viewport_height.max(1))
     }
 
     pub fn update_viewport_size(&mut self, area: Rect) {
-        let chunks = dashboard_chunks(area);
+        let chunks = dashboard_chunks(area, self);
         self.log_viewport_height = chunks[3].height.saturating_sub(2) as usize;
+        self.log_viewport_width = chunks[3].width.saturating_sub(2) as usize;
         let max_scroll = self.max_log_scroll();
         if self.log_scroll_from_bottom > max_scroll {
             self.log_scroll_from_bottom = max_scroll;
@@ -333,23 +351,25 @@ impl DashboardState {
             .saturating_sub(lines);
     }
 
-    /// Updates the log buffer while keeping the viewport anchored on the same log lines when paused.
+    /// Updates the log buffer while keeping the viewport anchored on the same visual log line when paused.
     pub fn set_logs(&mut self, new_logs: Vec<LogEntry>) {
         if self.log_scroll_from_bottom > 0 {
-            let visible = self.visible_logs();
-            if !visible.is_empty() {
-                let max_prev_scroll = visible
-                    .len()
-                    .saturating_sub(self.log_viewport_height.max(1));
+            let width = self.log_viewport_width;
+            let visual = self.visual_log_lines(width);
+            if !visual.is_empty() {
+                let max_prev_scroll = visual.len().saturating_sub(self.log_viewport_height.max(1));
                 let effective_prev_scroll = self.log_scroll_from_bottom.min(max_prev_scroll);
-                let prev_end_idx = visible.len().saturating_sub(effective_prev_scroll);
+                let prev_end_idx = visual.len().saturating_sub(effective_prev_scroll);
                 if prev_end_idx > 0
-                    && let Some(anchor_id) = visible.get(prev_end_idx - 1).map(|l| l.id)
+                    && let Some((anchor_id, anchor_sub, _)) = visual.get(prev_end_idx - 1).cloned()
                 {
                     self.logs = new_logs;
-                    let new_visible = self.visible_logs();
-                    if let Some(pos) = new_visible.iter().position(|l| l.id == anchor_id) {
-                        let new_scroll = new_visible.len().saturating_sub(pos + 1);
+                    let new_visual = self.visual_log_lines(width);
+                    if let Some(pos) = new_visual
+                        .iter()
+                        .position(|(id, sub, _)| *id == anchor_id && *sub == anchor_sub)
+                    {
+                        let new_scroll = new_visual.len().saturating_sub(pos + 1);
                         self.log_scroll_from_bottom = new_scroll.min(self.max_log_scroll());
                     } else {
                         self.log_scroll_from_bottom = self.max_log_scroll();
@@ -400,22 +420,26 @@ pub fn format_duration_secs(secs: u64) -> String {
     format!("{:02}:{:02}:{:02}", h, m, s)
 }
 
-fn dashboard_chunks(area: Rect) -> std::rc::Rc<[Rect]> {
+fn dashboard_chunks(area: Rect, state: &DashboardState) -> std::rc::Rc<[Rect]> {
+    let model_rows = state.sorted_models().len().max(1) as u16;
+    // 2 border rows + 1 header row + N model rows
+    let models_table_height = model_rows.saturating_add(3);
+
     Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(4),  // Header bar + Session tab bar
-            Constraint::Length(6),  // 4 Summary cards
-            Constraint::Length(10), // Per-model breakdown table
-            Constraint::Min(8),     // Real-time gateway logs
-            Constraint::Length(1),  // Footer keybindings bar
+            Constraint::Length(4),                   // Header bar + Session tab bar
+            Constraint::Length(6),                   // 4 Summary cards
+            Constraint::Length(models_table_height), // Per-model breakdown table (sized to content)
+            Constraint::Fill(1), // Real-time gateway logs (expands to remaining space)
+            Constraint::Length(1), // Footer keybindings bar
         ])
         .split(area)
 }
 
 /// Renders the complete TUI dashboard frame from [`DashboardState`].
 pub fn render_dashboard(frame: &mut Frame, state: &DashboardState) {
-    let chunks = dashboard_chunks(frame.area());
+    let chunks = dashboard_chunks(frame.area(), state);
 
     render_header(frame, chunks[0], state);
     render_summary_cards(frame, chunks[1], state);
@@ -821,7 +845,7 @@ fn render_models_table(frame: &mut Frame, area: Rect, state: &DashboardState) {
         )
     });
 
-    let header = Row::new(header_cells).height(1).bottom_margin(1);
+    let header = Row::new(header_cells).height(1);
     let models = state.sorted_models();
 
     let rows: Vec<Row> = if models.is_empty() {
@@ -919,50 +943,116 @@ fn render_models_table(frame: &mut Frame, area: Rect, state: &DashboardState) {
     frame.render_widget(table, area);
 }
 
-fn render_logs_panel(frame: &mut Frame, area: Rect, state: &DashboardState) {
-    let logs = state.visible_logs();
+fn wrap_text_to_width(text: &str, max_width: usize) -> Vec<String> {
+    let width = max_width.max(1);
+    let mut wrapped = Vec::new();
 
+    for raw_line in text.split('\n') {
+        if raw_line.is_empty() {
+            wrapped.push(String::new());
+            continue;
+        }
+
+        let chars: Vec<char> = raw_line.chars().collect();
+        let mut start = 0;
+        while start < chars.len() {
+            let remaining = chars.len() - start;
+            if remaining <= width {
+                let chunk: String = chars[start..].iter().collect();
+                wrapped.push(chunk);
+                break;
+            }
+
+            let end_limit = start + width;
+            let split_at = chars[start..end_limit]
+                .iter()
+                .rposition(|&c| c == ' ')
+                .filter(|&rel_pos| rel_pos > 0)
+                .map(|rel_pos| start + rel_pos);
+
+            if let Some(space_idx) = split_at {
+                let chunk: String = chars[start..space_idx].iter().collect();
+                wrapped.push(chunk);
+                start = space_idx + 1;
+                while start < chars.len() && chars[start] == ' ' {
+                    start += 1;
+                }
+            } else {
+                let chunk: String = chars[start..end_limit].iter().collect();
+                wrapped.push(chunk);
+                start = end_limit;
+            }
+        }
+    }
+
+    if wrapped.is_empty() {
+        wrapped.push(String::new());
+    }
+    wrapped
+}
+
+fn format_wrapped_log_entry(entry: &LogEntry, inner_width: usize) -> Vec<Line<'static>> {
+    let (level_str, level_style) = match entry.level.as_str() {
+        "ERROR" => (
+            "ERROR",
+            Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+        ),
+        "WARN" => (
+            "WARN ",
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        ),
+        "INFO" => ("INFO ", Style::default().fg(Color::Green)),
+        "DEBUG" => ("DEBUG", Style::default().fg(Color::Cyan)),
+        other => (other, Style::default().fg(Color::DarkGray)),
+    };
+
+    let ts_prefix = format!("[{}] ", format_duration_secs(entry.timestamp_secs));
+    let lvl_prefix = format!("{} ", level_str);
+    let prefix_width = ts_prefix.chars().count() + lvl_prefix.chars().count();
+    let msg_width = inner_width.saturating_sub(prefix_width).max(12);
+    let indent = " ".repeat(prefix_width);
+
+    let chunks = wrap_text_to_width(&entry.message, msg_width);
+    let mut lines = Vec::with_capacity(chunks.len());
+    for (idx, chunk) in chunks.into_iter().enumerate() {
+        if idx == 0 {
+            lines.push(Line::from(vec![
+                Span::styled(ts_prefix.clone(), Style::default().fg(Color::DarkGray)),
+                Span::styled(lvl_prefix.clone(), level_style),
+                Span::styled(chunk, Style::default().fg(Color::White)),
+            ]));
+        } else {
+            lines.push(Line::from(vec![
+                Span::raw(indent.clone()),
+                Span::styled(chunk, Style::default().fg(Color::White)),
+            ]));
+        }
+    }
+    lines
+}
+
+fn render_logs_panel(frame: &mut Frame, area: Rect, state: &DashboardState) {
+    let total_entries = state.visible_logs().len();
+    let inner_width = area.width.saturating_sub(2) as usize;
     let visible_rows = area.height.saturating_sub(2) as usize;
-    let total = logs.len();
-    let max_scroll = total.saturating_sub(visible_rows);
+    let visual_lines = state.visual_log_lines(inner_width);
+    let total_visual = visual_lines.len();
+    let max_scroll = total_visual.saturating_sub(visible_rows);
     let effective_scroll = state.log_scroll_from_bottom.min(max_scroll);
-    let end_idx = total.saturating_sub(effective_scroll);
+    let end_idx = total_visual.saturating_sub(effective_scroll);
     let start_idx = end_idx.saturating_sub(visible_rows);
 
-    let lines: Vec<Line> = if logs.is_empty() {
+    let lines: Vec<Line> = if visual_lines.is_empty() {
         vec![Line::from(Span::styled(
             "Waiting for gateway logs...",
             Style::default().fg(Color::DarkGray),
         ))]
     } else {
-        logs[start_idx..end_idx]
+        visual_lines[start_idx..end_idx]
             .iter()
-            .map(|entry| {
-                let (level_str, level_style) = match entry.level.as_str() {
-                    "ERROR" => (
-                        "ERROR",
-                        Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
-                    ),
-                    "WARN" => (
-                        "WARN ",
-                        Style::default()
-                            .fg(Color::Yellow)
-                            .add_modifier(Modifier::BOLD),
-                    ),
-                    "INFO" => ("INFO ", Style::default().fg(Color::Green)),
-                    "DEBUG" => ("DEBUG", Style::default().fg(Color::Cyan)),
-                    other => (other, Style::default().fg(Color::DarkGray)),
-                };
-
-                Line::from(vec![
-                    Span::styled(
-                        format!("[{}] ", format_duration_secs(entry.timestamp_secs)),
-                        Style::default().fg(Color::DarkGray),
-                    ),
-                    Span::styled(format!("{} ", level_str), level_style),
-                    Span::styled(entry.message.clone(), Style::default().fg(Color::White)),
-                ])
-            })
+            .map(|(_, _, line)| line.clone())
             .collect()
     };
 
@@ -974,7 +1064,7 @@ fn render_logs_panel(frame: &mut Frame, area: Rect, state: &DashboardState) {
     } else {
         format!(
             " Live Gateway Logs ({} entries, ↑/↓/PgUp/PgDn to scroll) ",
-            total
+            total_entries
         )
     };
 
@@ -1027,7 +1117,6 @@ fn render_footer(frame: &mut Frame, area: Rect, state: &DashboardState) {
                 .add_modifier(Modifier::BOLD),
         ),
         Span::raw(" Scroll Logs  "),
-        Span::styled("│ Stream: SSE ", Style::default().fg(Color::DarkGray)),
     ];
 
     if let Some((ref msg, ts)) = state.status_message
@@ -1498,5 +1587,45 @@ mod tests {
             .collect();
         state.set_logs(new_logs);
         assert_eq!(state.log_scroll_from_bottom, 9);
+    }
+
+    #[test]
+    fn test_log_soft_wrapping_and_hanging_indent() {
+        let entry = LogEntry {
+            id: 1,
+            timestamp_secs: 5,
+            level: "INFO".to_string(),
+            target: "agy_gyro".to_string(),
+            message: "First segment of a long message that wraps onto a second visual row\nExplicit newline row".to_string(),
+            session_id: None,
+        };
+
+        // Prefix "[00:00:05] INFO  " is 17 columns; width 52 leaves 35 columns for message text
+        let wrapped = format_wrapped_log_entry(&entry, 52);
+        assert!(wrapped.len() >= 3);
+
+        let first_text: String = wrapped[0]
+            .spans
+            .iter()
+            .map(|s| s.content.as_ref())
+            .collect();
+        assert!(first_text.starts_with("[00:00:05] INFO  First segment"));
+
+        // Continuation lines have 17-space hanging indent
+        let second_text: String = wrapped[1]
+            .spans
+            .iter()
+            .map(|s| s.content.as_ref())
+            .collect();
+        assert!(second_text.starts_with(&" ".repeat(17)));
+
+        let last_text: String = wrapped
+            .last()
+            .unwrap()
+            .spans
+            .iter()
+            .map(|s| s.content.as_ref())
+            .collect();
+        assert_eq!(last_text, format!("{}Explicit newline row", " ".repeat(17)));
     }
 }

@@ -120,25 +120,10 @@ async fn run_server(server_args: ServerArgs) -> Result<(), Box<dyn std::error::E
     let shutdown_rx = state.subscribe_shutdown();
     let app = create_router(state.clone());
 
-    let model_list: Vec<_> = gateway_models
-        .split(',')
-        .filter(|m| !m.is_empty())
-        .map(|m| format!("      {{ \"modelId\": \"{}\" }}", m))
-        .collect();
-
     info!("agy-gyro gateway listening on http://{}", bound_addr);
     info!(
         "Live usage endpoint: http://{}/usage (run `agy-gyro monitor` for live TUI dashboard)",
         bound_addr
-    );
-    info!(
-        "To configure via environment variables:\n  export AGY_LLM_GATEWAY_URL=http://{}\n  export AGY_LLM_GATEWAY_WIRE_PROTOCOL=genai\n  export AGY_LLM_GATEWAY_API_KEY=agy-gyro\n  export AGY_LLM_GATEWAY_MODELS=\"{}\"\n",
-        addr, gateway_models
-    );
-    info!(
-        "To configure via ~/.gemini/config/config.json:\n{{\n  \"gateway\": {{\n    \"enabled\": true,\n    \"url\": \"http://{}\",\n    \"apiKey\": \"agy-gyro\",\n    \"wireProtocol\": \"genai\"\n  }},\n  \"models\": {{\n    \"list\": [\n{}\n    ]\n  }}\n}}\n",
-        addr,
-        model_list.join(",\n")
     );
 
     let serve_fut = axum::serve(listener, app)

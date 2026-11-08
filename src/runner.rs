@@ -198,37 +198,13 @@ pub async fn start_daemon(server_args: ServerArgs) -> Result<(), Box<dyn std::er
 
     spawn_background_daemon(config, server_args.log_file.as_deref(), port)?;
 
-    let env_models = std::env::var("AGY_LLM_GATEWAY_MODELS")
-        .ok()
-        .filter(|s| !s.trim().is_empty());
-
     let start = Instant::now();
     while start.elapsed() < Duration::from_secs(15) {
         tokio::time::sleep(Duration::from_millis(40)).await;
         if let Ok(status) = try_fetch_daemon_status(&client, &daemon_url).await {
-            let models = env_models.unwrap_or(status.gateway_models);
-            let model_list: Vec<_> = models
-                .split(',')
-                .filter(|m| !m.is_empty())
-                .map(|m| format!("      {{ \"modelId\": \"{}\" }}", m))
-                .collect();
-
             println!(
                 "Started agy-gyro daemon (pid={}) on {}",
                 status.pid, daemon_url
-            );
-            println!(
-                "Live usage endpoint: {}/usage (run `agy-gyro monitor` for live TUI dashboard)\n",
-                daemon_url
-            );
-            println!(
-                "To configure via environment variables:\n  export AGY_LLM_GATEWAY_URL={}\n  export AGY_LLM_GATEWAY_WIRE_PROTOCOL=genai\n  export AGY_LLM_GATEWAY_API_KEY=agy-gyro\n  export AGY_LLM_GATEWAY_MODELS=\"{}\"\n",
-                daemon_url, models
-            );
-            println!(
-                "To configure via ~/.gemini/config/config.json:\n{{\n  \"gateway\": {{\n    \"enabled\": true,\n    \"url\": \"{}\",\n    \"apiKey\": \"agy-gyro\",\n    \"wireProtocol\": \"genai\"\n  }},\n  \"models\": {{\n    \"list\": [\n{}\n    ]\n  }}\n}}",
-                daemon_url,
-                model_list.join(",\n")
             );
             return Ok(());
         }

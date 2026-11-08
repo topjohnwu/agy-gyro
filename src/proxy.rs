@@ -638,6 +638,13 @@ enum KeepAlivePhase<F> {
     },
 }
 
+fn format_endpoint(url: &reqwest::Url) -> String {
+    match url.query() {
+        Some(q) => format!("{}?{}", url.path(), q),
+        None => url.path().to_string(),
+    }
+}
+
 async fn execute_proxy_request(
     state: Arc<ProxyState>,
     method: Method,
@@ -646,6 +653,7 @@ async fn execute_proxy_request(
     body: Bytes,
 ) -> UpstreamOutcome {
     let req_start = Instant::now();
+    let endpoint = format_endpoint(&target_url);
     let session = extract_session_from_headers(&headers);
     let session_prefix = session
         .as_ref()
@@ -667,8 +675,9 @@ async fn execute_proxy_request(
 
     loop {
         debug!(
-            "Forwarding request {} {} (attempt {}/{})",
-            method, target_url, attempt, max_retries
+            session_id = %session_id_str,
+            "{}Forwarding request {} {} (attempt {}/{})",
+            session_prefix, method, endpoint, attempt, max_retries
         );
 
         let mut req_builder = state.client.request(method.clone(), target_url.clone());
@@ -724,7 +733,7 @@ async fn execute_proxy_request(
                             session_prefix,
                             status,
                             method,
-                            target_url,
+                            endpoint,
                             delay,
                             attempt + 1,
                             max_retries,
@@ -739,26 +748,30 @@ async fn execute_proxy_request(
                         continue;
                     } else {
                         warn!(
-                            "Max retries ({}) reached for status {}. Forwarding upstream error to client.",
-                            max_retries, status
+                            session_id = %session_id_str,
+                            "{}Max retries ({}) reached for status {}. Forwarding upstream error to client.",
+                            session_prefix, max_retries, status
                         );
                     }
                 } else if status.is_success() {
                     if attempt > 0 {
                         info!(
-                            "Request {} {} succeeded after {} retries (status {})",
-                            method, target_url, attempt, status
+                            session_id = %session_id_str,
+                            "{}Request {} {} succeeded after {} retries (status {})",
+                            session_prefix, method, endpoint, attempt, status
                         );
                     } else {
                         debug!(
-                            "Request {} {} succeeded (status {})",
-                            method, target_url, status
+                            session_id = %session_id_str,
+                            "{}Request {} {} succeeded (status {})",
+                            session_prefix, method, endpoint, status
                         );
                     }
                 } else {
                     debug!(
-                        "Request {} {} returned non-retriable status {}",
-                        method, target_url, status
+                        session_id = %session_id_str,
+                        "{}Request {} {} returned non-retriable status {}",
+                        session_prefix, method, endpoint, status
                     );
                 }
 
@@ -820,7 +833,7 @@ async fn execute_proxy_request(
                                 err_msg,
                                 chunk_idx + 1,
                                 method,
-                                target_url,
+                                endpoint,
                                 delay,
                                 attempt + 1,
                                 max_retries
@@ -855,7 +868,7 @@ async fn execute_proxy_request(
                                 session_prefix,
                                 chunk_idx + 1,
                                 method,
-                                target_url,
+                                endpoint,
                                 err,
                                 delay,
                                 attempt + 1,
@@ -875,7 +888,7 @@ async fn execute_proxy_request(
                                 session_prefix,
                                 chunk_idx + 1,
                                 method,
-                                target_url,
+                                endpoint,
                                 err
                             );
                             drop(active_guard);
@@ -947,7 +960,7 @@ async fn execute_proxy_request(
                                     in_stream_status,
                                     err_msg,
                                     method,
-                                    target_url,
+                                    endpoint,
                                     delay,
                                     attempt + 1,
                                     max_retries
@@ -1065,7 +1078,7 @@ async fn execute_proxy_request(
                                 "{}Upstream stream error on initial chunk for {} {}: {}. Retrying in {:?} (attempt {}/{})...",
                                 session_prefix,
                                 method,
-                                target_url,
+                                endpoint,
                                 err,
                                 delay,
                                 attempt + 1,
@@ -1082,7 +1095,7 @@ async fn execute_proxy_request(
                             error!(
                                 session_id = %session_id_str,
                                 "{}Upstream error reading initial stream chunk for {} {}: {}",
-                                session_prefix, method, target_url, err
+                                session_prefix, method, endpoint, err
                             );
                             drop(active_guard);
                             if let Some(ref req_model) = model_from_path {
@@ -1131,7 +1144,7 @@ async fn execute_proxy_request(
                         "{}Upstream network error for {} {}: {}. Retrying in {:?} (attempt {}/{})...",
                         session_prefix,
                         method,
-                        target_url,
+                        endpoint,
                         err,
                         delay,
                         attempt + 1,
@@ -1148,7 +1161,7 @@ async fn execute_proxy_request(
                     error!(
                         session_id = %session_id_str,
                         "{}Upstream error for {} {}: {} (retries exhausted or non-retriable)",
-                        session_prefix, method, target_url, err
+                        session_prefix, method, endpoint, err
                     );
                     drop(active_guard);
                     if let Some(ref req_model) = model_from_path {
@@ -1198,11 +1211,12 @@ pub async fn proxy_handler(
 
     let is_sse = is_sse_request(path_and_query, &headers);
     let keep_alive_interval = state.keep_alive_interval;
+    let endpoint = format_endpoint(&target_url);
 
     let mut work_fut = Box::pin(execute_proxy_request(
         state,
         method.clone(),
-        target_url.clone(),
+        target_url,
         headers,
         body,
     ));
@@ -1215,7 +1229,7 @@ pub async fn proxy_handler(
 
     debug!(
         "Request {} {} still in progress after {:?}; committing 200 OK headers and starting keep-alive stream",
-        method, target_url, keep_alive_interval
+        method, endpoint, keep_alive_interval
     );
 
     let heartbeat_bytes = if is_sse {
@@ -1235,7 +1249,7 @@ pub async fn proxy_handler(
     let keep_alive_stream = futures_util::stream::unfold(initial_phase, move |phase| {
         let heartbeat = heartbeat_bytes.clone();
         let req_method = method.clone();
-        let req_url = target_url.clone();
+        let req_endpoint = endpoint.clone();
         async move {
             match phase {
                 KeepAlivePhase::SendInitialHeartbeat { work_fut, interval } => Some((
@@ -1256,7 +1270,7 @@ pub async fn proxy_handler(
                         _ = interval.tick() => {
                             debug!(
                                 "Sending keep-alive heartbeat for in-flight request {} {}",
-                                req_method, req_url
+                                req_method, req_endpoint
                             );
                             Some((
                                 Ok(heartbeat),

@@ -1565,7 +1565,10 @@ impl tracing::field::Visit for LogEventVisitor {
         if field.name() == "message" {
             self.message = format!("{:?}", value);
         } else if field.name() == "session_id" {
-            self.session_id = Some(format!("{:?}", value).trim_matches('"').to_string());
+            let s = format!("{:?}", value).trim_matches('"').to_string();
+            if !s.is_empty() {
+                self.session_id = Some(s);
+            }
         } else {
             self.fields.push(format!("{}={:?}", field.name(), value));
         }
@@ -1575,7 +1578,9 @@ impl tracing::field::Visit for LogEventVisitor {
         if field.name() == "message" {
             self.message = value.to_string();
         } else if field.name() == "session_id" {
-            self.session_id = Some(value.to_string());
+            if !value.is_empty() {
+                self.session_id = Some(value.to_string());
+            }
         } else {
             self.fields.push(format!("{}={}", field.name(), value));
         }
