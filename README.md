@@ -6,7 +6,7 @@
 
 > **Disclaimer**: `agy-gyro` is an independent open-source project and is not affiliated with, endorsed by, or sponsored by Google or the Antigravity team.
 
-`agy-gyro` is a high-performance, lightweight local **Antigravity Enterprise Gateway** and retry proxy written in Rust. It translates Antigravity's Enterprise Gateway `genai` wire protocol to standard Google Gemini API endpoints (`generativelanguage.googleapis.com`) and stabilizes the Antigravity CLI (`agy`) against transient API errors.
+`agy-gyro` is a high-performance, lightweight local **Antigravity Enterprise Gateway** and retry proxy written in Rust. It forwards Antigravity's Enterprise Gateway `genai` wire protocol requests to standard Google Gemini API endpoints (`generativelanguage.googleapis.com`) and stabilizes the Antigravity CLI (`agy`) against transient API errors.
 
 
 ## Motivation
@@ -15,7 +15,7 @@
 
 While Antigravity supports a Gemini API key mode (`"modelProvider": "gemini"`), many first-class features and latest models are incomplete or unavailable in that mode.
 
-By contrast, [Antigravity Enterprise Gateway](https://docs.cloud.google.com/gemini/enterprise/docs/ai-developer-tools/deploy-enterprise-gateway) is a first-class integration mode across `agy` and IDE extensions. `agy-gyro` acts as a local Enterprise Gateway server that translates the `genai` gateway wire protocol to standard Gemini API endpoints and dynamically queries `/v1beta/models` to discover available Core Gemini Text / Reasoning models (filtering out legacy/lite/alias variants and expanding effort levels) so newly released Gemini models become available in `agy` automatically.
+By contrast, [Antigravity Enterprise Gateway](https://docs.cloud.google.com/gemini/enterprise/docs/ai-developer-tools/deploy-enterprise-gateway) is a first-class integration mode across `agy` and IDE extensions. `agy-gyro` acts as a local Enterprise Gateway server that forwards `genai` gateway wire protocol requests to standard Gemini API endpoints.
 
 ### 2. Transient API Errors & Lack of Retries
 
@@ -58,48 +58,27 @@ cargo install agy-gyro
 
 Prebuilt executables for Linux, macOS, and Windows are also available in the [latest GitHub release](https://github.com/topjohnwu/agy-gyro/releases/latest).
 
-## Configuration & Modes
+## Usage
 
-`agy-gyro` operates in three modes: **Wrapper Mode** (default), **Standalone Server Mode**, and **Live TUI Monitor Mode**.
+`agy-gyro` runs a single persistent background daemon (`127.0.0.1:6470` by default) shared across all `agy` instances, tracking each session's token usage, request stats, and cost independently.
 
-### Mode 1: Launcher Mode (Default)
+### Launching Antigravity (`agy`)
 
-Running `agy-gyro` without subcommands connects to the local Enterprise Gateway daemon on `127.0.0.1:6470` (automatically spawning a single persistent background daemon if none is running yet), registers a session for the current process PID, configures `AGY_LLM_GATEWAY_URL`, `AGY_LLM_GATEWAY_WIRE_PROTOCOL=genai`, `AGY_LLM_GATEWAY_API_KEY`, `AGY_LLM_GATEWAY_MODELS`, and `AGY_ENABLE_HUB=1`, and replaces itself in-place with `agy` (`execvp` on Unix). No wrapper process remains—only a single shared background daemon process runs across all `agy` instances, tracking each session's token usage, cost, and OS process liveness independently.
+Running `agy-gyro` without subcommands ensures the background daemon is running, configures the environment (`AGY_LLM_GATEWAY_*` and `AGY_ENABLE_HUB=1`), and launches `agy`:
 
 ```bash
-# Simply launch agy wrapped with agy-gyro gateway:
+export GEMINI_API_KEY="your-gemini-api-key"
+
+# Launch agy connected to the agy-gyro gateway:
 agy-gyro
 
 # Pass arguments directly through to agy:
 agy-gyro -- --dangerously-skip-permissions
-
-# Optionally write proxy logs to a file:
-agy-gyro --log-file /tmp/gyro.log
-
-# Stop the background daemon at any time:
-agy-gyro stop
 ```
 
-### Mode 2: Background Daemon Mode (`agy-gyro server` / `agy-gyro stop`)
+### Live Usage & Cost TUI Dashboard (`agy-gyro monitor`)
 
-To start the `agy-gyro` background daemon explicitly without launching `agy` (no-op if a daemon is already running on the configured port):
-
-```bash
-agy-gyro server
-
-# Stop the background daemon at any time:
-agy-gyro stop
-```
-
-### Mode 3: Live Usage & Cost TUI Dashboard (`agy-gyro monitor`)
-
-`agy-gyro` exposes two real-time Server-Sent Events (SSE) endpoints:
-- `GET /usage` (resettable via `DELETE /usage` or `DELETE /usage?session=<id>`): streams live token usage, request counters, and USD cost breakdowns across all sessions and per `agy` session (`UsageSnapshot`).
-- `GET /logs`: streams real-time gateway tracing logs (`Vec<LogEntry>`).
-
-It fetches live Gemini model pricing from `https://models.dev/api.json` on startup (with a built-in fallback pricing table).
-
-In a second terminal, launch the interactive TUI dashboard (use `Tab` or `←`/`→` to switch between `[All Sessions]` and individual `agy` sessions):
+`agy-gyro monitor` provides an interactive TUI frontend for real-time token usage, request statistics, estimated USD costs, and gateway logs (use `Tab` or `←`/`→` to switch between `[All Sessions]` and individual `agy` sessions):
 
 ```bash
 # Connect to the default gateway port (127.0.0.1:6470, or port configured in agy-gyro.toml):
@@ -107,15 +86,38 @@ agy-gyro monitor
 
 # Or connect to a specific port or URL:
 agy-gyro monitor --port 9090
-agy-gyro monitor --url http://127.0.0.1:9090/usage
+agy-gyro monitor --url http://127.0.0.1:9090
 ```
 
-You can also subscribe to either SSE stream directly at any time:
+### Managing the Background Daemon (`agy-gyro server` / `agy-gyro stop`)
+
+While running `agy-gyro` starts the daemon automatically, you can also start or stop the background daemon explicitly:
 
 ```bash
-curl -N http://127.0.0.1:6470/usage
-curl -N http://127.0.0.1:6470/logs
+# Start the background daemon without launching agy:
+agy-gyro server
+
+# Stop the background daemon at any time:
+agy-gyro stop
 ```
+
+### Antigravity Hub Web UI (`--hub`)
+
+`agy-gyro` automatically sets `AGY_ENABLE_HUB=1` when launching `agy`, unlocking Antigravity's local Hub web interface (which requires Enterprise Gateway mode):
+
+```bash
+agy-gyro -- --hub [--hub-port 4400]
+```
+
+Once the server is running, open the Hub UI in your browser with `?useWebSocket=true`:
+
+```text
+http://localhost:4400/?useWebSocket=true
+```
+
+> **Important**: Always include `?useWebSocket=true` when accessing the Hub UI over `http://localhost:4400`. Without it, the web UI opens multiple long-lived HTTP/1.1 streaming RPCs that exhaust the browser's 6-connection-per-origin limit and cause the UI to stall when switching or starting conversations. With `?useWebSocket=true`, all RPC streams are multiplexed over a single WebSocket connection.
+
+## Configuration
 
 ### Options & Flags
 
@@ -128,7 +130,7 @@ Options are resolved in order of precedence: **CLI flags > Environment variables
 | `-u`, `--upstream`       | `AGY_GYRO_UPSTREAM_URL`         | `upstream`                   | `https://generativelanguage.googleapis.com` | Target upstream Gemini API base URL                     |
 | `--api-key`              | `GEMINI_API_KEY`                | `api_key`                    | _Required_                                  | Gemini API key for authenticating upstream requests     |
 | `--agy-path`             | `AGY_GYRO_AGY_PATH`             | `agy_path`                   | `agy`                                       | Executable path for Antigravity CLI                     |
-| `--log-file`             | `AGY_GYRO_LOG_FILE`             | `log_file`                   | _None_                                      | Path to log file for proxy tracing logs in wrapper mode |
+| `--log-file`             | `AGY_GYRO_LOG_FILE`             | `log_file`                   | _None_                                      | Path to log file for daemon proxy tracing logs          |
 | `--max-retries`          | `AGY_GYRO_MAX_RETRIES`          | `max_retries`                | `15`                                        | Maximum number of retry attempts for retriable errors   |
 | `--initial-delay-ms`     | `AGY_GYRO_INITIAL_DELAY_MS`     | `initial_delay_ms`           | `1000`                                      | Initial retry backoff delay in milliseconds             |
 | `--max-delay-ms`         | `AGY_GYRO_MAX_DELAY_MS`         | `max_delay_ms`               | `60000`                                     | Maximum backoff delay cap in milliseconds               |
@@ -145,35 +147,6 @@ api_key = "your-gemini-api-key"
 max_retries = 15
 log_file = "/tmp/gyro.log"
 ```
-
-## Quick Start with Antigravity (`agy`)
-
-Set your Gemini API key and run `agy-gyro`:
-
-```bash
-export GEMINI_API_KEY="your-gemini-api-key"
-
-# Launch agy
-agy-gyro
-```
-
-`agy-gyro` handles local gateway startup, `AGY_LLM_GATEWAY_*` environment variable setup, protocol translation, and signal forwarding seamlessly!
-
-### Antigravity Hub Web UI (`--hub`)
-
-`agy-gyro` automatically exports `AGY_ENABLE_HUB=1` in wrapper mode, unlocking Antigravity's local Hub web interface (which requires Enterprise Gateway mode):
-
-```bash
-agy-gyro -- --hub [--hub-port 4400]
-```
-
-Once the server is running, open the Hub UI in your browser with `?useWebSocket=true`:
-
-```text
-http://localhost:4400/?useWebSocket=true
-```
-
-> **Important**: Always include `?useWebSocket=true` when accessing the Hub UI over `http://localhost:4400`. Without it, the web UI opens multiple long-lived HTTP/1.1 streaming RPCs that exhaust the browser's 6-connection-per-origin limit and cause the UI to stall when switching or starting conversations. With `?useWebSocket=true`, all RPC streams are multiplexed over a single WebSocket connection.
 
 ## Streaming & Error Recovery Behavior
 
