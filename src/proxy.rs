@@ -6,7 +6,7 @@ use crate::retry::{
     parse_retry_after,
 };
 use crate::usage::{
-    PricingTable, StreamUsageExtractor, UsageLogLayer, UsageSnapshot, UsageTracker,
+    PricingTable, SessionMeta, StreamUsageExtractor, UsageLogLayer, UsageSnapshot, UsageTracker,
     extract_model_from_path, extract_session_from_headers, extract_usage_from_chunks,
     format_session_api_key,
 };
@@ -550,7 +550,7 @@ impl UpstreamOutcome {
         }
     }
 
-    fn into_fast_response(self) -> Response {
+    fn into_fast_response(self, session_id_str: &str, session_prefix: &str) -> Response {
         let mut client_res_builder = Response::builder().status(self.status.as_u16());
         for (name, val) in &self.headers {
             if !is_hop_by_hop(name) {
@@ -572,7 +572,11 @@ impl UpstreamOutcome {
         match client_res_builder.body(body) {
             Ok(res) => res,
             Err(err) => {
-                error!("Failed to build proxy response: {}", err);
+                error!(
+                    session_id = %session_id_str,
+                    "{}Failed to build proxy response: {}",
+                    session_prefix, err
+                );
                 (
                     StatusCode::INTERNAL_SERVER_ERROR,
                     format!("Failed to build proxy response: {}", err),
@@ -651,10 +655,10 @@ async fn execute_proxy_request(
     target_url: reqwest::Url,
     headers: HeaderMap,
     body: Bytes,
+    session: Option<SessionMeta>,
 ) -> UpstreamOutcome {
     let req_start = Instant::now();
     let endpoint = format_endpoint(&target_url);
-    let session = extract_session_from_headers(&headers);
     let session_prefix = session
         .as_ref()
         .map(|s| format!("[#{} {}] ", s.id, s.label))
@@ -782,10 +786,17 @@ async fn execute_proxy_request(
                     }
                 }
 
+                let is_sse = is_sse_request(&endpoint, &headers)
+                    || res_headers
+                        .get(axum::http::header::CONTENT_TYPE)
+                        .and_then(|v| v.to_str().ok())
+                        .is_some_and(|v| v.contains("text/event-stream"));
+
                 let mut stream = upstream_res.bytes_stream();
 
                 if state.config.is_buffer_enabled() {
                     let mut buffered_chunks: Vec<Bytes> = Vec::new();
+                    let mut total_buffered_bytes: usize = 0;
                     let mut stream_error = None;
                     let mut in_stream_err_details = None;
                     let mut chunk_index = 0;
@@ -803,6 +814,19 @@ async fn execute_proxy_request(
                                     buffered_chunks.clear();
                                     buffered_chunks.push(chunk);
                                     break;
+                                }
+                                total_buffered_bytes += chunk.len();
+                                if is_sse {
+                                    debug!(
+                                        session_id = %session_id_str,
+                                        "{}Buffered SSE chunk #{} ({} bytes, {} bytes total) for {} {}",
+                                        session_prefix,
+                                        chunk_index + 1,
+                                        chunk.len(),
+                                        total_buffered_bytes,
+                                        method,
+                                        endpoint
+                                    );
                                 }
                                 buffered_chunks.push(chunk);
                                 chunk_index += 1;
@@ -987,75 +1011,114 @@ async fn execute_proxy_request(
                         })
                         .chain(stream.map(|res| res.map_err(std::io::Error::other)));
 
-                        let passthrough_stream: BoxByteStream =
-                            if let Some(req_model) = model_from_path {
-                                let tracker = state.usage.clone();
-                                let initial_status = status.as_u16();
-                                let retries_used = attempt;
-                                let extractor = StreamUsageExtractor::new();
-                                let inner_stream: BoxByteStream = Box::pin(full_stream);
-                                let session_for_stream = session.clone();
-                                Box::pin(futures_util::stream::unfold(
-                                    (inner_stream, extractor, active_guard, initial_status),
-                                    move |(mut s, mut ext, mut guard, mut eff_status)| {
-                                        let tracker = tracker.clone();
-                                        let req_model = req_model.clone();
-                                        let session_for_stream = session_for_stream.clone();
-                                        async move {
-                                            match s.next().await {
-                                                Some(Ok(chunk)) => {
-                                                    if (200..300).contains(&eff_status)
-                                                        && let Some((in_stream_status, _)) =
-                                                            parse_in_stream_error(&chunk)
-                                                    {
-                                                        eff_status = in_stream_status.as_u16();
-                                                    }
-                                                    ext.feed_chunk(&chunk);
-                                                    Some((Ok(chunk), (s, ext, guard, eff_status)))
+                        let passthrough_stream: BoxByteStream = if let Some(req_model) =
+                            model_from_path
+                        {
+                            let tracker = state.usage.clone();
+                            let initial_status = status.as_u16();
+                            let retries_used = attempt;
+                            let extractor = StreamUsageExtractor::new();
+                            let inner_stream: BoxByteStream = Box::pin(full_stream);
+                            let session_for_stream = session.clone();
+                            let sid_for_stream = session_id_str.clone();
+                            let sprefix_for_stream = session_prefix.clone();
+                            let method_for_stream = method.clone();
+                            let endpoint_for_stream = endpoint.clone();
+                            Box::pin(futures_util::stream::unfold(
+                                (
+                                    inner_stream,
+                                    extractor,
+                                    active_guard,
+                                    initial_status,
+                                    0usize,
+                                ),
+                                move |(
+                                    mut s,
+                                    mut ext,
+                                    mut guard,
+                                    mut eff_status,
+                                    mut chunk_idx,
+                                )| {
+                                    let tracker = tracker.clone();
+                                    let req_model = req_model.clone();
+                                    let session_for_stream = session_for_stream.clone();
+                                    let sid = sid_for_stream.clone();
+                                    let sprefix = sprefix_for_stream.clone();
+                                    let req_method = method_for_stream.clone();
+                                    let req_endpoint = endpoint_for_stream.clone();
+                                    async move {
+                                        match s.next().await {
+                                            Some(Ok(chunk)) => {
+                                                chunk_idx += 1;
+                                                if is_sse {
+                                                    debug!(
+                                                        session_id = %sid,
+                                                        "{}Received SSE chunk #{} ({} bytes) for {} {}",
+                                                        sprefix,
+                                                        chunk_idx,
+                                                        chunk.len(),
+                                                        req_method,
+                                                        req_endpoint
+                                                    );
                                                 }
-                                                Some(Err(err)) => {
-                                                    if guard.take().is_some() {
-                                                        let raw_usage = ext.finish(None);
-                                                        let effective_model = ext
-                                                            .model_version
-                                                            .as_deref()
-                                                            .unwrap_or(&req_model);
-                                                        tracker.record_session_completed_request(
-                                                            session_for_stream.as_ref(),
-                                                            effective_model,
-                                                            StatusCode::BAD_GATEWAY.as_u16(),
-                                                            retries_used,
-                                                            req_start.elapsed(),
-                                                            raw_usage.as_ref(),
-                                                        );
-                                                    }
-                                                    Some((Err(err), (s, ext, guard, eff_status)))
+                                                if (200..300).contains(&eff_status)
+                                                    && let Some((in_stream_status, _)) =
+                                                        parse_in_stream_error(&chunk)
+                                                {
+                                                    eff_status = in_stream_status.as_u16();
                                                 }
-                                                None => {
-                                                    if guard.take().is_some() {
-                                                        let raw_usage = ext.finish(None);
-                                                        let effective_model = ext
-                                                            .model_version
-                                                            .as_deref()
-                                                            .unwrap_or(&req_model);
-                                                        tracker.record_session_completed_request(
-                                                            session_for_stream.as_ref(),
-                                                            effective_model,
-                                                            eff_status,
-                                                            retries_used,
-                                                            req_start.elapsed(),
-                                                            raw_usage.as_ref(),
-                                                        );
-                                                    }
-                                                    None
+                                                ext.feed_chunk(&chunk);
+                                                Some((
+                                                    Ok(chunk),
+                                                    (s, ext, guard, eff_status, chunk_idx),
+                                                ))
+                                            }
+                                            Some(Err(err)) => {
+                                                if guard.take().is_some() {
+                                                    let raw_usage = ext.finish(None);
+                                                    let effective_model = ext
+                                                        .model_version
+                                                        .as_deref()
+                                                        .unwrap_or(&req_model);
+                                                    tracker.record_session_completed_request(
+                                                        session_for_stream.as_ref(),
+                                                        effective_model,
+                                                        StatusCode::BAD_GATEWAY.as_u16(),
+                                                        retries_used,
+                                                        req_start.elapsed(),
+                                                        raw_usage.as_ref(),
+                                                    );
                                                 }
+                                                Some((
+                                                    Err(err),
+                                                    (s, ext, guard, eff_status, chunk_idx),
+                                                ))
+                                            }
+                                            None => {
+                                                if guard.take().is_some() {
+                                                    let raw_usage = ext.finish(None);
+                                                    let effective_model = ext
+                                                        .model_version
+                                                        .as_deref()
+                                                        .unwrap_or(&req_model);
+                                                    tracker.record_session_completed_request(
+                                                        session_for_stream.as_ref(),
+                                                        effective_model,
+                                                        eff_status,
+                                                        retries_used,
+                                                        req_start.elapsed(),
+                                                        raw_usage.as_ref(),
+                                                    );
+                                                }
+                                                None
                                             }
                                         }
-                                    },
-                                ))
-                            } else {
-                                Box::pin(full_stream)
-                            };
+                                    }
+                                },
+                            ))
+                        } else {
+                            Box::pin(full_stream)
+                        };
 
                         return UpstreamOutcome {
                             status,
@@ -1191,6 +1254,13 @@ pub async fn proxy_handler(
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
+    let session = extract_session_from_headers(&headers);
+    let session_prefix = session
+        .as_ref()
+        .map(|s| format!("[#{} {}] ", s.id, s.label))
+        .unwrap_or_default();
+    let session_id_str = session.as_ref().map(|s| s.id.clone()).unwrap_or_default();
+
     let path_and_query = original_uri
         .path_and_query()
         .map(|pq| pq.as_str())
@@ -1200,7 +1270,11 @@ pub async fn proxy_handler(
     let target_url = match reqwest::Url::parse(&target_url_str) {
         Ok(url) => url,
         Err(err) => {
-            error!("Failed to parse target URL {}: {}", target_url_str, err);
+            error!(
+                session_id = %session_id_str,
+                "{}Failed to parse target URL {}: {}",
+                session_prefix, target_url_str, err
+            );
             return (
                 StatusCode::BAD_REQUEST,
                 format!("Invalid target URL: {}", err),
@@ -1219,17 +1293,19 @@ pub async fn proxy_handler(
         target_url,
         headers,
         body,
+        session,
     ));
 
     // Wait up to `keep_alive_interval` for the request (including buffering/retries) to finish
     // before committing HTTP 200 OK headers and starting keep-alive heartbeats.
     if let Ok(outcome) = tokio::time::timeout(keep_alive_interval, &mut work_fut).await {
-        return outcome.into_fast_response();
+        return outcome.into_fast_response(&session_id_str, &session_prefix);
     }
 
     debug!(
-        "Request {} {} still in progress after {:?}; committing 200 OK headers and starting keep-alive stream",
-        method, endpoint, keep_alive_interval
+        session_id = %session_id_str,
+        "{}Request {} {} still in progress after {:?}; committing 200 OK headers and starting keep-alive stream",
+        session_prefix, method, endpoint, keep_alive_interval
     );
 
     let heartbeat_bytes = if is_sse {
@@ -1246,10 +1322,15 @@ pub async fn proxy_handler(
 
     let initial_phase = KeepAlivePhase::SendInitialHeartbeat { work_fut, interval };
 
+    let keep_alive_session_id = session_id_str.clone();
+    let keep_alive_session_prefix = session_prefix.clone();
+
     let keep_alive_stream = futures_util::stream::unfold(initial_phase, move |phase| {
         let heartbeat = heartbeat_bytes.clone();
         let req_method = method.clone();
         let req_endpoint = endpoint.clone();
+        let sid = keep_alive_session_id.clone();
+        let sprefix = keep_alive_session_prefix.clone();
         async move {
             match phase {
                 KeepAlivePhase::SendInitialHeartbeat { work_fut, interval } => Some((
@@ -1269,8 +1350,9 @@ pub async fn proxy_handler(
                         }
                         _ = interval.tick() => {
                             debug!(
-                                "Sending keep-alive heartbeat for in-flight request {} {}",
-                                req_method, req_endpoint
+                                session_id = %sid,
+                                "{}Sending keep-alive heartbeat for in-flight request {} {}",
+                                sprefix, req_method, req_endpoint
                             );
                             Some((
                                 Ok(heartbeat),
@@ -1299,7 +1381,11 @@ pub async fn proxy_handler(
     match res_builder.body(Body::from_stream(keep_alive_stream)) {
         Ok(res) => res,
         Err(err) => {
-            error!("Failed to build keep-alive proxy response: {}", err);
+            error!(
+                session_id = %session_id_str,
+                "{}Failed to build keep-alive proxy response: {}",
+                session_prefix, err
+            );
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 format!("Failed to build keep-alive proxy response: {}", err),

@@ -255,10 +255,35 @@ async fn test_large_request_body_exceeding_default_limit() {
 
 static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
+fn clear_test_env_vars() {
+    for var in [
+        "GEMINI_API_KEY",
+        "AGY_GYRO_API_KEY",
+        "AGY_GYRO_HOST",
+        "AGY_GYRO_PORT",
+        "AGY_GYRO_UPSTREAM",
+        "AGY_GYRO_UPSTREAM_URL",
+        "AGY_GYRO_AGY_PATH",
+        "AGY_GYRO_LOG_FILE",
+        "AGY_GYRO_MAX_RETRIES",
+        "AGY_GYRO_INITIAL_DELAY_MS",
+        "AGY_GYRO_MAX_DELAY_MS",
+        "AGY_GYRO_NO_JITTER",
+        "AGY_GYRO_NO_BUFFER",
+        "AGY_GYRO_REQUEST_TIMEOUT_SECS",
+        "AGY_GYRO_URL",
+    ] {
+        unsafe {
+            std::env::remove_var(var);
+        }
+    }
+}
+
 #[test]
 fn test_cli_parse_server_command() {
     use agy_gyro::config::{Cli, Commands};
-    let _guard = ENV_LOCK.lock().unwrap();
+    let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    clear_test_env_vars();
 
     let temp_path =
         std::env::temp_dir().join(format!("agy-gyro-server-test-{}.toml", std::process::id()));
@@ -277,7 +302,8 @@ fn test_cli_parse_server_command() {
 #[test]
 fn test_cli_parse_wrapper_default_and_passthrough() {
     use agy_gyro::config::Cli;
-    let _guard = ENV_LOCK.lock().unwrap();
+    let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    clear_test_env_vars();
 
     let temp_path =
         std::env::temp_dir().join(format!("agy-gyro-wrapper-test-{}.toml", std::process::id()));
@@ -655,21 +681,14 @@ async fn test_gateway_bearer_auth_translated_to_x_goog_api_key() {
 #[test]
 fn test_cli_parse_env_vars_and_toml_config() {
     use agy_gyro::config::{Cli, Commands, default_config_path};
-    let _guard = ENV_LOCK.lock().unwrap();
+    let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    clear_test_env_vars();
 
     let default_path = default_config_path().expect("home dir should resolve");
     assert!(default_path.ends_with(".gemini/config/agy-gyro.toml"));
 
     let temp_path = std::env::temp_dir().join(format!("agy-gyro-test-{}.toml", std::process::id()));
     let _ = std::fs::remove_file(&temp_path);
-
-    unsafe {
-        std::env::remove_var("GEMINI_API_KEY");
-        std::env::remove_var("AGY_GYRO_MAX_RETRIES");
-        std::env::remove_var("AGY_GYRO_HOST");
-        std::env::remove_var("AGY_GYRO_AGY_PATH");
-        std::env::remove_var("AGY_GYRO_NO_BUFFER");
-    }
 
     // Missing config file is ignored; fails if api_key is not provided anywhere
     assert!(Cli::try_parse_with_config_from(["agy-gyro"], Some(&temp_path)).is_err());
@@ -852,6 +871,7 @@ async fn test_buffered_mode_sends_keep_alive_during_long_generation_and_retries(
                 "{}/v1beta/models/gemini-4-argon:streamGenerateContent?alt=sse",
                 proxy_url
             ))
+            .header("Authorization", "Bearer gyro:7:999:keepalive-sess")
             .send(),
     )
     .await
@@ -878,6 +898,16 @@ async fn test_buffered_mode_sends_keep_alive_during_long_generation_and_retries(
     // Must contain the clean recovered response from attempt 1
     assert!(text.contains("Recovered after keep-alive!"));
     assert_eq!(call_count.load(Ordering::SeqCst), 2);
+
+    // Verify keep-alive logs in /logs are attributed to session #7
+    let logs = agy_gyro::tui::fetch_logs_snapshot(&req_client, &format!("{}/logs", proxy_url))
+        .await
+        .unwrap();
+    assert!(logs.iter().any(|l| {
+        l.session_id.as_deref() == Some("7")
+            && l.message
+                .contains("[#7 keepalive-sess] Sending keep-alive heartbeat")
+    }));
 }
 
 #[tokio::test]
@@ -1215,7 +1245,8 @@ async fn test_no_buffer_passthrough_mode_records_usage_on_stream_completion() {
 #[test]
 fn test_cli_parse_monitor_subcommand_without_api_key() {
     use agy_gyro::config::{Cli, Commands};
-    let _guard = ENV_LOCK.lock().unwrap();
+    let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    clear_test_env_vars();
 
     let cli_default = Cli::try_parse_with_config_from(["agy-gyro", "monitor"], None).unwrap();
     match cli_default.command {
