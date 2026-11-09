@@ -1,9 +1,9 @@
 [package]
 name = "agy-gyro"
-version = "0.1.2"
+version = "0.2.0"
 edition = "2024"
 authors = ["John Wu <topjohnwu@gmail.com>"]
-description = "Local retry proxy to stabilize the Antigravity CLI (agy) against transient Google Gemini API errors"
+description = "Local Antigravity Enterprise Gateway, retry proxy, and live token usage monitor for the Antigravity CLI (agy)"
 readme = "README.md"
 license = "MIT"
 repository = "https://github.com/topjohnwu/agy-gyro"
@@ -24,7 +24,7 @@ include = [
 ]
 
 [dependencies]
-tokio = { version = "1.53", features = ["full"] }
+tokio = { version = "1.54", features = ["full"] }
 axum = { version = "0.8", features = ["tokio"] }
 reqwest = { version = "0.13", default-features = false, features = [
     "stream",
@@ -41,7 +41,7 @@ futures-util = { version = "0.3", default-features = false, features = [
 httpdate = "1.0"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
-toml = { version = "1.0", default-features = false, features = [
+toml = { version = "1.2", default-features = false, features = [
     "parse",
     "serde",
 ] }

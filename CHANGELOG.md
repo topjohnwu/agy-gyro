@@ -5,6 +5,25 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.0] - 2026-11-08
+
+### Added
+- **Local Antigravity Enterprise Gateway**: `agy-gyro` now operates as a local Enterprise Gateway server (`127.0.0.1:6470` by default), translating `genai` gateway wire protocol requests and `Bearer` authentication into `x-goog-api-key` requests to standard Gemini REST endpoints.
+- **Dynamic Model Discovery & Effort Expansion**: Automatically queries `/v1beta/models` at startup to discover active thinking-capable Core Gemini Text / Reasoning models and expands effort levels (`-low`, `-medium`, `-high`).
+- **Shared Background Daemon & Session Management (`server` / `stop`)**: Runs a single persistent background daemon shared across all `agy` instances, with non-blocking `agy-gyro server` and `agy-gyro stop` commands, in-place `execvp` process replacement in wrapper mode, and OS-level PID liveness tracking per session.
+- **Live Token Usage, Cost & Log TUI Monitor (`agy-gyro monitor`)**: Interactive terminal dashboard powered by `/usage` and `/logs` SSE streams, displaying real-time input, cached, output, and thinking token metrics, cache savings, per-model breakdowns, per-session tabs, and soft-wrapped gateway logs.
+- **Live Model Pricing Discovery**: Fetches up-to-date Gemini model pricing (including >200k tiered rates and context caching rates) from `models.dev` with a built-in fallback table.
+- **Keep-Alive Heartbeat Streaming**: Emits periodic keep-alive heartbeats when upstream buffering or retry backoff exceeds 15 seconds, preventing `agy`'s 60-second `ResponseHeaderTimeout` from dropping long-running thinking or retry requests.
+- **TOML Configuration File**: Added support for persistent configuration in `~/.gemini/config/agy-gyro.toml` (with `AGY_GYRO_<KEY>` and `GEMINI_API_KEY` environment variable overrides).
+- **Antigravity Hub Mode Support**: Automatically exports `AGY_ENABLE_HUB=1` when launching `agy` to unlock the local Antigravity Hub web UI (`--hub`).
+- **Upstream Gzip Decompression**: Enabled automatic `gzip` decompression on upstream responses and switched to `native-tls` across all platforms.
+
+### Changed
+- **Transparent CLI Argument Passthrough**: Removed proxy CLI flags; `agy-gyro` now matches only `server`, `stop`, or `monitor` as the first argument and forwards all other arguments directly to `agy`.
+
+### Removed
+- **Model Redirection (`--redirect-model`)**: Replaced by native Enterprise Gateway model discovery and effort-level expansion.
+
 ## [0.1.2] - 2026-09-02
 
 ### Added
