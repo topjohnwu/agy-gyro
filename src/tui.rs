@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
 
 use crate::config::MonitorArgs;
-use crate::usage::{LogEntry, ModelUsageStats, SessionUsageStats, UsageSnapshot};
+use crate::usage::{LogEntry, ModelUsageStats, ScopeUsageStats, SessionUsageStats, UsageSnapshot};
 use crossterm::{
     event::{self, Event, KeyCode, KeyEventKind, KeyModifiers},
     execute,
@@ -16,7 +16,10 @@ use ratatui::{
     text::{Line, Span},
     widgets::{Block, Borders, Cell, Paragraph, Row, Table},
 };
+use serde::de::DeserializeOwned;
+use std::cell::RefCell;
 use std::io;
+use std::rc::Rc;
 use std::time::{Duration, Instant};
 
 /// Normalizes a gateway base URL or endpoint URL into a full `.../usage` endpoint URL.
@@ -33,18 +36,51 @@ pub fn resolve_logs_endpoint_url(raw_url: &str) -> String {
 /// preserving any incomplete trailing bytes (including split multi-byte UTF-8 sequences).
 fn drain_sse_data_line(buf: &mut Vec<u8>) -> Option<String> {
     while let Some(newline_idx) = buf.iter().position(|&b| b == b'\n') {
-        let line = String::from_utf8_lossy(&buf[..newline_idx])
-            .trim()
-            .to_string();
+        let extracted = {
+            let line = String::from_utf8_lossy(&buf[..newline_idx]);
+            line.trim()
+                .strip_prefix("data:")
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_owned)
+        };
         buf.drain(..=newline_idx);
-        if let Some(data) = line.strip_prefix("data:") {
-            let json_str = data.trim();
-            if !json_str.is_empty() {
-                return Some(json_str.to_string());
-            }
+        if extracted.is_some() {
+            return extracted;
         }
     }
     None
+}
+
+async fn fetch_sse_first_event<T: DeserializeOwned>(
+    client: &reqwest::Client,
+    url: &str,
+) -> Result<T, String> {
+    let res = client
+        .get(url)
+        .timeout(Duration::from_secs(2))
+        .send()
+        .await
+        .map_err(|e| format!("Connection error: {}", e))?;
+
+    if !res.status().is_success() {
+        return Err(format!("HTTP {}", res.status()));
+    }
+
+    let mut stream = res.bytes_stream();
+    let mut buf = Vec::new();
+
+    while let Some(chunk_res) = stream.next().await {
+        let chunk = chunk_res.map_err(|e| format!("SSE read error: {}", e))?;
+        buf.extend_from_slice(&chunk);
+
+        if let Some(json_str) = drain_sse_data_line(&mut buf) {
+            return serde_json::from_str::<T>(&json_str)
+                .map_err(|e| format!("Invalid SSE JSON payload: {}", e));
+        }
+    }
+
+    Err("SSE stream closed before emitting an event".to_string())
 }
 
 /// Connects to the SSE `GET /usage` stream and reads the initial [`UsageSnapshot`] event.
@@ -52,31 +88,7 @@ pub async fn fetch_usage_snapshot(
     client: &reqwest::Client,
     endpoint_url: &str,
 ) -> Result<UsageSnapshot, String> {
-    let res = client
-        .get(endpoint_url)
-        .timeout(Duration::from_secs(2))
-        .send()
-        .await
-        .map_err(|e| format!("Connection error: {}", e))?;
-
-    if !res.status().is_success() {
-        return Err(format!("HTTP {}", res.status()));
-    }
-
-    let mut stream = res.bytes_stream();
-    let mut buf = Vec::new();
-
-    while let Some(chunk_res) = stream.next().await {
-        let chunk = chunk_res.map_err(|e| format!("SSE read error: {}", e))?;
-        buf.extend_from_slice(&chunk);
-
-        if let Some(json_str) = drain_sse_data_line(&mut buf) {
-            return serde_json::from_str::<UsageSnapshot>(&json_str)
-                .map_err(|e| format!("Invalid SSE JSON payload: {}", e));
-        }
-    }
-
-    Err("SSE stream closed before emitting a snapshot".to_string())
+    fetch_sse_first_event(client, endpoint_url).await
 }
 
 /// Connects to the SSE `GET /logs` stream and reads the initial `Vec<LogEntry>` event.
@@ -84,31 +96,7 @@ pub async fn fetch_logs_snapshot(
     client: &reqwest::Client,
     logs_url: &str,
 ) -> Result<Vec<LogEntry>, String> {
-    let res = client
-        .get(logs_url)
-        .timeout(Duration::from_secs(2))
-        .send()
-        .await
-        .map_err(|e| format!("Connection error: {}", e))?;
-
-    if !res.status().is_success() {
-        return Err(format!("HTTP {}", res.status()));
-    }
-
-    let mut stream = res.bytes_stream();
-    let mut buf = Vec::new();
-
-    while let Some(chunk_res) = stream.next().await {
-        let chunk = chunk_res.map_err(|e| format!("SSE read error: {}", e))?;
-        buf.extend_from_slice(&chunk);
-
-        if let Some(json_str) = drain_sse_data_line(&mut buf) {
-            return serde_json::from_str::<Vec<LogEntry>>(&json_str)
-                .map_err(|e| format!("Invalid SSE JSON payload: {}", e));
-        }
-    }
-
-    Err("SSE stream closed before emitting logs".to_string())
+    fetch_sse_first_event(client, logs_url).await
 }
 
 /// Resets usage statistics on the target `agy-gyro` instance via `DELETE /usage`.
@@ -146,6 +134,16 @@ pub async fn reset_remote_session_usage(
         .map_err(|e| format!("Invalid JSON response: {}", e))
 }
 
+#[derive(Clone)]
+struct WrappedLogsCache {
+    selected_session: Option<String>,
+    inner_width: usize,
+    log_count: usize,
+    first_log_id: Option<u64>,
+    last_log_id: Option<u64>,
+    lines: Rc<[(u64, usize, Line<'static>)]>,
+}
+
 /// State held by the TUI monitor dashboard.
 pub struct DashboardState {
     pub endpoint_url: String,
@@ -159,6 +157,7 @@ pub struct DashboardState {
     pub log_viewport_height: usize,
     pub log_viewport_width: usize,
     pub tick_count: u64,
+    wrapped_logs_cache: RefCell<Option<WrappedLogsCache>>,
 }
 
 impl DashboardState {
@@ -176,6 +175,7 @@ impl DashboardState {
             log_viewport_height: 10,
             log_viewport_width: 120,
             tick_count: 0,
+            wrapped_logs_cache: RefCell::new(None),
         }
     }
 
@@ -187,6 +187,14 @@ impl DashboardState {
             .sessions
             .iter()
             .find(|s| s.id == sid)
+    }
+
+    /// Returns the [`ScopeUsageStats`] for the currently selected session tab, or global stats
+    /// when `[All Sessions]` is active.
+    pub fn active_stats(&self) -> Option<&ScopeUsageStats> {
+        self.active_session()
+            .map(|s| &s.stats)
+            .or_else(|| self.snapshot.as_ref().map(|s| &s.stats))
     }
 
     /// Switches to the next session tab (`[All Sessions]` -> `#1` -> `#2` -> ... -> `[All Sessions]`).
@@ -248,14 +256,10 @@ impl DashboardState {
     }
 
     pub fn sorted_models(&self) -> Vec<&ModelUsageStats> {
-        let Some(ref snap) = self.snapshot else {
+        let Some(stats) = self.active_stats() else {
             return Vec::new();
         };
-        let models_map = match self.active_session() {
-            Some(sess) => &sess.models,
-            None => &snap.models,
-        };
-        let mut list: Vec<&ModelUsageStats> = models_map.values().collect();
+        let mut list: Vec<&ModelUsageStats> = stats.models.values().collect();
         list.sort_by(|a, b| {
             b.totals
                 .total_cost_usd
@@ -279,9 +283,21 @@ impl DashboardState {
         }
     }
 
-    /// Returns all visible log entries pre-wrapped into visual terminal [`Line`]s for `inner_width`,
-    /// tagged with `(entry_id, subline_index, line)`.
-    pub fn visual_log_lines(&self, inner_width: usize) -> Vec<(u64, usize, Line<'static>)> {
+    fn cached_visual_log_lines(&self, inner_width: usize) -> Rc<[(u64, usize, Line<'static>)]> {
+        let first_id = self.logs.first().map(|l| l.id);
+        let last_id = self.logs.last().map(|l| l.id);
+        let log_count = self.logs.len();
+
+        if let Some(ref cache) = *self.wrapped_logs_cache.borrow()
+            && cache.inner_width == inner_width
+            && cache.log_count == log_count
+            && cache.first_log_id == first_id
+            && cache.last_log_id == last_id
+            && cache.selected_session == self.selected_session
+        {
+            return Rc::clone(&cache.lines);
+        }
+
         let mut out = Vec::new();
         for entry in self.visible_logs() {
             for (sub_idx, line) in format_wrapped_log_entry(entry, inner_width)
@@ -291,13 +307,28 @@ impl DashboardState {
                 out.push((entry.id, sub_idx, line));
             }
         }
-        out
+        let lines: Rc<[(u64, usize, Line<'static>)]> = out.into();
+        *self.wrapped_logs_cache.borrow_mut() = Some(WrappedLogsCache {
+            selected_session: self.selected_session.clone(),
+            inner_width,
+            log_count,
+            first_log_id: first_id,
+            last_log_id: last_id,
+            lines: Rc::clone(&lines),
+        });
+        lines
+    }
+
+    /// Returns all visible log entries pre-wrapped into visual terminal [`Line`]s for `inner_width`,
+    /// tagged with `(entry_id, subline_index, line)`.
+    pub fn visual_log_lines(&self, inner_width: usize) -> Vec<(u64, usize, Line<'static>)> {
+        self.cached_visual_log_lines(inner_width).to_vec()
     }
 
     /// Maximum number of visual lines the log panel can scroll up from the bottom
     /// while keeping the viewport full.
     pub fn max_log_scroll(&self) -> usize {
-        self.visual_log_lines(self.log_viewport_width)
+        self.cached_visual_log_lines(self.log_viewport_width)
             .len()
             .saturating_sub(self.log_viewport_height.max(1))
     }
@@ -329,16 +360,16 @@ impl DashboardState {
     pub fn set_logs(&mut self, new_logs: Vec<LogEntry>) {
         if self.log_scroll_from_bottom > 0 {
             let width = self.log_viewport_width;
-            let visual = self.visual_log_lines(width);
+            let visual = self.cached_visual_log_lines(width);
             if !visual.is_empty() {
                 let max_prev_scroll = visual.len().saturating_sub(self.log_viewport_height.max(1));
                 let effective_prev_scroll = self.log_scroll_from_bottom.min(max_prev_scroll);
                 let prev_end_idx = visual.len().saturating_sub(effective_prev_scroll);
                 if prev_end_idx > 0
-                    && let Some((anchor_id, anchor_sub, _)) = visual.get(prev_end_idx - 1).cloned()
+                    && let Some(&(anchor_id, anchor_sub, _)) = visual.get(prev_end_idx - 1)
                 {
                     self.logs = new_logs;
-                    let new_visual = self.visual_log_lines(width);
+                    let new_visual = self.cached_visual_log_lines(width);
                     if let Some(pos) = new_visual
                         .iter()
                         .position(|(id, sub, _)| *id == anchor_id && *sub == anchor_sub)
@@ -394,7 +425,7 @@ pub fn format_duration_secs(secs: u64) -> String {
     format!("{:02}:{:02}:{:02}", h, m, s)
 }
 
-fn dashboard_chunks(area: Rect, state: &DashboardState) -> std::rc::Rc<[Rect]> {
+fn dashboard_chunks(area: Rect, state: &DashboardState) -> Rc<[Rect]> {
     let model_rows = state.sorted_models().len().max(1) as u16;
     // 2 border rows + 1 header row + N model rows
     let models_table_height = model_rows.saturating_add(3);
@@ -426,11 +457,7 @@ fn render_header(frame: &mut Frame, area: Rect, state: &DashboardState) {
     let spinner_frames = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
     let spinner = spinner_frames[(state.tick_count as usize) % spinner_frames.len()];
 
-    let active_in_flight = state
-        .active_session()
-        .map(|s| s.active_requests)
-        .or_else(|| state.snapshot.as_ref().map(|s| s.active_requests))
-        .unwrap_or(0);
+    let active_in_flight = state.active_stats().map_or(0, |s| s.active_requests);
 
     let (status_span, uptime_str, pricing_src, active_span) =
         match (&state.snapshot, state.connected) {
@@ -573,6 +600,32 @@ fn render_header(frame: &mut Frame, area: Rect, state: &DashboardState) {
     frame.render_widget(paragraph, area);
 }
 
+fn render_metric_card(
+    frame: &mut Frame,
+    area: Rect,
+    title: &str,
+    border_color: Color,
+    rows: [(&'static str, String, Style); 4],
+) {
+    let lines: Vec<Line> = rows
+        .into_iter()
+        .map(|(label, value, style)| {
+            Line::from(vec![
+                Span::styled(label, Style::default().fg(Color::DarkGray)),
+                Span::styled(value, style),
+            ])
+        })
+        .collect();
+
+    let card = Paragraph::new(lines).block(
+        Block::default()
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(border_color))
+            .title(title),
+    );
+    frame.render_widget(card, area);
+}
+
 fn render_summary_cards(frame: &mut Frame, area: Rect, state: &DashboardState) {
     let cards = Layout::default()
         .direction(Direction::Horizontal)
@@ -584,12 +637,9 @@ fn render_summary_cards(frame: &mut Frame, area: Rect, state: &DashboardState) {
         ])
         .split(area);
 
-    let active_sess = state.active_session();
-
-    let totals = active_sess
-        .map(|s| s.totals.clone())
-        .or_else(|| state.snapshot.as_ref().map(|s| s.totals.clone()))
-        .unwrap_or_default();
+    let default_stats = ScopeUsageStats::default();
+    let stats = state.active_stats().unwrap_or(&default_stats);
+    let totals = &stats.totals;
 
     let cache_hit_pct = if totals.input_tokens > 0 {
         (totals.cached_input_tokens as f64 / totals.input_tokens as f64) * 100.0
@@ -603,197 +653,139 @@ fn render_summary_cards(frame: &mut Frame, area: Rect, state: &DashboardState) {
         0.0
     };
 
-    let (ok_reqs, failed_reqs, total_retries) = active_sess
-        .map(|s| (s.successful_requests, s.failed_requests, s.total_retries))
-        .or_else(|| {
-            state
-                .snapshot
-                .as_ref()
-                .map(|s| (s.successful_requests, s.failed_requests, s.total_retries))
-        })
-        .unwrap_or((0, 0, 0));
+    let bold = |fg: Color| Style::default().fg(fg).add_modifier(Modifier::BOLD);
+    let plain = |fg: Color| Style::default().fg(fg);
 
-    // Card 1: Input Tokens
-    let input_card = Paragraph::new(vec![
-        Line::from(vec![
-            Span::styled("Total Input: ", Style::default().fg(Color::DarkGray)),
-            Span::styled(
+    render_metric_card(
+        frame,
+        cards[0],
+        " Input Tokens ",
+        Color::Blue,
+        [
+            (
+                "Total Input: ",
                 format_number(totals.input_tokens),
-                Style::default()
-                    .fg(Color::White)
-                    .add_modifier(Modifier::BOLD),
+                bold(Color::White),
             ),
-        ]),
-        Line::from(vec![
-            Span::styled("Uncached:    ", Style::default().fg(Color::DarkGray)),
-            Span::styled(
+            (
+                "Uncached:    ",
                 format_number(totals.uncached_input_tokens),
-                Style::default().fg(Color::Cyan),
+                plain(Color::Cyan),
             ),
-        ]),
-        Line::from(vec![
-            Span::styled("Uncached $:  ", Style::default().fg(Color::DarkGray)),
-            Span::styled(
+            (
+                "Uncached $:  ",
                 format_usd(totals.uncached_input_cost_usd),
-                Style::default().fg(Color::Yellow),
+                plain(Color::Yellow),
             ),
-        ]),
-        Line::from(vec![
-            Span::styled("Total In $:  ", Style::default().fg(Color::DarkGray)),
-            Span::styled(
+            (
+                "Total In $:  ",
                 format_usd(totals.input_cost_usd),
-                Style::default()
-                    .fg(Color::Green)
-                    .add_modifier(Modifier::BOLD),
+                bold(Color::Green),
             ),
-        ]),
-    ])
-    .block(
-        Block::default()
-            .borders(Borders::ALL)
-            .border_style(Style::default().fg(Color::Blue))
-            .title(" Input Tokens "),
+        ],
     );
-    frame.render_widget(input_card, cards[0]);
 
-    // Card 2: Cached Input Tokens
-    let cached_card = Paragraph::new(vec![
-        Line::from(vec![
-            Span::styled("Cached Tok:  ", Style::default().fg(Color::DarkGray)),
-            Span::styled(
+    render_metric_card(
+        frame,
+        cards[1],
+        " Cached Input Tokens ",
+        Color::Magenta,
+        [
+            (
+                "Cached Tok:  ",
                 format_number(totals.cached_input_tokens),
-                Style::default()
-                    .fg(Color::Magenta)
-                    .add_modifier(Modifier::BOLD),
+                bold(Color::Magenta),
             ),
-        ]),
-        Line::from(vec![
-            Span::styled("Cache Hit:   ", Style::default().fg(Color::DarkGray)),
-            Span::styled(
+            (
+                "Cache Hit:   ",
                 format!("{:.1}%", cache_hit_pct),
-                Style::default().fg(Color::Cyan),
+                plain(Color::Cyan),
             ),
-        ]),
-        Line::from(vec![
-            Span::styled("Cached $:    ", Style::default().fg(Color::DarkGray)),
-            Span::styled(
+            (
+                "Cached $:    ",
                 format_usd(totals.cached_input_cost_usd),
-                Style::default().fg(Color::Yellow),
+                plain(Color::Yellow),
             ),
-        ]),
-        Line::from(vec![
-            Span::styled("Cache Saved: ", Style::default().fg(Color::DarkGray)),
-            Span::styled(
+            (
+                "Cache Saved: ",
                 format_usd(totals.cache_savings_usd),
-                Style::default()
-                    .fg(Color::Green)
-                    .add_modifier(Modifier::BOLD),
+                bold(Color::Green),
             ),
-        ]),
-    ])
-    .block(
-        Block::default()
-            .borders(Borders::ALL)
-            .border_style(Style::default().fg(Color::Magenta))
-            .title(" Cached Input Tokens "),
+        ],
     );
-    frame.render_widget(cached_card, cards[1]);
 
-    // Card 3: Output Tokens
-    let output_card = Paragraph::new(vec![
-        Line::from(vec![
-            Span::styled("Output Tok:  ", Style::default().fg(Color::DarkGray)),
-            Span::styled(
+    render_metric_card(
+        frame,
+        cards[2],
+        " Output & Thinking Tokens ",
+        Color::Yellow,
+        [
+            (
+                "Output Tok:  ",
                 format_number(totals.output_tokens),
-                Style::default()
-                    .fg(Color::White)
-                    .add_modifier(Modifier::BOLD),
+                bold(Color::White),
             ),
-        ]),
-        Line::from(vec![
-            Span::styled("Candidates:  ", Style::default().fg(Color::DarkGray)),
-            Span::styled(
+            (
+                "Candidates:  ",
                 format_number(totals.candidates_tokens),
-                Style::default().fg(Color::Cyan),
+                plain(Color::Cyan),
             ),
-        ]),
-        Line::from(vec![
-            Span::styled("Thinking:    ", Style::default().fg(Color::DarkGray)),
-            Span::styled(
+            (
+                "Thinking:    ",
                 format!(
                     "{} ({:.0}%)",
                     format_number(totals.thoughts_tokens),
                     think_pct
                 ),
-                Style::default().fg(Color::LightYellow),
+                plain(Color::LightYellow),
             ),
-        ]),
-        Line::from(vec![
-            Span::styled("Output $:    ", Style::default().fg(Color::DarkGray)),
-            Span::styled(
+            (
+                "Output $:    ",
                 format_usd(totals.output_cost_usd),
-                Style::default()
-                    .fg(Color::Green)
-                    .add_modifier(Modifier::BOLD),
+                bold(Color::Green),
             ),
-        ]),
-    ])
-    .block(
-        Block::default()
-            .borders(Borders::ALL)
-            .border_style(Style::default().fg(Color::Yellow))
-            .title(" Output & Thinking Tokens "),
+        ],
     );
-    frame.render_widget(output_card, cards[2]);
 
-    // Card 4: Total Cost & Requests
-    let total_card = Paragraph::new(vec![
-        Line::from(vec![
-            Span::styled("Total Price: ", Style::default().fg(Color::DarkGray)),
-            Span::styled(
+    render_metric_card(
+        frame,
+        cards[3],
+        " Total Price & Reliability ",
+        Color::Green,
+        [
+            (
+                "Total Price: ",
                 format_usd(totals.total_cost_usd),
-                Style::default()
-                    .fg(Color::LightGreen)
-                    .add_modifier(Modifier::BOLD),
+                bold(Color::LightGreen),
             ),
-        ]),
-        Line::from(vec![
-            Span::styled("All Tokens:  ", Style::default().fg(Color::DarkGray)),
-            Span::styled(
+            (
+                "All Tokens:  ",
                 format_number(totals.total_tokens),
-                Style::default().fg(Color::White),
+                plain(Color::White),
             ),
-        ]),
-        Line::from(vec![
-            Span::styled("Requests:    ", Style::default().fg(Color::DarkGray)),
-            Span::styled(
-                format!("{} ok / {} err", ok_reqs, failed_reqs),
-                Style::default().fg(if failed_reqs > 0 {
+            (
+                "Requests:    ",
+                format!(
+                    "{} ok / {} err",
+                    stats.successful_requests, stats.failed_requests
+                ),
+                plain(if stats.failed_requests > 0 {
                     Color::LightRed
                 } else {
                     Color::Cyan
                 }),
             ),
-        ]),
-        Line::from(vec![
-            Span::styled("Retries:     ", Style::default().fg(Color::DarkGray)),
-            Span::styled(
-                format_number(total_retries),
-                Style::default().fg(if total_retries > 0 {
+            (
+                "Retries:     ",
+                format_number(stats.total_retries),
+                plain(if stats.total_retries > 0 {
                     Color::Yellow
                 } else {
                     Color::DarkGray
                 }),
             ),
-        ]),
-    ])
-    .block(
-        Block::default()
-            .borders(Borders::ALL)
-            .border_style(Style::default().fg(Color::Green))
-            .title(" Total Price & Reliability "),
+        ],
     );
-    frame.render_widget(total_card, cards[3]);
 }
 
 fn render_models_table(frame: &mut Frame, area: Rect, state: &DashboardState) {
@@ -1011,7 +1003,7 @@ fn render_logs_panel(frame: &mut Frame, area: Rect, state: &DashboardState) {
     let total_entries = state.visible_logs().len();
     let inner_width = area.width.saturating_sub(2) as usize;
     let visible_rows = area.height.saturating_sub(2) as usize;
-    let visual_lines = state.visual_log_lines(inner_width);
+    let visual_lines = state.cached_visual_log_lines(inner_width);
     let total_visual = visual_lines.len();
     let max_scroll = total_visual.saturating_sub(visible_rows);
     let effective_scroll = state.log_scroll_from_bottom.min(max_scroll);
@@ -1119,27 +1111,41 @@ enum SseUpdate {
     Disconnected(String),
 }
 
-fn spawn_usage_sse_listener(
+fn spawn_sse_listener<T, F>(
     client: reqwest::Client,
-    usage_url: String,
+    url: String,
+    read_timeout: Duration,
+    report_disconnect: bool,
+    map_event: F,
     tx: tokio::sync::mpsc::UnboundedSender<SseUpdate>,
-) -> tokio::task::JoinHandle<()> {
+) -> tokio::task::JoinHandle<()>
+where
+    T: DeserializeOwned + Send + 'static,
+    F: Fn(T) -> SseUpdate + Send + 'static,
+{
     tokio::spawn(async move {
+        let send_disconnect = |reason: String| {
+            if report_disconnect {
+                tx.send(SseUpdate::Disconnected(reason)).is_ok()
+            } else {
+                !tx.is_closed()
+            }
+        };
+
         loop {
-            match client.get(&usage_url).send().await {
+            match client.get(&url).send().await {
                 Ok(res) if res.status().is_success() => {
                     let mut stream = res.bytes_stream();
                     let mut buf = Vec::new();
                     let mut stream_err = "SSE stream closed".to_string();
 
                     loop {
-                        match tokio::time::timeout(Duration::from_secs(5), stream.next()).await {
+                        match tokio::time::timeout(read_timeout, stream.next()).await {
                             Ok(Some(Ok(chunk))) => {
                                 buf.extend_from_slice(&chunk);
                                 while let Some(json_str) = drain_sse_data_line(&mut buf) {
-                                    if let Ok(snapshot) =
-                                        serde_json::from_str::<UsageSnapshot>(&json_str)
-                                        && tx.send(SseUpdate::Snapshot(Box::new(snapshot))).is_err()
+                                    if let Ok(parsed) = serde_json::from_str::<T>(&json_str)
+                                        && tx.send(map_event(parsed)).is_err()
                                     {
                                         return;
                                     }
@@ -1157,23 +1163,17 @@ fn spawn_usage_sse_listener(
                         }
                     }
 
-                    if tx.send(SseUpdate::Disconnected(stream_err)).is_err() {
+                    if !send_disconnect(stream_err) {
                         return;
                     }
                 }
                 Ok(res) => {
-                    if tx
-                        .send(SseUpdate::Disconnected(format!("HTTP {}", res.status())))
-                        .is_err()
-                    {
+                    if !send_disconnect(format!("HTTP {}", res.status())) {
                         return;
                     }
                 }
                 Err(e) => {
-                    if tx
-                        .send(SseUpdate::Disconnected(format!("Connection error: {}", e)))
-                        .is_err()
-                    {
+                    if !send_disconnect(format!("Connection error: {}", e)) {
                         return;
                     }
                 }
@@ -1184,36 +1184,34 @@ fn spawn_usage_sse_listener(
     })
 }
 
+fn spawn_usage_sse_listener(
+    client: reqwest::Client,
+    usage_url: String,
+    tx: tokio::sync::mpsc::UnboundedSender<SseUpdate>,
+) -> tokio::task::JoinHandle<()> {
+    spawn_sse_listener::<UsageSnapshot, _>(
+        client,
+        usage_url,
+        Duration::from_secs(5),
+        true,
+        |snap| SseUpdate::Snapshot(Box::new(snap)),
+        tx,
+    )
+}
+
 fn spawn_logs_sse_listener(
     client: reqwest::Client,
     logs_url: String,
     tx: tokio::sync::mpsc::UnboundedSender<SseUpdate>,
 ) -> tokio::task::JoinHandle<()> {
-    tokio::spawn(async move {
-        loop {
-            if let Ok(res) = client.get(&logs_url).send().await
-                && res.status().is_success()
-            {
-                let mut stream = res.bytes_stream();
-                let mut buf = Vec::new();
-
-                while let Ok(Some(Ok(chunk))) =
-                    tokio::time::timeout(Duration::from_secs(30), stream.next()).await
-                {
-                    buf.extend_from_slice(&chunk);
-                    while let Some(json_str) = drain_sse_data_line(&mut buf) {
-                        if let Ok(logs) = serde_json::from_str::<Vec<LogEntry>>(&json_str)
-                            && tx.send(SseUpdate::Logs(logs)).is_err()
-                        {
-                            return;
-                        }
-                    }
-                }
-            }
-
-            tokio::time::sleep(Duration::from_millis(500)).await;
-        }
-    })
+    spawn_sse_listener::<Vec<LogEntry>, _>(
+        client,
+        logs_url,
+        Duration::from_secs(30),
+        false,
+        SseUpdate::Logs,
+        tx,
+    )
 }
 
 struct TerminalRestoreGuard;
