@@ -1363,7 +1363,7 @@ async fn run_monitor_loop(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::usage::{LogEntry, ModelPricing, TokenUsageTotals};
+    use crate::usage::{LogEntry, ModelPricing, ScopeUsageStats, TokenUsageTotals};
     use ratatui::backend::TestBackend;
     use std::collections::BTreeMap;
 
@@ -1438,28 +1438,25 @@ mod tests {
         );
 
         let totals = models["gemini-4-argon"].totals.clone();
-        state.snapshot = Some(UsageSnapshot {
-            uptime_secs: 95,
+        let scope_stats = ScopeUsageStats {
             active_requests: 1,
             total_requests: 5,
             successful_requests: 5,
             failed_requests: 0,
             total_retries: 1,
+            totals,
+            models,
+        };
+        state.snapshot = Some(UsageSnapshot {
+            uptime_secs: 95,
+            stats: scope_stats.clone(),
             pricing_source: "models.dev (live)".to_string(),
-            totals: totals.clone(),
-            models: models.clone(),
             sessions: vec![SessionUsageStats {
                 id: "1".to_string(),
                 label: "agy-gyro".to_string(),
                 pid: Some(48210),
                 active: true,
-                active_requests: 1,
-                total_requests: 5,
-                successful_requests: 5,
-                failed_requests: 0,
-                total_retries: 1,
-                totals,
-                models,
+                stats: scope_stats,
             }],
         });
         state.logs = vec![LogEntry {

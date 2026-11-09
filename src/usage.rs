@@ -13,10 +13,12 @@ pub use crate::session::{
 use axum::body::Bytes;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, VecDeque};
+use std::ops::{Deref, DerefMut};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock, RwLock, Weak};
 use std::time::{Duration, Instant};
 use tracing::info;
+use tracing_subscriber::registry::LookupSpan;
 
 /// Maximum number of real-time log entries retained in the log ring buffer.
 const MAX_LOG_ENTRIES: usize = 200;
@@ -315,6 +317,97 @@ pub struct ModelUsageStats {
     pub pricing: Option<ModelPricing>,
 }
 
+/// Aggregated request counters, token totals, and per-model breakdown shared by
+/// both global [`UsageSnapshot`] and per-session [`SessionUsageStats`].
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct ScopeUsageStats {
+    pub active_requests: u64,
+    pub total_requests: u64,
+    pub successful_requests: u64,
+    pub failed_requests: u64,
+    pub total_retries: u64,
+    pub totals: TokenUsageTotals,
+    pub models: BTreeMap<String, ModelUsageStats>,
+}
+
+impl ScopeUsageStats {
+    pub fn begin_request(&mut self) {
+        self.total_requests += 1;
+        self.active_requests += 1;
+    }
+
+    pub fn end_request(&mut self) {
+        self.active_requests = self.active_requests.saturating_sub(1);
+    }
+
+    pub fn record_retry(&mut self) {
+        self.total_retries += 1;
+    }
+
+    pub fn record_completed(
+        &mut self,
+        canonical_model: &str,
+        is_ok: bool,
+        retries: u32,
+        usage: &RawUsageMetadata,
+        cost: &CostBreakdown,
+        pricing: Option<ModelPricing>,
+    ) {
+        if is_ok {
+            self.successful_requests += 1;
+        } else {
+            self.failed_requests += 1;
+        }
+        self.totals.record(usage, cost, retries);
+
+        let model_entry = self
+            .models
+            .entry(canonical_model.to_string())
+            .or_insert_with(|| ModelUsageStats {
+                model: canonical_model.to_string(),
+                totals: TokenUsageTotals::default(),
+                pricing: pricing.clone(),
+            });
+        if model_entry.pricing.is_none() && pricing.is_some() {
+            model_entry.pricing = pricing;
+        }
+        model_entry.totals.record(usage, cost, retries);
+    }
+
+    pub fn reset_completed(&mut self) {
+        self.total_requests = self.active_requests;
+        self.successful_requests = 0;
+        self.failed_requests = 0;
+        self.total_retries = 0;
+        self.totals = TokenUsageTotals::default();
+        self.models.clear();
+    }
+
+    pub fn subtract(&mut self, other: &ScopeUsageStats) {
+        let completed_reqs = other.total_requests.saturating_sub(other.active_requests);
+        self.total_requests = self.total_requests.saturating_sub(completed_reqs);
+        self.successful_requests = self
+            .successful_requests
+            .saturating_sub(other.successful_requests);
+        self.failed_requests = self.failed_requests.saturating_sub(other.failed_requests);
+        self.total_retries = self.total_retries.saturating_sub(other.total_retries);
+        self.totals.subtract(&other.totals);
+
+        for (model_name, model_stats) in &other.models {
+            let mut remove_model = false;
+            if let Some(global_model) = self.models.get_mut(model_name) {
+                global_model.totals.subtract(&model_stats.totals);
+                if global_model.totals.requests == 0 {
+                    remove_model = true;
+                }
+            }
+            if remove_model {
+                self.models.remove(model_name);
+            }
+        }
+    }
+}
+
 /// Per-session (`agy` instance) usage, cost, and lifecycle breakdown returned in [`UsageSnapshot`].
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SessionUsageStats {
@@ -323,13 +416,22 @@ pub struct SessionUsageStats {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub pid: Option<u32>,
     pub active: bool,
-    pub active_requests: u64,
-    pub total_requests: u64,
-    pub successful_requests: u64,
-    pub failed_requests: u64,
-    pub total_retries: u64,
-    pub totals: TokenUsageTotals,
-    pub models: BTreeMap<String, ModelUsageStats>,
+    #[serde(flatten)]
+    pub stats: ScopeUsageStats,
+}
+
+impl Deref for SessionUsageStats {
+    type Target = ScopeUsageStats;
+
+    fn deref(&self) -> &Self::Target {
+        &self.stats
+    }
+}
+
+impl DerefMut for SessionUsageStats {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.stats
+    }
 }
 
 /// A single real-time tracing log entry streamed by `GET /logs`.
@@ -348,16 +450,25 @@ pub struct LogEntry {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct UsageSnapshot {
     pub uptime_secs: u64,
-    pub active_requests: u64,
-    pub total_requests: u64,
-    pub successful_requests: u64,
-    pub failed_requests: u64,
-    pub total_retries: u64,
+    #[serde(flatten)]
+    pub stats: ScopeUsageStats,
     pub pricing_source: String,
-    pub totals: TokenUsageTotals,
-    pub models: BTreeMap<String, ModelUsageStats>,
     #[serde(default)]
     pub sessions: Vec<SessionUsageStats>,
+}
+
+impl Deref for UsageSnapshot {
+    type Target = ScopeUsageStats;
+
+    fn deref(&self) -> &Self::Target {
+        &self.stats
+    }
+}
+
+impl DerefMut for UsageSnapshot {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.stats
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -368,8 +479,7 @@ struct SessionEntry {
 
 #[derive(Debug, Default)]
 struct UsageInner {
-    totals: TokenUsageTotals,
-    models: BTreeMap<String, ModelUsageStats>,
+    global: ScopeUsageStats,
     sessions: BTreeMap<String, SessionEntry>,
     logs: VecDeque<LogEntry>,
 }
@@ -377,11 +487,6 @@ struct UsageInner {
 /// Thread-safe live usage, cost, and log tracker shared across proxy handlers.
 pub struct UsageTracker {
     started_at: Instant,
-    active_requests: AtomicU64,
-    total_requests: AtomicU64,
-    successful_requests: AtomicU64,
-    failed_requests: AtomicU64,
-    total_retries: AtomicU64,
     next_request_id: AtomicU64,
     next_session_id: AtomicU64,
     next_log_id: AtomicU64,
@@ -403,11 +508,6 @@ impl UsageTracker {
         let (log_change_tx, _) = tokio::sync::watch::channel(0u64);
         Self {
             started_at: Instant::now(),
-            active_requests: AtomicU64::new(0),
-            total_requests: AtomicU64::new(0),
-            successful_requests: AtomicU64::new(0),
-            failed_requests: AtomicU64::new(0),
-            total_retries: AtomicU64::new(0),
             next_request_id: AtomicU64::new(1),
             next_session_id: AtomicU64::new(1),
             next_log_id: AtomicU64::new(1),
@@ -469,6 +569,10 @@ impl UsageTracker {
     /// Checks OS-level process liveness for all active tracked sessions, transitioning any
     /// session whose process has terminated to `active = false`.
     pub fn check_session_processes(&self) {
+        self.reap_exited_sessions(true);
+    }
+
+    fn reap_exited_sessions(&self, notify: bool) {
         let has_exited = self.inner.read().ok().is_some_and(|inner| {
             inner.sessions.values().any(|e| {
                 e.stats.active
@@ -508,7 +612,9 @@ impl UsageTracker {
                     pid
                 );
             }
-            self.notify_usage_change();
+            if notify {
+                self.notify_usage_change();
+            }
         }
     }
 
@@ -598,13 +704,7 @@ impl UsageTracker {
                         label: clean_label.clone(),
                         pid,
                         active: true,
-                        active_requests: 0,
-                        total_requests: 0,
-                        successful_requests: 0,
-                        failed_requests: 0,
-                        total_retries: 0,
-                        totals: TokenUsageTotals::default(),
-                        models: BTreeMap::new(),
+                        stats: ScopeUsageStats::default(),
                     },
                     track_pid_liveness,
                 },
@@ -693,13 +793,7 @@ impl UsageTracker {
                     label: meta.label.clone(),
                     pid: meta.pid,
                     active: true,
-                    active_requests: 0,
-                    total_requests: 0,
-                    successful_requests: 0,
-                    failed_requests: 0,
-                    total_retries: 0,
-                    totals: TokenUsageTotals::default(),
-                    models: BTreeMap::new(),
+                    stats: ScopeUsageStats::default(),
                 },
                 track_pid_liveness: meta.pid.is_some_and(is_pid_alive),
             })
@@ -716,18 +810,17 @@ impl UsageTracker {
         self: &Arc<Self>,
         session: Option<&SessionMeta>,
     ) -> ActiveRequestGuard {
-        self.total_requests.fetch_add(1, Ordering::Relaxed);
-        self.active_requests.fetch_add(1, Ordering::Relaxed);
-
-        let session_id = if let Some(meta) = session {
-            if let Ok(mut inner) = self.inner.write() {
+        let session_id = if let Ok(mut inner) = self.inner.write() {
+            inner.global.begin_request();
+            if let Some(meta) = session {
                 let entry = self.ensure_session_entry(&mut inner, meta);
-                entry.stats.total_requests += 1;
-                entry.stats.active_requests += 1;
+                entry.stats.begin_request();
+                Some(meta.id.clone())
+            } else {
+                None
             }
-            Some(meta.id.clone())
         } else {
-            None
+            session.map(|m| m.id.clone())
         };
 
         self.notify_usage_change();
@@ -744,12 +837,12 @@ impl UsageTracker {
 
     /// Increments the global and per-session retry counter when a request attempt is retried.
     pub fn record_session_retry(&self, session: Option<&SessionMeta>) {
-        self.total_retries.fetch_add(1, Ordering::Relaxed);
-        if let Some(meta) = session
-            && let Ok(mut inner) = self.inner.write()
-        {
-            let entry = self.ensure_session_entry(&mut inner, meta);
-            entry.stats.total_retries += 1;
+        if let Ok(mut inner) = self.inner.write() {
+            inner.global.record_retry();
+            if let Some(meta) = session {
+                let entry = self.ensure_session_entry(&mut inner, meta);
+                entry.stats.record_retry();
+            }
         }
         self.notify_usage_change();
     }
@@ -777,12 +870,6 @@ impl UsageTracker {
         raw_usage: Option<&RawUsageMetadata>,
     ) {
         let is_ok = (200..300).contains(&status);
-        if is_ok {
-            self.successful_requests.fetch_add(1, Ordering::Relaxed);
-        } else {
-            self.failed_requests.fetch_add(1, Ordering::Relaxed);
-        }
-
         let canonical_model = if model.is_empty() {
             "unknown".to_string()
         } else {
@@ -810,42 +897,25 @@ impl UsageTracker {
         let req_id = self.next_request_id.fetch_add(1, Ordering::Relaxed);
 
         if let Ok(mut inner) = self.inner.write() {
-            inner.totals.record(&usage, &cost, retries);
-
-            let model_entry = inner
-                .models
-                .entry(canonical_model.clone())
-                .or_insert_with(|| ModelUsageStats {
-                    model: canonical_model.clone(),
-                    totals: TokenUsageTotals::default(),
-                    pricing: pricing.clone(),
-                });
-            if model_entry.pricing.is_none() && pricing.is_some() {
-                model_entry.pricing = pricing.clone();
-            }
-            model_entry.totals.record(&usage, &cost, retries);
+            inner.global.record_completed(
+                &canonical_model,
+                is_ok,
+                retries,
+                &usage,
+                &cost,
+                pricing.clone(),
+            );
 
             if let Some(meta) = session {
                 let sess_entry = self.ensure_session_entry(&mut inner, meta);
-                if is_ok {
-                    sess_entry.stats.successful_requests += 1;
-                } else {
-                    sess_entry.stats.failed_requests += 1;
-                }
-                sess_entry.stats.totals.record(&usage, &cost, retries);
-                let sess_model = sess_entry
-                    .stats
-                    .models
-                    .entry(canonical_model.clone())
-                    .or_insert_with(|| ModelUsageStats {
-                        model: canonical_model.clone(),
-                        totals: TokenUsageTotals::default(),
-                        pricing: pricing.clone(),
-                    });
-                if sess_model.pricing.is_none() && pricing.is_some() {
-                    sess_model.pricing = pricing;
-                }
-                sess_model.totals.record(&usage, &cost, retries);
+                sess_entry.stats.record_completed(
+                    &canonical_model,
+                    is_ok,
+                    retries,
+                    &usage,
+                    &cost,
+                    pricing,
+                );
             }
         }
 
@@ -889,27 +959,16 @@ impl UsageTracker {
     /// Resets all accumulated metrics and buffered logs across all sessions.
     /// Exited sessions are removed while active sessions are retained with zeroed counters.
     pub fn reset(&self) {
-        let active_reqs = self.active_requests.load(Ordering::Relaxed);
-        self.total_requests.store(active_reqs, Ordering::Relaxed);
-        self.successful_requests.store(0, Ordering::Relaxed);
-        self.failed_requests.store(0, Ordering::Relaxed);
-        self.total_retries.store(0, Ordering::Relaxed);
         self.next_request_id.store(1, Ordering::Relaxed);
         self.next_log_id.store(1, Ordering::Relaxed);
         if let Ok(mut inner) = self.inner.write() {
-            inner.totals = TokenUsageTotals::default();
-            inner.models.clear();
+            inner.global.reset_completed();
             inner.logs.clear();
             inner
                 .sessions
                 .retain(|_, entry| entry.stats.active || entry.stats.active_requests > 0);
             for entry in inner.sessions.values_mut() {
-                entry.stats.total_requests = entry.stats.active_requests;
-                entry.stats.successful_requests = 0;
-                entry.stats.failed_requests = 0;
-                entry.stats.total_retries = 0;
-                entry.stats.totals = TokenUsageTotals::default();
-                entry.stats.models.clear();
+                entry.stats.reset_completed();
             }
             if inner.sessions.is_empty() {
                 self.next_session_id.store(1, Ordering::Relaxed);
@@ -927,59 +986,16 @@ impl UsageTracker {
                 return;
             };
 
-            let completed_reqs = entry
-                .stats
-                .total_requests
-                .saturating_sub(entry.stats.active_requests);
-            let _ = self
-                .total_requests
-                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |cur| {
-                    Some(cur.saturating_sub(completed_reqs))
-                });
-            let _ = self.successful_requests.fetch_update(
-                Ordering::Relaxed,
-                Ordering::Relaxed,
-                |cur| Some(cur.saturating_sub(entry.stats.successful_requests)),
-            );
-            let _ =
-                self.failed_requests
-                    .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |cur| {
-                        Some(cur.saturating_sub(entry.stats.failed_requests))
-                    });
-            let _ = self
-                .total_retries
-                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |cur| {
-                    Some(cur.saturating_sub(entry.stats.total_retries))
-                });
-
-            let sess_totals = entry.stats.totals.clone();
-            let sess_models = std::mem::take(&mut entry.stats.models);
+            let removed_stats = entry.stats.stats.clone();
             let keep_session = entry.stats.active || entry.stats.active_requests > 0;
 
             if keep_session {
-                entry.stats.total_requests = entry.stats.active_requests;
-                entry.stats.successful_requests = 0;
-                entry.stats.failed_requests = 0;
-                entry.stats.total_retries = 0;
-                entry.stats.totals = TokenUsageTotals::default();
+                entry.stats.reset_completed();
             } else {
                 inner.sessions.remove(session_id);
             }
 
-            inner.totals.subtract(&sess_totals);
-            for (model_name, model_stats) in &sess_models {
-                let mut remove_model = false;
-                if let Some(global_model) = inner.models.get_mut(model_name) {
-                    global_model.totals.subtract(&model_stats.totals);
-                    if global_model.totals.requests == 0 {
-                        remove_model = true;
-                    }
-                }
-                if remove_model {
-                    inner.models.remove(model_name);
-                }
-            }
-
+            inner.global.subtract(&removed_stats);
             inner
                 .logs
                 .retain(|l| l.session_id.as_deref() != Some(session_id));
@@ -993,7 +1009,7 @@ impl UsageTracker {
 
     /// Returns a point-in-time [`UsageSnapshot`] for the `/usage` endpoint.
     pub fn snapshot(&self) -> UsageSnapshot {
-        self.check_session_processes();
+        self.reap_exited_sessions(false);
 
         let pricing_source = self
             .pricing
@@ -1001,13 +1017,13 @@ impl UsageTracker {
             .map(|p| p.source.clone())
             .unwrap_or_else(|_| "built-in".to_string());
 
-        let (totals, models, mut sessions) = match self.inner.read() {
+        let (stats, mut sessions) = match self.inner.read() {
             Ok(inner) => {
                 let sessions: Vec<SessionUsageStats> =
                     inner.sessions.values().map(|e| e.stats.clone()).collect();
-                (inner.totals.clone(), inner.models.clone(), sessions)
+                (inner.global.clone(), sessions)
             }
-            Err(_) => (TokenUsageTotals::default(), BTreeMap::new(), Vec::new()),
+            Err(_) => (ScopeUsageStats::default(), Vec::new()),
         };
 
         sessions.sort_by(|a, b| {
@@ -1018,14 +1034,8 @@ impl UsageTracker {
 
         UsageSnapshot {
             uptime_secs: self.started_at.elapsed().as_secs(),
-            active_requests: self.active_requests.load(Ordering::Relaxed),
-            total_requests: self.total_requests.load(Ordering::Relaxed),
-            successful_requests: self.successful_requests.load(Ordering::Relaxed),
-            failed_requests: self.failed_requests.load(Ordering::Relaxed),
-            total_retries: self.total_retries.load(Ordering::Relaxed),
+            stats,
             pricing_source,
-            totals,
-            models,
             sessions,
         }
     }
@@ -1034,6 +1044,31 @@ impl UsageTracker {
 fn global_log_trackers() -> &'static RwLock<Vec<Weak<UsageTracker>>> {
     static TRACKERS: OnceLock<RwLock<Vec<Weak<UsageTracker>>>> = OnceLock::new();
     TRACKERS.get_or_init(|| RwLock::new(Vec::new()))
+}
+
+#[derive(Clone, Debug)]
+struct SpanSessionId(String);
+
+#[derive(Default)]
+struct SessionFieldVisitor {
+    session_id: Option<String>,
+}
+
+impl tracing::field::Visit for SessionFieldVisitor {
+    fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+        if field.name() == "session_id" {
+            let s = format!("{:?}", value).trim_matches('"').to_string();
+            if !s.is_empty() {
+                self.session_id = Some(s);
+            }
+        }
+    }
+
+    fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+        if field.name() == "session_id" && !value.is_empty() {
+            self.session_id = Some(value.to_string());
+        }
+    }
 }
 
 #[derive(Default)]
@@ -1073,12 +1108,41 @@ impl tracing::field::Visit for LogEventVisitor {
 /// A `tracing_subscriber::Layer` that routes `agy_gyro` log events into active [`UsageTracker`] instances.
 pub struct UsageLogLayer;
 
-impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for UsageLogLayer {
-    fn on_event(
+impl<S> tracing_subscriber::Layer<S> for UsageLogLayer
+where
+    S: tracing::Subscriber + for<'a> LookupSpan<'a>,
+{
+    fn on_new_span(
         &self,
-        event: &tracing::Event<'_>,
-        _ctx: tracing_subscriber::layer::Context<'_, S>,
+        attrs: &tracing::span::Attributes<'_>,
+        id: &tracing::span::Id,
+        ctx: tracing_subscriber::layer::Context<'_, S>,
     ) {
+        let mut visitor = SessionFieldVisitor::default();
+        attrs.record(&mut visitor);
+        if let Some(sid) = visitor.session_id
+            && let Some(span) = ctx.span(id)
+        {
+            span.extensions_mut().insert(SpanSessionId(sid));
+        }
+    }
+
+    fn on_record(
+        &self,
+        id: &tracing::span::Id,
+        values: &tracing::span::Record<'_>,
+        ctx: tracing_subscriber::layer::Context<'_, S>,
+    ) {
+        let mut visitor = SessionFieldVisitor::default();
+        values.record(&mut visitor);
+        if let Some(sid) = visitor.session_id
+            && let Some(span) = ctx.span(id)
+        {
+            span.extensions_mut().insert(SpanSessionId(sid));
+        }
+    }
+
+    fn on_event(&self, event: &tracing::Event<'_>, ctx: tracing_subscriber::layer::Context<'_, S>) {
         let meta = event.metadata();
         if !meta.target().starts_with("agy_gyro") {
             return;
@@ -1095,6 +1159,17 @@ impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for UsageLogLayer {
         let mut visitor = LogEventVisitor::default();
         event.record(&mut visitor);
 
+        let session_id = visitor.session_id.or_else(|| {
+            ctx.event_scope(event).and_then(|scope| {
+                for span in scope {
+                    if let Some(ext) = span.extensions().get::<SpanSessionId>() {
+                        return Some(ext.0.clone());
+                    }
+                }
+                None
+            })
+        });
+
         let text = if visitor.fields.is_empty() {
             visitor.message
         } else if visitor.message.is_empty() {
@@ -1108,7 +1183,7 @@ impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for UsageLogLayer {
                 tracker.record_log_with_session(
                     meta.level().as_str(),
                     meta.target(),
-                    visitor.session_id.clone(),
+                    session_id.clone(),
                     text.clone(),
                 );
             }
@@ -1123,12 +1198,13 @@ pub struct ActiveRequestGuard {
 
 impl Drop for ActiveRequestGuard {
     fn drop(&mut self) {
-        self.tracker.active_requests.fetch_sub(1, Ordering::Relaxed);
-        if let Some(ref sid) = self.session_id
-            && let Ok(mut inner) = self.tracker.inner.write()
-            && let Some(entry) = inner.sessions.get_mut(sid)
-        {
-            entry.stats.active_requests = entry.stats.active_requests.saturating_sub(1);
+        if let Ok(mut inner) = self.tracker.inner.write() {
+            inner.global.end_request();
+            if let Some(ref sid) = self.session_id
+                && let Some(entry) = inner.sessions.get_mut(sid)
+            {
+                entry.stats.end_request();
+            }
         }
         self.tracker.notify_usage_change();
     }
