@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: MIT
 
-use crate::config::MonitorArgs;
+use crate::config::Config;
 use crate::usage::{LogEntry, ModelUsageStats, ScopeUsageStats, SessionUsageStats, UsageSnapshot};
 use crossterm::{
     event::{self, Event, KeyCode, KeyEventKind, KeyModifiers},
@@ -21,16 +21,6 @@ use std::cell::RefCell;
 use std::io;
 use std::rc::Rc;
 use std::time::{Duration, Instant};
-
-/// Normalizes a gateway base URL or endpoint URL into a full `.../usage` endpoint URL.
-pub fn resolve_usage_endpoint_url(raw_url: &str) -> String {
-    crate::config::resolve_endpoint_url(raw_url, "usage")
-}
-
-/// Normalizes a gateway base URL or endpoint URL into a full `.../logs` endpoint URL.
-pub fn resolve_logs_endpoint_url(raw_url: &str) -> String {
-    crate::config::resolve_endpoint_url(raw_url, "logs")
-}
 
 /// Drains complete `\n`-terminated SSE `data:` JSON payloads from a raw byte buffer,
 /// preserving any incomplete trailing bytes (including split multi-byte UTF-8 sequences).
@@ -161,8 +151,8 @@ pub struct DashboardState {
 }
 
 impl DashboardState {
-    pub fn new(args: &MonitorArgs) -> Self {
-        let endpoint_url = args.resolve_endpoint_url();
+    pub fn new(config: &Config) -> Self {
+        let endpoint_url = config.usage_url();
         Self {
             endpoint_url,
             snapshot: None,
@@ -1224,7 +1214,7 @@ impl Drop for TerminalRestoreGuard {
 }
 
 /// Runs the interactive live TUI usage and cost monitor dashboard over SSE.
-pub async fn run_monitor(args: MonitorArgs) -> Result<(), Box<dyn std::error::Error>> {
+pub async fn run_monitor(config: Config) -> Result<(), Box<dyn std::error::Error>> {
     let sse_client = reqwest::Client::builder()
         .connect_timeout(Duration::from_secs(2))
         .tcp_keepalive(Duration::from_secs(15))
@@ -1233,8 +1223,8 @@ pub async fn run_monitor(args: MonitorArgs) -> Result<(), Box<dyn std::error::Er
         .timeout(Duration::from_secs(2))
         .build()?;
 
-    let mut state = DashboardState::new(&args);
-    let logs_url = resolve_logs_endpoint_url(&state.endpoint_url);
+    let mut state = DashboardState::new(&config);
+    let logs_url = config.logs_url();
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
     let usage_sse_handle =
         spawn_usage_sse_listener(sse_client.clone(), state.endpoint_url.clone(), tx.clone());
@@ -1366,30 +1356,6 @@ mod tests {
     use std::collections::BTreeMap;
 
     #[test]
-    fn test_resolve_endpoint_urls() {
-        assert_eq!(
-            resolve_usage_endpoint_url("127.0.0.1:6470"),
-            "http://127.0.0.1:6470/usage"
-        );
-        assert_eq!(
-            resolve_usage_endpoint_url("http://127.0.0.1:9000/"),
-            "http://127.0.0.1:9000/usage"
-        );
-        assert_eq!(
-            resolve_usage_endpoint_url("http://127.0.0.1:9000/usage"),
-            "http://127.0.0.1:9000/usage"
-        );
-        assert_eq!(
-            resolve_logs_endpoint_url("127.0.0.1:6470"),
-            "http://127.0.0.1:6470/logs"
-        );
-        assert_eq!(
-            resolve_logs_endpoint_url("http://127.0.0.1:9000/usage"),
-            "http://127.0.0.1:9000/logs"
-        );
-    }
-
-    #[test]
     fn test_format_helpers() {
         assert_eq!(format_number(0), "0");
         assert_eq!(format_number(999), "999");
@@ -1401,12 +1367,7 @@ mod tests {
 
     #[test]
     fn test_render_dashboard_with_test_backend() {
-        let args = MonitorArgs {
-            url: Some("http://127.0.0.1:6470".to_string()),
-            host: "127.0.0.1".to_string(),
-            port: 6470,
-        };
-        let mut state = DashboardState::new(&args);
+        let mut state = DashboardState::new(&Config::default());
         state.connected = true;
 
         let mut models = BTreeMap::new();
@@ -1503,12 +1464,7 @@ mod tests {
 
     #[test]
     fn test_log_scrolling_bounds_at_top_and_bottom() {
-        let args = MonitorArgs {
-            url: Some("http://127.0.0.1:6470".to_string()),
-            host: "127.0.0.1".to_string(),
-            port: 6470,
-        };
-        let mut state = DashboardState::new(&args);
+        let mut state = DashboardState::new(&Config::default());
         state.log_viewport_height = 5;
 
         // 1. Fewer logs than viewport height: scrolling up should stay at 0

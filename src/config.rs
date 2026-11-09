@@ -15,7 +15,6 @@ pub const ENV_API_KEY: &str = "AGY_GYRO_API_KEY";
 pub const ENV_HOST: &str = "AGY_GYRO_HOST";
 pub const ENV_PORT: &str = "AGY_GYRO_PORT";
 pub const ENV_UPSTREAM: &str = "AGY_GYRO_UPSTREAM";
-pub const ENV_UPSTREAM_URL: &str = "AGY_GYRO_UPSTREAM_URL";
 pub const ENV_AGY_PATH: &str = "AGY_GYRO_AGY_PATH";
 pub const ENV_LOG_FILE: &str = "AGY_GYRO_LOG_FILE";
 pub const ENV_MAX_RETRIES: &str = "AGY_GYRO_MAX_RETRIES";
@@ -24,7 +23,6 @@ pub const ENV_MAX_DELAY_MS: &str = "AGY_GYRO_MAX_DELAY_MS";
 pub const ENV_NO_JITTER: &str = "AGY_GYRO_NO_JITTER";
 pub const ENV_NO_BUFFER: &str = "AGY_GYRO_NO_BUFFER";
 pub const ENV_REQUEST_TIMEOUT_SECS: &str = "AGY_GYRO_REQUEST_TIMEOUT_SECS";
-pub const ENV_URL: &str = "AGY_GYRO_URL";
 
 /// All configuration environment variables recognized by [`Cli::try_parse_with_config_from`].
 pub const KNOWN_ENV_VARS: &[&str] = &[
@@ -33,7 +31,6 @@ pub const KNOWN_ENV_VARS: &[&str] = &[
     ENV_HOST,
     ENV_PORT,
     ENV_UPSTREAM,
-    ENV_UPSTREAM_URL,
     ENV_AGY_PATH,
     ENV_LOG_FILE,
     ENV_MAX_RETRIES,
@@ -42,7 +39,6 @@ pub const KNOWN_ENV_VARS: &[&str] = &[
     ENV_NO_JITTER,
     ENV_NO_BUFFER,
     ENV_REQUEST_TIMEOUT_SECS,
-    ENV_URL,
 ];
 
 /// Converts a wildcard bind address (`0.0.0.0`) into a loopback connect address (`127.0.0.1`).
@@ -54,33 +50,27 @@ pub fn connect_host(bind_host: &str) -> &str {
     }
 }
 
-/// Normalizes a raw gateway URL or endpoint URL into a base `http(s)://host:port` URL without
-/// trailing `/usage` or `/logs` suffixes.
-pub fn normalize_base_url(raw_url: &str) -> String {
-    let trimmed = raw_url.trim().trim_end_matches('/');
-    let with_scheme = if trimmed.starts_with("http://") || trimmed.starts_with("https://") {
-        trimmed.to_string()
-    } else {
-        format!("http://{}", trimmed)
-    };
-
-    with_scheme
-        .strip_suffix("/usage")
-        .or_else(|| with_scheme.strip_suffix("/logs"))
-        .unwrap_or(&with_scheme)
-        .to_string()
-}
-
-/// Normalizes a raw gateway base URL or endpoint URL and appends `/<endpoint_path>`.
-pub fn resolve_endpoint_url(raw_url: &str, endpoint_path: &str) -> String {
-    let base = normalize_base_url(raw_url);
-    let path = endpoint_path.trim_start_matches('/');
-    format!("{}/{}", base, path)
+/// Returns the default configuration file path: `~/.gemini/config/agy-gyro.toml`.
+pub fn default_config_path() -> Option<PathBuf> {
+    std::env::home_dir().map(|home| home.join(".gemini").join("config").join("agy-gyro.toml"))
 }
 
 #[derive(Debug, Clone)]
 pub struct Cli {
+    pub config: Config,
     pub command: Commands,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Commands {
+    /// Start the background agy-gyro daemon (if not already running)
+    Server,
+    /// Run agy CLI wrapped with the local proxy (default mode)
+    Run(Vec<String>),
+    /// Monitor live token usage and cost in a terminal UI dashboard
+    Monitor,
+    /// Stop the running background agy-gyro daemon
+    Stop,
 }
 
 /// Configuration loaded from `~/.gemini/config/agy-gyro.toml`.
@@ -107,11 +97,6 @@ pub struct FileConfig {
     pub no_buffer: Option<bool>,
     #[serde(alias = "request-timeout-secs")]
     pub request_timeout_secs: Option<u64>,
-}
-
-/// Returns the default configuration file path: `~/.gemini/config/agy-gyro.toml`.
-pub fn default_config_path() -> Option<PathBuf> {
-    std::env::home_dir().map(|home| home.join(".gemini").join("config").join("agy-gyro.toml"))
 }
 
 impl FileConfig {
@@ -153,6 +138,103 @@ fn env_bool(name: &str) -> Result<Option<bool>, String> {
             _ => Err(format!("Invalid boolean value '{}' for {}", raw, name)),
         },
         None => Ok(None),
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct Config {
+    /// Host address to bind or connect to the proxy server
+    pub host: String,
+    /// Port to listen on or connect to
+    pub port: u16,
+    /// Upstream Gemini API base URL
+    pub upstream: String,
+    /// Gemini API key for authenticating upstream requests
+    pub api_key: String,
+    /// Executable path or command name for Antigravity CLI
+    pub agy_path: String,
+    /// Optional log file path for agy-gyro proxy tracing logs
+    pub log_file: Option<PathBuf>,
+    /// Maximum retry attempts on retriable errors
+    pub max_retries: u32,
+    /// Initial retry backoff delay in milliseconds
+    pub initial_delay_ms: u64,
+    /// Maximum retry backoff delay in milliseconds
+    pub max_delay_ms: u64,
+    /// Disable jitter in exponential backoff calculation
+    pub no_jitter: bool,
+    /// Disable full stream chunk buffering (stream chunks immediately to client after first chunk)
+    pub no_buffer: bool,
+    /// Client request timeout in seconds (for long thinking / generation requests)
+    pub request_timeout_secs: u64,
+}
+
+impl Default for Config {
+    fn default() -> Self {
+        Self {
+            host: "127.0.0.1".to_string(),
+            port: DEFAULT_PORT,
+            upstream: "https://generativelanguage.googleapis.com".to_string(),
+            api_key: String::new(),
+            agy_path: "agy".to_string(),
+            log_file: None,
+            max_retries: 15,
+            initial_delay_ms: 1000,
+            max_delay_ms: 60000,
+            no_jitter: false,
+            no_buffer: false,
+            request_timeout_secs: 600,
+        }
+    }
+}
+
+impl Config {
+    pub fn is_jitter_enabled(&self) -> bool {
+        !self.no_jitter
+    }
+
+    pub fn is_buffer_enabled(&self) -> bool {
+        !self.no_buffer
+    }
+
+    /// Returns the base HTTP URL (`http://<connect_host>:<port>`) for connecting to the local daemon.
+    pub fn base_url(&self) -> String {
+        format!("http://{}:{}", connect_host(&self.host), self.port)
+    }
+
+    /// Returns the `/usage` SSE endpoint URL for connecting to the local daemon.
+    pub fn usage_url(&self) -> String {
+        format!("{}/usage", self.base_url())
+    }
+
+    /// Returns the `/logs` SSE endpoint URL for connecting to the local daemon.
+    pub fn logs_url(&self) -> String {
+        format!("{}/logs", self.base_url())
+    }
+
+    /// Serializes this [`Config`] into environment variables on a child [`std::process::Command`].
+    pub fn apply_env_to_command(&self, cmd: &mut std::process::Command, port: u16) {
+        cmd.env(ENV_HOST, &self.host)
+            .env(ENV_PORT, port.to_string())
+            .env(ENV_UPSTREAM, &self.upstream)
+            .env(ENV_MAX_RETRIES, self.max_retries.to_string())
+            .env(ENV_INITIAL_DELAY_MS, self.initial_delay_ms.to_string())
+            .env(ENV_MAX_DELAY_MS, self.max_delay_ms.to_string())
+            .env(ENV_NO_JITTER, self.no_jitter.to_string())
+            .env(ENV_NO_BUFFER, self.no_buffer.to_string())
+            .env(
+                ENV_REQUEST_TIMEOUT_SECS,
+                self.request_timeout_secs.to_string(),
+            )
+            .env(ENV_API_KEY, &self.api_key)
+            .env(ENV_GEMINI_API_KEY, &self.api_key);
+
+        if let Some(ref log_file) = self.log_file {
+            cmd.env(ENV_LOG_FILE, log_file);
+        }
+        if !self.agy_path.is_empty() {
+            cmd.env(ENV_AGY_PATH, &self.agy_path);
+        }
     }
 }
 
@@ -200,7 +282,6 @@ impl Cli {
             .or(file_config.port)
             .unwrap_or(DEFAULT_PORT);
         let upstream = env_non_empty(ENV_UPSTREAM)
-            .or_else(|| env_non_empty(ENV_UPSTREAM_URL))
             .or(file_config.upstream)
             .unwrap_or_else(|| "https://generativelanguage.googleapis.com".to_string());
         let max_retries = env_parse::<u32>(ENV_MAX_RETRIES)?
@@ -221,8 +302,8 @@ impl Cli {
         let request_timeout_secs = env_parse::<u64>(ENV_REQUEST_TIMEOUT_SECS)?
             .or(file_config.request_timeout_secs)
             .unwrap_or(600);
-        let api_key = env_non_empty(ENV_GEMINI_API_KEY)
-            .or_else(|| env_non_empty(ENV_API_KEY))
+        let api_key = env_non_empty(ENV_API_KEY)
+            .or_else(|| env_non_empty(ENV_GEMINI_API_KEY))
             .or(file_config.api_key)
             .unwrap_or_default();
         let agy_path = env_non_empty(ENV_AGY_PATH)
@@ -231,10 +312,9 @@ impl Cli {
         let log_file = env_non_empty(ENV_LOG_FILE)
             .map(PathBuf::from)
             .or(file_config.log_file);
-        let url = env_non_empty(ENV_URL);
 
         let config = Config {
-            host: host.clone(),
+            host,
             port,
             upstream,
             max_retries,
@@ -244,155 +324,32 @@ impl Cli {
             no_buffer,
             request_timeout_secs,
             api_key,
+            agy_path,
+            log_file,
         };
 
         let command = match args.first().map(|s| s.as_str()) {
-            Some("server") => Commands::Server(ServerArgs { config, log_file }),
-            Some("monitor") => Commands::Monitor(MonitorArgs { url, host, port }),
-            Some("stop") => Commands::Stop(MonitorArgs { url, host, port }),
+            Some("server") => Commands::Server,
+            Some("monitor") => Commands::Monitor,
+            Some("stop") => Commands::Stop,
             _ => {
                 let agy_args = if args.first().map(|s| s.as_str()) == Some("--") {
                     args[1..].to_vec()
                 } else {
                     args
                 };
-                Commands::Run(WrapperArgs {
-                    config,
-                    agy_path,
-                    log_file,
-                    agy_args,
-                })
+                Commands::Run(agy_args)
             }
         };
 
-        let missing_api_key = match &command {
-            Commands::Server(s) => s.config.api_key.trim().is_empty(),
-            Commands::Run(w) => w.config.api_key.trim().is_empty(),
-            Commands::Monitor(_) | Commands::Stop(_) => false,
-        };
-
-        if missing_api_key {
+        let requires_api_key = matches!(command, Commands::Server | Commands::Run(_));
+        if requires_api_key && config.api_key.trim().is_empty() {
             return Err(
                 "missing Gemini API key: set GEMINI_API_KEY or configure `api_key` in ~/.gemini/config/agy-gyro.toml"
                     .to_string(),
             );
         }
 
-        Ok(Self { command })
-    }
-}
-
-#[derive(Debug, Clone)]
-pub enum Commands {
-    /// Start the background agy-gyro daemon (if not already running)
-    Server(ServerArgs),
-    /// Run agy CLI wrapped with the local proxy (default mode)
-    Run(WrapperArgs),
-    /// Monitor live token usage and cost in a terminal UI dashboard
-    Monitor(MonitorArgs),
-    /// Stop the running background agy-gyro daemon
-    Stop(MonitorArgs),
-}
-
-#[derive(Debug, Clone)]
-pub struct MonitorArgs {
-    /// Target agy-gyro gateway URL or /usage endpoint URL
-    pub url: Option<String>,
-    /// Host address of the local agy-gyro server
-    pub host: String,
-    /// Port of the local agy-gyro server
-    pub port: u16,
-}
-
-impl MonitorArgs {
-    pub fn resolve_base_url(&self) -> String {
-        if let Some(ref u) = self.url {
-            normalize_base_url(u)
-        } else {
-            format!("http://{}:{}", connect_host(&self.host), self.port)
-        }
-    }
-
-    pub fn resolve_endpoint_url(&self) -> String {
-        format!("{}/usage", self.resolve_base_url())
-    }
-}
-
-#[derive(Debug, Clone)]
-pub struct ServerArgs {
-    pub config: Config,
-    /// Optional log file path for agy-gyro proxy tracing logs
-    pub log_file: Option<PathBuf>,
-}
-
-#[derive(Debug, Clone)]
-pub struct WrapperArgs {
-    pub config: Config,
-    /// Executable path or command name for Antigravity CLI
-    pub agy_path: String,
-    /// Optional log file path for agy-gyro proxy tracing logs
-    pub log_file: Option<PathBuf>,
-    /// Raw arguments passed through directly to agy
-    pub agy_args: Vec<String>,
-}
-
-#[derive(Debug, Clone)]
-pub struct Config {
-    /// Host address to bind the proxy server to
-    pub host: String,
-    /// Port to listen on
-    pub port: u16,
-    /// Upstream Gemini API base URL
-    pub upstream: String,
-    /// Maximum retry attempts on retriable errors
-    pub max_retries: u32,
-    /// Initial retry backoff delay in milliseconds
-    pub initial_delay_ms: u64,
-    /// Maximum retry backoff delay in milliseconds
-    pub max_delay_ms: u64,
-    /// Disable jitter in exponential backoff calculation
-    pub no_jitter: bool,
-    /// Disable full stream chunk buffering (stream chunks immediately to client after first chunk)
-    pub no_buffer: bool,
-    /// Client request timeout in seconds (for long thinking / generation requests)
-    pub request_timeout_secs: u64,
-    /// Gemini API key for authenticating upstream requests
-    pub api_key: String,
-}
-
-impl Config {
-    pub fn is_jitter_enabled(&self) -> bool {
-        !self.no_jitter
-    }
-
-    pub fn is_buffer_enabled(&self) -> bool {
-        !self.no_buffer
-    }
-
-    /// Serializes this [`Config`] into environment variables on a child [`std::process::Command`].
-    pub fn apply_env_to_command(
-        &self,
-        cmd: &mut std::process::Command,
-        port: u16,
-        log_file: Option<&Path>,
-    ) {
-        cmd.env(ENV_HOST, &self.host)
-            .env(ENV_PORT, port.to_string())
-            .env(ENV_UPSTREAM, &self.upstream)
-            .env(ENV_UPSTREAM_URL, &self.upstream)
-            .env(ENV_MAX_RETRIES, self.max_retries.to_string())
-            .env(ENV_INITIAL_DELAY_MS, self.initial_delay_ms.to_string())
-            .env(ENV_MAX_DELAY_MS, self.max_delay_ms.to_string())
-            .env(ENV_NO_JITTER, self.no_jitter.to_string())
-            .env(ENV_NO_BUFFER, self.no_buffer.to_string())
-            .env(
-                ENV_REQUEST_TIMEOUT_SECS,
-                self.request_timeout_secs.to_string(),
-            )
-            .env(ENV_GEMINI_API_KEY, &self.api_key);
-
-        if let Some(log_file) = log_file {
-            cmd.env(ENV_LOG_FILE, log_file);
-        }
+        Ok(Self { config, command })
     }
 }

@@ -43,6 +43,7 @@ async fn spawn_test_proxy_with_keep_alive(
         no_buffer,
         request_timeout_secs: 10,
         api_key: "test-key-123".to_string(),
+        ..Config::default()
     };
 
     let client = build_http_client(&config).unwrap();
@@ -276,11 +277,9 @@ fn test_cli_parse_server_command() {
     let cli = Cli::try_parse_with_config_from(["agy-gyro", "server"], Some(&temp_path)).unwrap();
     let _ = std::fs::remove_file(&temp_path);
 
-    let Commands::Server(server_args) = cli.command else {
-        panic!("expected Server command");
-    };
-    assert_eq!(server_args.config.port, 9090);
-    assert_eq!(server_args.config.api_key, "test-key");
+    assert_eq!(cli.command, Commands::Server);
+    assert_eq!(cli.config.port, 9090);
+    assert_eq!(cli.config.api_key, "test-key");
 }
 
 #[test]
@@ -304,19 +303,16 @@ fn test_cli_parse_wrapper_default_and_passthrough() {
     .unwrap();
     let _ = std::fs::remove_file(&temp_path);
 
-    let Commands::Run(wrapper_args) = cli.command else {
+    let Commands::Run(agy_args) = cli.command else {
         panic!("expected Run command");
     };
-    assert_eq!(wrapper_args.config.port, 6470);
-    assert_eq!(wrapper_args.config.api_key, "test-key");
+    assert_eq!(cli.config.port, 6470);
+    assert_eq!(cli.config.api_key, "test-key");
     assert_eq!(
-        wrapper_args.log_file.as_deref().unwrap().to_str().unwrap(),
+        cli.config.log_file.as_deref().unwrap().to_str().unwrap(),
         "/tmp/test.log"
     );
-    assert_eq!(
-        wrapper_args.agy_args,
-        vec!["--model", "gemini-2.5-pro", "--hub"]
-    );
+    assert_eq!(agy_args, vec!["--model", "gemini-2.5-pro", "--hub"]);
 }
 
 #[tokio::test]
@@ -523,11 +519,22 @@ async fn test_run_wrapper_executes_child_and_propagates_exit_code() {
         .port()
         .expect("proxy port");
 
+    let temp_home =
+        std::env::temp_dir().join(format!("agy-gyro-wrapper-home-{}", std::process::id()));
+    let config_dir = temp_home.join(".gemini").join("config");
+    std::fs::create_dir_all(&config_dir).unwrap();
+    std::fs::write(
+        config_dir.join("agy-gyro.toml"),
+        format!(
+            "host = \"127.0.0.1\"\nport = {}\napi_key = \"test-gemini-key\"\nagy_path = \"sh\"\n",
+            port
+        ),
+    )
+    .unwrap();
+
     let status = tokio::process::Command::new(env!("CARGO_BIN_EXE_agy-gyro"))
-        .env("AGY_GYRO_HOST", "127.0.0.1")
-        .env("AGY_GYRO_PORT", port.to_string())
-        .env("GEMINI_API_KEY", "test-gemini-key")
-        .env("AGY_GYRO_AGY_PATH", "sh")
+        .env("HOME", &temp_home)
+        .env("USERPROFILE", &temp_home)
         .args([
             "-c",
             r#"
@@ -543,6 +550,7 @@ async fn test_run_wrapper_executes_child_and_propagates_exit_code() {
         .await
         .unwrap();
 
+    let _ = std::fs::remove_dir_all(&temp_home);
     assert_eq!(status.code(), Some(42));
 
     // OS-level process monitor detects that the replaced `sh` process ($$) has exited
@@ -607,6 +615,7 @@ async fn test_resolve_gateway_models_fetches_and_expands_models() {
         no_buffer: false,
         request_timeout_secs: 10,
         api_key: "my-gemini-api-key".to_string(),
+        ..Config::default()
     };
 
     let client = Client::new();
@@ -660,7 +669,7 @@ async fn test_gateway_bearer_auth_translated_to_x_goog_api_key() {
 }
 
 #[test]
-fn test_cli_parse_env_vars_and_toml_config() {
+fn test_cli_parse_toml_config() {
     use agy_gyro::config::{Cli, Commands, default_config_path};
     let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     clear_test_env_vars();
@@ -671,7 +680,7 @@ fn test_cli_parse_env_vars_and_toml_config() {
     let temp_path = std::env::temp_dir().join(format!("agy-gyro-test-{}.toml", std::process::id()));
     let _ = std::fs::remove_file(&temp_path);
 
-    // Missing config file is ignored; fails if api_key is not provided anywhere
+    // Missing config file uses defaults; fails if api_key is not configured
     assert!(Cli::try_parse_with_config_from(["agy-gyro"], Some(&temp_path)).is_err());
     assert!(Cli::try_parse_with_config_from(["agy-gyro", "server"], Some(&temp_path)).is_err());
 
@@ -695,42 +704,35 @@ request_timeout_secs = 120
     )
     .unwrap();
 
-    // 1. Config loaded purely from TOML file (wrapper mode)
+    // 1. Config loaded from TOML file (wrapper mode)
     let cli = Cli::try_parse_with_config_from(["agy-gyro"], Some(&temp_path)).unwrap();
-    let Commands::Run(wrapper_args) = cli.command else {
-        panic!("expected Run command");
-    };
-    assert_eq!(wrapper_args.config.host, "192.168.1.10");
-    assert_eq!(wrapper_args.config.port, 7070);
+    assert_eq!(cli.command, Commands::Run(Vec::new()));
+    assert_eq!(cli.config.host, "192.168.1.10");
+    assert_eq!(cli.config.port, 7070);
+    assert_eq!(cli.config.upstream, "https://custom.googleapis.com");
+    assert_eq!(cli.config.api_key, "toml-gemini-key");
+    assert_eq!(cli.config.agy_path, "/toml/agy");
     assert_eq!(
-        wrapper_args.config.upstream,
-        "https://custom.googleapis.com"
-    );
-    assert_eq!(wrapper_args.config.api_key, "toml-gemini-key");
-    assert_eq!(wrapper_args.agy_path, "/toml/agy");
-    assert_eq!(
-        wrapper_args.log_file.as_deref().unwrap().to_str().unwrap(),
+        cli.config.log_file.as_deref().unwrap().to_str().unwrap(),
         "/tmp/toml.log"
     );
-    assert_eq!(wrapper_args.config.max_retries, 25);
-    assert_eq!(wrapper_args.config.initial_delay_ms, 500);
-    assert_eq!(wrapper_args.config.max_delay_ms, 30000);
-    assert!(wrapper_args.config.no_jitter);
-    assert!(wrapper_args.config.no_buffer);
-    assert_eq!(wrapper_args.config.request_timeout_secs, 120);
+    assert_eq!(cli.config.max_retries, 25);
+    assert_eq!(cli.config.initial_delay_ms, 500);
+    assert_eq!(cli.config.max_delay_ms, 30000);
+    assert!(cli.config.no_jitter);
+    assert!(cli.config.no_buffer);
+    assert!(!cli.config.is_buffer_enabled());
+    assert_eq!(cli.config.request_timeout_secs, 120);
 
     // 2. Config loaded from TOML file in server mode
     let cli_server =
         Cli::try_parse_with_config_from(["agy-gyro", "server"], Some(&temp_path)).unwrap();
-    if let Commands::Server(server_args) = cli_server.command {
-        assert_eq!(server_args.config.api_key, "toml-gemini-key");
-        assert_eq!(server_args.config.port, 7070);
-        assert_eq!(server_args.config.max_retries, 25);
-    } else {
-        panic!("expected server command");
-    }
+    assert_eq!(cli_server.command, Commands::Server);
+    assert_eq!(cli_server.config.api_key, "toml-gemini-key");
+    assert_eq!(cli_server.config.port, 7070);
+    assert_eq!(cli_server.config.max_retries, 25);
 
-    // 3. Precedence: Env > TOML > Default
+    // 3. Precedence: Environment variables override TOML
     unsafe {
         std::env::set_var("AGY_GYRO_MAX_RETRIES", "42");
         std::env::set_var("AGY_GYRO_HOST", "10.0.0.1");
@@ -739,30 +741,18 @@ request_timeout_secs = 120
         std::env::set_var("GEMINI_API_KEY", "env-gemini-key-123");
     }
 
-    let cli = Cli::try_parse_with_config_from(["agy-gyro"], Some(&temp_path)).unwrap();
+    let cli_env = Cli::try_parse_with_config_from(["agy-gyro"], Some(&temp_path)).unwrap();
+    clear_test_env_vars();
 
-    // Clean up env vars immediately so subsequent assertions are not affected by env state
-    unsafe {
-        std::env::remove_var("AGY_GYRO_MAX_RETRIES");
-        std::env::remove_var("AGY_GYRO_HOST");
-        std::env::remove_var("AGY_GYRO_AGY_PATH");
-        std::env::remove_var("AGY_GYRO_NO_BUFFER");
-        std::env::remove_var("GEMINI_API_KEY");
-    }
-
-    // Env overrides TOML
-    let Commands::Run(wrapper_args) = cli.command else {
-        panic!("expected Run command");
-    };
-    assert_eq!(wrapper_args.config.host, "10.0.0.1");
-    assert_eq!(wrapper_args.config.max_retries, 42);
-    assert_eq!(wrapper_args.agy_path, "/custom/agy");
-    assert!(!wrapper_args.config.no_buffer);
-    assert!(wrapper_args.config.is_buffer_enabled());
-    assert_eq!(wrapper_args.config.api_key, "env-gemini-key-123");
+    assert_eq!(cli_env.config.host, "10.0.0.1");
+    assert_eq!(cli_env.config.max_retries, 42);
+    assert_eq!(cli_env.config.agy_path, "/custom/agy");
+    assert!(!cli_env.config.no_buffer);
+    assert!(cli_env.config.is_buffer_enabled());
+    assert_eq!(cli_env.config.api_key, "env-gemini-key-123");
     // TOML still applies for fields not set via Env
-    assert_eq!(wrapper_args.config.port, 7070);
-    assert_eq!(wrapper_args.config.initial_delay_ms, 500);
+    assert_eq!(cli_env.config.port, 7070);
+    assert_eq!(cli_env.config.initial_delay_ms, 500);
 
     // 4. Unknown TOML keys are ignored
     std::fs::write(
@@ -771,10 +761,8 @@ request_timeout_secs = 120
     )
     .unwrap();
     let cli = Cli::try_parse_with_config_from(["agy-gyro"], Some(&temp_path)).unwrap();
-    let Commands::Run(wrapper_args) = cli.command else {
-        panic!("expected Run command");
-    };
-    assert_eq!(wrapper_args.config.api_key, "toml-gemini-key");
+    assert_eq!(cli.command, Commands::Run(Vec::new()));
+    assert_eq!(cli.config.api_key, "toml-gemini-key");
 
     // 5. Invalid TOML syntax returns an error
     std::fs::write(&temp_path, "invalid = [\n").unwrap();
@@ -1234,38 +1222,25 @@ fn test_cli_parse_monitor_subcommand_without_api_key() {
     clear_test_env_vars();
 
     let cli_default = Cli::try_parse_with_config_from(["agy-gyro", "monitor"], None).unwrap();
-    match cli_default.command {
-        Commands::Monitor(args) => {
-            assert_eq!(args.port, 6470);
-            assert_eq!(args.resolve_endpoint_url(), "http://127.0.0.1:6470/usage");
-        }
-        _ => panic!("expected Monitor command"),
-    }
+    assert_eq!(cli_default.command, Commands::Monitor);
+    assert_eq!(cli_default.config.port, 6470);
+    assert_eq!(cli_default.config.usage_url(), "http://127.0.0.1:6470/usage");
 
     let temp_path =
         std::env::temp_dir().join(format!("agy-gyro-monitor-test-{}.toml", std::process::id()));
     std::fs::write(&temp_path, "port = 9090\n").unwrap();
 
     let cli = Cli::try_parse_with_config_from(["agy-gyro", "monitor"], Some(&temp_path)).unwrap();
-
-    match cli.command {
-        Commands::Monitor(args) => {
-            assert_eq!(args.port, 9090);
-            assert_eq!(args.resolve_endpoint_url(), "http://127.0.0.1:9090/usage");
-        }
-        _ => panic!("expected Monitor command"),
-    }
+    assert_eq!(cli.command, Commands::Monitor);
+    assert_eq!(cli.config.port, 9090);
+    assert_eq!(cli.config.usage_url(), "http://127.0.0.1:9090/usage");
 
     let cli_stop = Cli::try_parse_with_config_from(["agy-gyro", "stop"], Some(&temp_path)).unwrap();
     let _ = std::fs::remove_file(&temp_path);
 
-    match cli_stop.command {
-        Commands::Stop(args) => {
-            assert_eq!(args.port, 9090);
-            assert_eq!(args.resolve_base_url(), "http://127.0.0.1:9090");
-        }
-        _ => panic!("expected Stop command"),
-    }
+    assert_eq!(cli_stop.command, Commands::Stop);
+    assert_eq!(cli_stop.config.port, 9090);
+    assert_eq!(cli_stop.config.base_url(), "http://127.0.0.1:9090");
 }
 
 #[tokio::test]
@@ -1428,16 +1403,26 @@ async fn test_server_and_stop_subcommands_spawn_and_stop_background_daemon() {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         listener.local_addr().unwrap().port()
     };
-    let port_str = free_port.to_string();
+
+    let temp_home =
+        std::env::temp_dir().join(format!("agy-gyro-daemon-home-{}", std::process::id()));
+    let config_dir = temp_home.join(".gemini").join("config");
+    std::fs::create_dir_all(&config_dir).unwrap();
+    std::fs::write(
+        config_dir.join("agy-gyro.toml"),
+        format!(
+            "host = \"127.0.0.1\"\nport = {}\nupstream = \"{}\"\napi_key = \"test-gemini-key\"\n",
+            free_port,
+            mock_server.uri()
+        ),
+    )
+    .unwrap();
 
     // 1. `agy-gyro server` spawns background daemon and returns immediately without blocking
     let out1 = tokio::process::Command::new(env!("CARGO_BIN_EXE_agy-gyro"))
         .arg("server")
-        .env("AGY_GYRO_HOST", "127.0.0.1")
-        .env("AGY_GYRO_PORT", &port_str)
-        .env("AGY_GYRO_UPSTREAM_URL", mock_server.uri())
-        .env("GEMINI_API_KEY", "test-gemini-key")
-        .env("AGY_LLM_GATEWAY_MODELS", "gemini-4-argon-high")
+        .env("HOME", &temp_home)
+        .env("USERPROFILE", &temp_home)
         .output()
         .await
         .unwrap();
@@ -1448,10 +1433,8 @@ async fn test_server_and_stop_subcommands_spawn_and_stop_background_daemon() {
     // 2. Second `agy-gyro server` on the same port detects existing daemon and returns immediately
     let out2 = tokio::process::Command::new(env!("CARGO_BIN_EXE_agy-gyro"))
         .arg("server")
-        .env("AGY_GYRO_HOST", "127.0.0.1")
-        .env("AGY_GYRO_PORT", &port_str)
-        .env("AGY_GYRO_UPSTREAM_URL", mock_server.uri())
-        .env("GEMINI_API_KEY", "test-gemini-key")
+        .env("HOME", &temp_home)
+        .env("USERPROFILE", &temp_home)
         .output()
         .await
         .unwrap();
@@ -1462,11 +1445,12 @@ async fn test_server_and_stop_subcommands_spawn_and_stop_background_daemon() {
     // 3. `agy-gyro stop` stops the background daemon and waits for port release
     let out_stop = tokio::process::Command::new(env!("CARGO_BIN_EXE_agy-gyro"))
         .arg("stop")
-        .env("AGY_GYRO_HOST", "127.0.0.1")
-        .env("AGY_GYRO_PORT", &port_str)
+        .env("HOME", &temp_home)
+        .env("USERPROFILE", &temp_home)
         .output()
         .await
         .unwrap();
+    let _ = std::fs::remove_dir_all(&temp_home);
     assert!(out_stop.status.success());
     let stdout_stop = String::from_utf8_lossy(&out_stop.stdout);
     assert!(stdout_stop.contains("Stopped agy-gyro daemon"));

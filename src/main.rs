@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: MIT
 
-use agy_gyro::config::{Cli, Commands, ServerArgs};
+use agy_gyro::config::{Cli, Commands, Config};
 use agy_gyro::proxy::{ProxyState, create_router};
 use agy_gyro::runner::{run_wrapper, start_daemon, stop_daemon};
 use agy_gyro::tui::run_monitor;
@@ -17,33 +17,33 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::load();
 
     match cli.command {
-        Commands::Server(server_args) => {
+        Commands::Server => {
             if std::env::var_os("AGY_GYRO_DAEMON_WORKER").is_some() {
                 let rt = tokio::runtime::Builder::new_multi_thread()
                     .enable_all()
                     .build()?;
-                rt.block_on(run_server(server_args))
+                rt.block_on(run_server(cli.config))
             } else {
                 let rt = tokio::runtime::Builder::new_current_thread()
                     .enable_all()
                     .build()?;
-                rt.block_on(start_daemon(server_args))
+                rt.block_on(start_daemon(cli.config))
             }
         }
-        Commands::Monitor(monitor_args) => {
+        Commands::Monitor => {
             let rt = tokio::runtime::Builder::new_multi_thread()
                 .enable_all()
                 .build()?;
-            rt.block_on(run_monitor(monitor_args))
+            rt.block_on(run_monitor(cli.config))
         }
-        Commands::Stop(stop_args) => {
+        Commands::Stop => {
             let rt = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
                 .build()?;
-            rt.block_on(stop_daemon(stop_args))
+            rt.block_on(stop_daemon(cli.config))
         }
-        Commands::Run(wrapper_args) => {
-            let code = run_wrapper(wrapper_args)?;
+        Commands::Run(agy_args) => {
+            let code = run_wrapper(cli.config, agy_args)?;
             std::process::exit(code);
         }
     }
@@ -79,10 +79,8 @@ fn init_server_tracing(log_file: Option<&Path>) -> Result<(), Box<dyn std::error
     Ok(())
 }
 
-async fn run_server(server_args: ServerArgs) -> Result<(), Box<dyn std::error::Error>> {
-    init_server_tracing(server_args.log_file.as_deref())?;
-
-    let config = server_args.config;
+async fn run_server(config: Config) -> Result<(), Box<dyn std::error::Error>> {
+    init_server_tracing(config.log_file.as_deref())?;
 
     let addr = format!("{}:{}", config.host, config.port);
     let listener = tokio::net::TcpListener::bind(&addr).await?;
@@ -101,20 +99,10 @@ async fn run_server(server_args: ServerArgs) -> Result<(), Box<dyn std::error::E
         config.is_jitter_enabled()
     );
 
-    let env_models = std::env::var("AGY_LLM_GATEWAY_MODELS")
-        .ok()
-        .filter(|s| !s.trim().is_empty());
-
-    let (gateway_models, pricing) = match env_models {
-        Some(models) => {
-            let pricing = fetch_model_pricing(&client, DEFAULT_PRICING_URL).await;
-            (models, pricing)
-        }
-        None => tokio::join!(
-            agy_gyro::proxy::resolve_gateway_models(&client, &config),
-            fetch_model_pricing(&client, DEFAULT_PRICING_URL)
-        ),
-    };
+    let (gateway_models, pricing) = tokio::join!(
+        agy_gyro::proxy::resolve_gateway_models(&client, &config),
+        fetch_model_pricing(&client, DEFAULT_PRICING_URL)
+    );
     state.set_gateway_models(gateway_models);
     state.usage.set_pricing(pricing);
 
