@@ -10,9 +10,9 @@ use crate::retry::{
     parse_retry_after,
 };
 use crate::usage::{
-    PricingTable, SessionMeta, StreamUsageExtractor, UsageLogLayer, UsageSnapshot, UsageTracker,
-    extract_model_from_path, extract_session_from_headers, extract_usage_from_chunks,
-    format_session_api_key,
+    ActiveRequestGuard, PricingTable, RawUsageMetadata, SessionMeta, StreamUsageExtractor,
+    UsageLogLayer, UsageSnapshot, UsageTracker, extract_model_from_path,
+    extract_session_from_headers, extract_usage_from_chunks, format_session_api_key,
 };
 use axum::{
     Json, Router,
@@ -29,7 +29,7 @@ use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
-use tracing::{debug, error, info, warn};
+use tracing::{Instrument, debug, error, info, info_span, warn};
 
 /// Default interval before committing early 200 OK headers and between keep-alive heartbeats.
 /// Set to 15 seconds to stay well below agy's 60-second ResponseHeaderTimeout.
@@ -319,6 +319,16 @@ fn is_hop_by_hop(header_name: &HeaderName) -> bool {
     )
 }
 
+fn copy_forwarded_response_headers(src: &HeaderMap) -> HeaderMap {
+    let mut dst = HeaderMap::new();
+    for (name, val) in src {
+        if !is_hop_by_hop(name) {
+            dst.append(name.clone(), val.clone());
+        }
+    }
+    dst
+}
+
 fn is_sse_request(path_and_query: &str, headers: &HeaderMap) -> bool {
     path_and_query.contains(":streamGenerateContent")
         || path_and_query.contains("alt=sse")
@@ -403,7 +413,7 @@ impl UpstreamOutcome {
         }
     }
 
-    fn into_fast_response(self, session_id_str: &str, session_prefix: &str) -> Response {
+    fn into_fast_response(self, session_prefix: &str) -> Response {
         let mut client_res_builder = Response::builder().status(self.status.as_u16());
         for (name, val) in &self.headers {
             if !is_hop_by_hop(name) {
@@ -425,11 +435,7 @@ impl UpstreamOutcome {
         match client_res_builder.body(body) {
             Ok(res) => res,
             Err(err) => {
-                error!(
-                    session_id = %session_id_str,
-                    "{}Failed to build proxy response: {}",
-                    session_prefix, err
-                );
+                error!("{}Failed to build proxy response: {}", session_prefix, err);
                 (
                     StatusCode::INTERNAL_SERVER_ERROR,
                     format!("Failed to build proxy response: {}", err),
@@ -481,6 +487,584 @@ impl UpstreamOutcome {
     }
 }
 
+fn format_endpoint(url: &reqwest::Url) -> String {
+    match url.query() {
+        Some(q) => format!("{}?{}", url.path(), q),
+        None => url.path().to_string(),
+    }
+}
+
+struct RequestContext {
+    state: Arc<ProxyState>,
+    method: Method,
+    target_url: reqwest::Url,
+    endpoint: String,
+    headers: HeaderMap,
+    body: Bytes,
+    session: Option<SessionMeta>,
+    session_prefix: String,
+    model_from_path: Option<String>,
+    req_start: Instant,
+    active_guard: Option<ActiveRequestGuard>,
+}
+
+enum AttemptOutcome {
+    Ready(UpstreamOutcome),
+    Retry(Duration),
+}
+
+impl RequestContext {
+    fn new(
+        state: Arc<ProxyState>,
+        method: Method,
+        target_url: reqwest::Url,
+        headers: HeaderMap,
+        body: Bytes,
+        session: Option<SessionMeta>,
+    ) -> Self {
+        let req_start = Instant::now();
+        let endpoint = format_endpoint(&target_url);
+        let session_prefix = session
+            .as_ref()
+            .map(SessionMeta::log_prefix)
+            .unwrap_or_default();
+        let model_from_path = extract_model_from_path(target_url.path());
+        let active_guard = model_from_path
+            .as_ref()
+            .map(|_| state.usage.begin_session_request(session.as_ref()));
+
+        Self {
+            state,
+            method,
+            target_url,
+            endpoint,
+            headers,
+            body,
+            session,
+            session_prefix,
+            model_from_path,
+            req_start,
+            active_guard,
+        }
+    }
+
+    fn max_retries(&self) -> u32 {
+        self.state.config.max_retries
+    }
+
+    fn calculate_retry_delay(&self, attempt: u32, retry_after: Option<Duration>) -> Duration {
+        calculate_backoff(
+            attempt,
+            Duration::from_millis(self.state.config.initial_delay_ms),
+            Duration::from_millis(self.state.config.max_delay_ms),
+            self.state.config.is_jitter_enabled(),
+            retry_after,
+        )
+    }
+
+    fn record_retry(&self) {
+        if self.model_from_path.is_some() {
+            self.state.usage.record_session_retry(self.session.as_ref());
+        }
+    }
+
+    fn build_upstream_request(&self) -> reqwest::RequestBuilder {
+        let mut req_builder = self
+            .state
+            .client
+            .request(self.method.clone(), self.target_url.clone());
+
+        // Forward headers, stripping hop-by-hop, accept-encoding (handled by reqwest gzip), and gateway Authorization header
+        for (header_name, header_val) in &self.headers {
+            if !is_hop_by_hop(header_name)
+                && header_name != axum::http::header::ACCEPT_ENCODING
+                && header_name != axum::http::header::AUTHORIZATION
+                && header_name.as_str() != "x-goog-api-key"
+            {
+                req_builder = req_builder.header(header_name, header_val);
+            }
+        }
+
+        req_builder
+            .header("x-goog-api-key", self.state.config.api_key.trim())
+            .body(self.body.clone())
+    }
+
+    fn finish_completed(
+        &mut self,
+        effective_model: Option<&str>,
+        status: u16,
+        attempt: u32,
+        raw_usage: Option<&RawUsageMetadata>,
+    ) {
+        drop(self.active_guard.take());
+        if let Some(ref req_model) = self.model_from_path {
+            self.state.usage.record_session_completed_request(
+                self.session.as_ref(),
+                effective_model.unwrap_or(req_model),
+                status,
+                attempt,
+                self.req_start.elapsed(),
+                raw_usage,
+            );
+        }
+    }
+
+    fn fail_bad_gateway(&mut self, attempt: u32, msg: String) -> UpstreamOutcome {
+        self.finish_completed(None, StatusCode::BAD_GATEWAY.as_u16(), attempt, None);
+        UpstreamOutcome::bad_gateway(msg)
+    }
+}
+
+async fn read_error_snippet(res: &mut reqwest::Response) -> String {
+    let mut snippet = String::new();
+    if let Ok(Some(chunk)) = res.chunk().await {
+        let bytes = &chunk[..chunk.len().min(200)];
+        snippet = String::from_utf8_lossy(bytes).trim().to_string();
+        if chunk.len() > 200 {
+            snippet.push_str("...");
+        }
+    }
+    snippet
+}
+
+async fn collect_buffered_response(
+    ctx: &mut RequestContext,
+    status: StatusCode,
+    res_headers: HeaderMap,
+    upstream_res: reqwest::Response,
+    is_sse: bool,
+    attempt: u32,
+) -> AttemptOutcome {
+    let max_retries = ctx.max_retries();
+    let mut stream = upstream_res.bytes_stream();
+    let mut buffered_chunks: Vec<Bytes> = Vec::new();
+    let mut total_buffered_bytes: usize = 0;
+    let mut stream_error = None;
+    let mut in_stream_err_details = None;
+    let mut chunk_index = 0;
+
+    while let Some(chunk_res) = stream.next().await {
+        match chunk_res {
+            Ok(chunk) => {
+                if status.is_success()
+                    && let Some((in_stream_status, err_msg)) =
+                        parse_in_stream_error(&chunk).filter(|(s, _)| is_retriable_status(*s))
+                {
+                    in_stream_err_details = Some((chunk_index, in_stream_status, err_msg));
+                    buffered_chunks.clear();
+                    buffered_chunks.push(chunk);
+                    break;
+                }
+                total_buffered_bytes += chunk.len();
+                if is_sse {
+                    debug!(
+                        "{}Buffered SSE chunk #{} ({} bytes, {} bytes total) for {} {}",
+                        ctx.session_prefix,
+                        chunk_index + 1,
+                        chunk.len(),
+                        total_buffered_bytes,
+                        ctx.method,
+                        ctx.endpoint
+                    );
+                }
+                buffered_chunks.push(chunk);
+                chunk_index += 1;
+            }
+            Err(err) => {
+                stream_error = Some((chunk_index, err));
+                break;
+            }
+        }
+    }
+
+    if let Some((chunk_idx, in_stream_status, ref err_msg)) = in_stream_err_details {
+        if attempt < max_retries {
+            let delay = ctx.calculate_retry_delay(attempt, None);
+            warn!(
+                "{}Upstream returned in-stream retriable error {} ({}) at chunk #{} for {} {}. Retrying in {:?} (attempt {}/{})...",
+                ctx.session_prefix,
+                in_stream_status,
+                err_msg,
+                chunk_idx + 1,
+                ctx.method,
+                ctx.endpoint,
+                delay,
+                attempt + 1,
+                max_retries
+            );
+            return AttemptOutcome::Retry(delay);
+        }
+        warn!(
+            "{}Max retries ({}) reached for in-stream error {}. Forwarding buffered stream to client.",
+            ctx.session_prefix, max_retries, in_stream_status
+        );
+    } else if let Some((chunk_idx, err)) = stream_error {
+        if is_retriable_error(&err) && attempt < max_retries {
+            let delay = ctx.calculate_retry_delay(attempt, None);
+            warn!(
+                "{}Upstream stream error at chunk #{} for {} {}: {}. Retrying in {:?} (attempt {}/{})...",
+                ctx.session_prefix,
+                chunk_idx + 1,
+                ctx.method,
+                ctx.endpoint,
+                err,
+                delay,
+                attempt + 1,
+                max_retries
+            );
+            return AttemptOutcome::Retry(delay);
+        }
+        error!(
+            "{}Upstream error reading stream at chunk #{} for {} {}: {}",
+            ctx.session_prefix,
+            chunk_idx + 1,
+            ctx.method,
+            ctx.endpoint,
+            err
+        );
+        return AttemptOutcome::Ready(ctx.fail_bad_gateway(
+            attempt,
+            format!("Bad Gateway: upstream stream read failed: {}", err),
+        ));
+    }
+
+    let (raw_usage, resp_model) = if ctx.model_from_path.is_some() {
+        extract_usage_from_chunks(&buffered_chunks)
+    } else {
+        (None, None)
+    };
+    let effective_status = if let Some((_, in_stream_status, _)) = in_stream_err_details {
+        in_stream_status.as_u16()
+    } else {
+        status.as_u16()
+    };
+    ctx.finish_completed(
+        resp_model.as_deref(),
+        effective_status,
+        attempt,
+        raw_usage.as_ref(),
+    );
+
+    AttemptOutcome::Ready(UpstreamOutcome {
+        status,
+        headers: res_headers,
+        body: UpstreamBody::Buffered(buffered_chunks),
+    })
+}
+
+struct PassthroughStreamState {
+    stream: BoxByteStream,
+    extractor: StreamUsageExtractor,
+    active_guard: Option<ActiveRequestGuard>,
+    tracker: Arc<UsageTracker>,
+    req_model: String,
+    session: Option<SessionMeta>,
+    session_prefix: String,
+    method: Method,
+    endpoint: String,
+    req_start: Instant,
+    retries_used: u32,
+    effective_status: u16,
+    chunk_idx: usize,
+    is_sse: bool,
+    span: tracing::Span,
+}
+
+impl PassthroughStreamState {
+    fn record_completion(&mut self, final_status: u16) {
+        if self.active_guard.take().is_some() {
+            let raw_usage = self.extractor.finish(None);
+            let effective_model = self
+                .extractor
+                .model_version
+                .as_deref()
+                .unwrap_or(&self.req_model);
+            let _enter = self.span.enter();
+            self.tracker.record_session_completed_request(
+                self.session.as_ref(),
+                effective_model,
+                final_status,
+                self.retries_used,
+                self.req_start.elapsed(),
+                raw_usage.as_ref(),
+            );
+        }
+    }
+}
+
+async fn prepare_passthrough_response(
+    ctx: &mut RequestContext,
+    status: StatusCode,
+    res_headers: HeaderMap,
+    upstream_res: reqwest::Response,
+    is_sse: bool,
+    attempt: u32,
+) -> AttemptOutcome {
+    let max_retries = ctx.max_retries();
+    let mut stream = upstream_res.bytes_stream();
+
+    // Peek at the initial stream chunk to catch in-stream 503 / 429 errors early
+    match stream.next().await {
+        Some(Ok(first_chunk)) => {
+            if status.is_success()
+                && let Some((in_stream_status, err_msg)) =
+                    parse_in_stream_error(&first_chunk).filter(|(s, _)| is_retriable_status(*s))
+            {
+                if attempt < max_retries {
+                    let delay = ctx.calculate_retry_delay(attempt, None);
+                    warn!(
+                        "{}Upstream returned in-stream retriable error {} ({}) for {} {}. Retrying in {:?} (attempt {}/{})...",
+                        ctx.session_prefix,
+                        in_stream_status,
+                        err_msg,
+                        ctx.method,
+                        ctx.endpoint,
+                        delay,
+                        attempt + 1,
+                        max_retries
+                    );
+                    return AttemptOutcome::Retry(delay);
+                }
+                warn!(
+                    "{}Max retries ({}) reached for in-stream error {}. Forwarding stream to client.",
+                    ctx.session_prefix, max_retries, in_stream_status
+                );
+            }
+
+            let full_stream =
+                futures_util::stream::once(async move { Ok::<_, std::io::Error>(first_chunk) })
+                    .chain(stream.map(|res| res.map_err(std::io::Error::other)));
+
+            let passthrough_stream: BoxByteStream = if let Some(req_model) =
+                ctx.model_from_path.clone()
+            {
+                let st = PassthroughStreamState {
+                    stream: Box::pin(full_stream),
+                    extractor: StreamUsageExtractor::new(),
+                    active_guard: ctx.active_guard.take(),
+                    tracker: ctx.state.usage.clone(),
+                    req_model,
+                    session: ctx.session.clone(),
+                    session_prefix: ctx.session_prefix.clone(),
+                    method: ctx.method.clone(),
+                    endpoint: ctx.endpoint.clone(),
+                    req_start: ctx.req_start,
+                    retries_used: attempt,
+                    effective_status: status.as_u16(),
+                    chunk_idx: 0,
+                    is_sse,
+                    span: tracing::Span::current(),
+                };
+
+                Box::pin(futures_util::stream::unfold(st, |mut st| async move {
+                    match st.stream.next().await {
+                        Some(Ok(chunk)) => {
+                            st.chunk_idx += 1;
+                            if st.is_sse {
+                                let _enter = st.span.enter();
+                                debug!(
+                                    "{}Received SSE chunk #{} ({} bytes) for {} {}",
+                                    st.session_prefix,
+                                    st.chunk_idx,
+                                    chunk.len(),
+                                    st.method,
+                                    st.endpoint
+                                );
+                            }
+                            if (200..300).contains(&st.effective_status)
+                                && let Some((in_stream_status, _)) = parse_in_stream_error(&chunk)
+                            {
+                                st.effective_status = in_stream_status.as_u16();
+                            }
+                            st.extractor.feed_chunk(&chunk);
+                            Some((Ok(chunk), st))
+                        }
+                        Some(Err(err)) => {
+                            st.record_completion(StatusCode::BAD_GATEWAY.as_u16());
+                            Some((Err(err), st))
+                        }
+                        None => {
+                            let final_status = st.effective_status;
+                            st.record_completion(final_status);
+                            None
+                        }
+                    }
+                }))
+            } else {
+                Box::pin(full_stream)
+            };
+
+            AttemptOutcome::Ready(UpstreamOutcome {
+                status,
+                headers: res_headers,
+                body: UpstreamBody::Passthrough(passthrough_stream),
+            })
+        }
+        Some(Err(err)) => {
+            if is_retriable_error(&err) && attempt < max_retries {
+                let delay = ctx.calculate_retry_delay(attempt, None);
+                warn!(
+                    "{}Upstream stream error on initial chunk for {} {}: {}. Retrying in {:?} (attempt {}/{})...",
+                    ctx.session_prefix,
+                    ctx.method,
+                    ctx.endpoint,
+                    err,
+                    delay,
+                    attempt + 1,
+                    max_retries
+                );
+                return AttemptOutcome::Retry(delay);
+            }
+            error!(
+                "{}Upstream error reading initial stream chunk for {} {}: {}",
+                ctx.session_prefix, ctx.method, ctx.endpoint, err
+            );
+            AttemptOutcome::Ready(ctx.fail_bad_gateway(
+                attempt,
+                format!("Bad Gateway: upstream stream read failed: {}", err),
+            ))
+        }
+        None => {
+            ctx.finish_completed(None, status.as_u16(), attempt, None);
+            AttemptOutcome::Ready(UpstreamOutcome {
+                status,
+                headers: res_headers,
+                body: UpstreamBody::Empty,
+            })
+        }
+    }
+}
+
+async fn execute_single_attempt(ctx: &mut RequestContext, attempt: u32) -> AttemptOutcome {
+    let max_retries = ctx.max_retries();
+    debug!(
+        "{}Forwarding request {} {} (attempt {}/{})",
+        ctx.session_prefix, ctx.method, ctx.endpoint, attempt, max_retries
+    );
+
+    match ctx.build_upstream_request().send().await {
+        Ok(mut upstream_res) => {
+            let status = upstream_res.status();
+
+            if is_retriable_status(status) {
+                if attempt < max_retries {
+                    let retry_after = upstream_res
+                        .headers()
+                        .get(reqwest::header::RETRY_AFTER)
+                        .and_then(|val| val.to_str().ok())
+                        .and_then(parse_retry_after);
+                    let delay = ctx.calculate_retry_delay(attempt, retry_after);
+                    let snippet = read_error_snippet(&mut upstream_res).await;
+
+                    warn!(
+                        "{}Upstream returned retriable status {} for {} {}. Retrying in {:?} (attempt {}/{}). Response: {}",
+                        ctx.session_prefix,
+                        status,
+                        ctx.method,
+                        ctx.endpoint,
+                        delay,
+                        attempt + 1,
+                        max_retries,
+                        snippet
+                    );
+                    return AttemptOutcome::Retry(delay);
+                }
+                warn!(
+                    "{}Max retries ({}) reached for status {}. Forwarding upstream error to client.",
+                    ctx.session_prefix, max_retries, status
+                );
+            } else if status.is_success() {
+                if attempt > 0 {
+                    info!(
+                        "{}Request {} {} succeeded after {} retries (status {})",
+                        ctx.session_prefix, ctx.method, ctx.endpoint, attempt, status
+                    );
+                } else {
+                    debug!(
+                        "{}Request {} {} succeeded (status {})",
+                        ctx.session_prefix, ctx.method, ctx.endpoint, status
+                    );
+                }
+            } else {
+                debug!(
+                    "{}Request {} {} returned non-retriable status {}",
+                    ctx.session_prefix, ctx.method, ctx.endpoint, status
+                );
+            }
+
+            let res_headers = copy_forwarded_response_headers(upstream_res.headers());
+            let is_sse = is_sse_request(&ctx.endpoint, &ctx.headers)
+                || res_headers
+                    .get(axum::http::header::CONTENT_TYPE)
+                    .and_then(|v| v.to_str().ok())
+                    .is_some_and(|v| v.contains("text/event-stream"));
+
+            if ctx.state.config.is_buffer_enabled() {
+                collect_buffered_response(ctx, status, res_headers, upstream_res, is_sse, attempt)
+                    .await
+            } else {
+                prepare_passthrough_response(
+                    ctx,
+                    status,
+                    res_headers,
+                    upstream_res,
+                    is_sse,
+                    attempt,
+                )
+                .await
+            }
+        }
+        Err(err) => {
+            if is_retriable_error(&err) && attempt < max_retries {
+                let delay = ctx.calculate_retry_delay(attempt, None);
+                warn!(
+                    "{}Upstream network error for {} {}: {}. Retrying in {:?} (attempt {}/{})...",
+                    ctx.session_prefix,
+                    ctx.method,
+                    ctx.endpoint,
+                    err,
+                    delay,
+                    attempt + 1,
+                    max_retries
+                );
+                return AttemptOutcome::Retry(delay);
+            }
+            error!(
+                "{}Upstream error for {} {}: {} (retries exhausted or non-retriable)",
+                ctx.session_prefix, ctx.method, ctx.endpoint, err
+            );
+            AttemptOutcome::Ready(ctx.fail_bad_gateway(
+                attempt,
+                format!("Bad Gateway: upstream request failed: {}", err),
+            ))
+        }
+    }
+}
+
+async fn execute_proxy_request(
+    state: Arc<ProxyState>,
+    method: Method,
+    target_url: reqwest::Url,
+    headers: HeaderMap,
+    body: Bytes,
+    session: Option<SessionMeta>,
+) -> UpstreamOutcome {
+    let mut ctx = RequestContext::new(state, method, target_url, headers, body, session);
+    let mut attempt = 0;
+
+    loop {
+        match execute_single_attempt(&mut ctx, attempt).await {
+            AttemptOutcome::Ready(outcome) => return outcome,
+            AttemptOutcome::Retry(delay) => {
+                ctx.record_retry();
+                tokio::time::sleep(delay).await;
+                attempt += 1;
+            }
+        }
+    }
+}
+
 enum KeepAlivePhase<F> {
     SendInitialHeartbeat {
         work_fut: F,
@@ -495,609 +1079,14 @@ enum KeepAlivePhase<F> {
     },
 }
 
-fn format_endpoint(url: &reqwest::Url) -> String {
-    match url.query() {
-        Some(q) => format!("{}?{}", url.path(), q),
-        None => url.path().to_string(),
-    }
-}
-
-async fn execute_proxy_request(
-    state: Arc<ProxyState>,
+struct KeepAliveStreamState<F> {
+    phase: KeepAlivePhase<F>,
+    heartbeat: Bytes,
+    is_sse: bool,
     method: Method,
-    target_url: reqwest::Url,
-    headers: HeaderMap,
-    body: Bytes,
-    session: Option<SessionMeta>,
-) -> UpstreamOutcome {
-    let req_start = Instant::now();
-    let endpoint = format_endpoint(&target_url);
-    let session_prefix = session
-        .as_ref()
-        .map(SessionMeta::log_prefix)
-        .unwrap_or_default();
-    let session_id_str = session.as_ref().map(|s| s.id.clone()).unwrap_or_default();
-    let model_from_path = extract_model_from_path(target_url.path());
-    let active_guard = model_from_path
-        .as_ref()
-        .map(|_| state.usage.begin_session_request(session.as_ref()));
-
-    let initial_delay = Duration::from_millis(state.config.initial_delay_ms);
-    let max_delay = Duration::from_millis(state.config.max_delay_ms);
-    let with_jitter = state.config.is_jitter_enabled();
-    let max_retries = state.config.max_retries;
-    let api_key = state.config.api_key.trim();
-
-    let mut attempt = 0;
-
-    loop {
-        debug!(
-            session_id = %session_id_str,
-            "{}Forwarding request {} {} (attempt {}/{})",
-            session_prefix, method, endpoint, attempt, max_retries
-        );
-
-        let mut req_builder = state.client.request(method.clone(), target_url.clone());
-
-        // Forward headers, stripping hop-by-hop, accept-encoding (handled by reqwest gzip), and gateway Authorization header
-        for (header_name, header_val) in headers.iter() {
-            if !is_hop_by_hop(header_name)
-                && header_name != axum::http::header::ACCEPT_ENCODING
-                && header_name != axum::http::header::AUTHORIZATION
-                && header_name.as_str() != "x-goog-api-key"
-            {
-                req_builder = req_builder.header(header_name, header_val);
-            }
-        }
-
-        req_builder = req_builder.header("x-goog-api-key", api_key);
-
-        // Set request body
-        req_builder = req_builder.body(body.clone());
-
-        match req_builder.send().await {
-            Ok(mut upstream_res) => {
-                let status = upstream_res.status();
-
-                if is_retriable_status(status) {
-                    if attempt < max_retries {
-                        let retry_after_duration = upstream_res
-                            .headers()
-                            .get(reqwest::header::RETRY_AFTER)
-                            .and_then(|val| val.to_str().ok())
-                            .and_then(parse_retry_after);
-
-                        let delay = calculate_backoff(
-                            attempt,
-                            initial_delay,
-                            max_delay,
-                            with_jitter,
-                            retry_after_duration,
-                        );
-
-                        let mut snippet = String::new();
-                        if let Ok(Some(chunk)) = upstream_res.chunk().await {
-                            let bytes = &chunk[..chunk.len().min(200)];
-                            snippet = String::from_utf8_lossy(bytes).trim().to_string();
-                            if chunk.len() > 200 {
-                                snippet.push_str("...");
-                            }
-                        }
-
-                        warn!(
-                            session_id = %session_id_str,
-                            "{}Upstream returned retriable status {} for {} {}. Retrying in {:?} (attempt {}/{}). Response: {}",
-                            session_prefix,
-                            status,
-                            method,
-                            endpoint,
-                            delay,
-                            attempt + 1,
-                            max_retries,
-                            snippet
-                        );
-
-                        if model_from_path.is_some() {
-                            state.usage.record_session_retry(session.as_ref());
-                        }
-                        tokio::time::sleep(delay).await;
-                        attempt += 1;
-                        continue;
-                    } else {
-                        warn!(
-                            session_id = %session_id_str,
-                            "{}Max retries ({}) reached for status {}. Forwarding upstream error to client.",
-                            session_prefix, max_retries, status
-                        );
-                    }
-                } else if status.is_success() {
-                    if attempt > 0 {
-                        info!(
-                            session_id = %session_id_str,
-                            "{}Request {} {} succeeded after {} retries (status {})",
-                            session_prefix, method, endpoint, attempt, status
-                        );
-                    } else {
-                        debug!(
-                            session_id = %session_id_str,
-                            "{}Request {} {} succeeded (status {})",
-                            session_prefix, method, endpoint, status
-                        );
-                    }
-                } else {
-                    debug!(
-                        session_id = %session_id_str,
-                        "{}Request {} {} returned non-retriable status {}",
-                        session_prefix, method, endpoint, status
-                    );
-                }
-
-                let mut res_headers = HeaderMap::new();
-                for (name, val) in upstream_res.headers() {
-                    if !is_hop_by_hop(name) {
-                        res_headers.append(name.clone(), val.clone());
-                    }
-                }
-
-                let is_sse = is_sse_request(&endpoint, &headers)
-                    || res_headers
-                        .get(axum::http::header::CONTENT_TYPE)
-                        .and_then(|v| v.to_str().ok())
-                        .is_some_and(|v| v.contains("text/event-stream"));
-
-                let mut stream = upstream_res.bytes_stream();
-
-                if state.config.is_buffer_enabled() {
-                    let mut buffered_chunks: Vec<Bytes> = Vec::new();
-                    let mut total_buffered_bytes: usize = 0;
-                    let mut stream_error = None;
-                    let mut in_stream_err_details = None;
-                    let mut chunk_index = 0;
-
-                    while let Some(chunk_res) = stream.next().await {
-                        match chunk_res {
-                            Ok(chunk) => {
-                                if status.is_success()
-                                    && let Some((in_stream_status, err_msg)) =
-                                        parse_in_stream_error(&chunk)
-                                            .filter(|(s, _)| is_retriable_status(*s))
-                                {
-                                    in_stream_err_details =
-                                        Some((chunk_index, in_stream_status, err_msg));
-                                    buffered_chunks.clear();
-                                    buffered_chunks.push(chunk);
-                                    break;
-                                }
-                                total_buffered_bytes += chunk.len();
-                                if is_sse {
-                                    debug!(
-                                        session_id = %session_id_str,
-                                        "{}Buffered SSE chunk #{} ({} bytes, {} bytes total) for {} {}",
-                                        session_prefix,
-                                        chunk_index + 1,
-                                        chunk.len(),
-                                        total_buffered_bytes,
-                                        method,
-                                        endpoint
-                                    );
-                                }
-                                buffered_chunks.push(chunk);
-                                chunk_index += 1;
-                            }
-                            Err(err) => {
-                                stream_error = Some((chunk_index, err));
-                                break;
-                            }
-                        }
-                    }
-
-                    if let Some((chunk_idx, in_stream_status, ref err_msg)) = in_stream_err_details
-                    {
-                        if attempt < max_retries {
-                            let delay = calculate_backoff(
-                                attempt,
-                                initial_delay,
-                                max_delay,
-                                with_jitter,
-                                None,
-                            );
-
-                            warn!(
-                                session_id = %session_id_str,
-                                "{}Upstream returned in-stream retriable error {} ({}) at chunk #{} for {} {}. Retrying in {:?} (attempt {}/{})...",
-                                session_prefix,
-                                in_stream_status,
-                                err_msg,
-                                chunk_idx + 1,
-                                method,
-                                endpoint,
-                                delay,
-                                attempt + 1,
-                                max_retries
-                            );
-
-                            if model_from_path.is_some() {
-                                state.usage.record_session_retry(session.as_ref());
-                            }
-                            tokio::time::sleep(delay).await;
-                            attempt += 1;
-                            continue;
-                        } else {
-                            warn!(
-                                session_id = %session_id_str,
-                                "{}Max retries ({}) reached for in-stream error {}. Forwarding buffered stream to client.",
-                                session_prefix, max_retries, in_stream_status
-                            );
-                        }
-                    } else if let Some((chunk_idx, err)) = stream_error {
-                        if is_retriable_error(&err) && attempt < max_retries {
-                            let delay = calculate_backoff(
-                                attempt,
-                                initial_delay,
-                                max_delay,
-                                with_jitter,
-                                None,
-                            );
-
-                            warn!(
-                                session_id = %session_id_str,
-                                "{}Upstream stream error at chunk #{} for {} {}: {}. Retrying in {:?} (attempt {}/{})...",
-                                session_prefix,
-                                chunk_idx + 1,
-                                method,
-                                endpoint,
-                                err,
-                                delay,
-                                attempt + 1,
-                                max_retries
-                            );
-
-                            if model_from_path.is_some() {
-                                state.usage.record_session_retry(session.as_ref());
-                            }
-                            tokio::time::sleep(delay).await;
-                            attempt += 1;
-                            continue;
-                        } else {
-                            error!(
-                                session_id = %session_id_str,
-                                "{}Upstream error reading stream at chunk #{} for {} {}: {}",
-                                session_prefix,
-                                chunk_idx + 1,
-                                method,
-                                endpoint,
-                                err
-                            );
-                            drop(active_guard);
-                            if let Some(ref req_model) = model_from_path {
-                                state.usage.record_session_completed_request(
-                                    session.as_ref(),
-                                    req_model,
-                                    StatusCode::BAD_GATEWAY.as_u16(),
-                                    attempt,
-                                    req_start.elapsed(),
-                                    None,
-                                );
-                            }
-                            return UpstreamOutcome::bad_gateway(format!(
-                                "Bad Gateway: upstream stream read failed: {}",
-                                err
-                            ));
-                        }
-                    }
-
-                    drop(active_guard);
-                    if let Some(ref req_model) = model_from_path {
-                        let (raw_usage, resp_model) = extract_usage_from_chunks(&buffered_chunks);
-                        let effective_model = resp_model.as_deref().unwrap_or(req_model);
-                        let effective_status =
-                            if let Some((_, in_stream_status, _)) = in_stream_err_details {
-                                in_stream_status.as_u16()
-                            } else {
-                                status.as_u16()
-                            };
-                        state.usage.record_session_completed_request(
-                            session.as_ref(),
-                            effective_model,
-                            effective_status,
-                            attempt,
-                            req_start.elapsed(),
-                            raw_usage.as_ref(),
-                        );
-                    }
-
-                    return UpstreamOutcome {
-                        status,
-                        headers: res_headers,
-                        body: UpstreamBody::Buffered(buffered_chunks),
-                    };
-                }
-
-                // Passthrough mode (--no-buffer): Peek at the initial stream chunk to catch in-stream 503 / 429 errors early
-                match stream.next().await {
-                    Some(Ok(first_chunk)) => {
-                        if status.is_success()
-                            && let Some((in_stream_status, err_msg)) =
-                                parse_in_stream_error(&first_chunk)
-                                    .filter(|(s, _)| is_retriable_status(*s))
-                        {
-                            if attempt < max_retries {
-                                let delay = calculate_backoff(
-                                    attempt,
-                                    initial_delay,
-                                    max_delay,
-                                    with_jitter,
-                                    None,
-                                );
-
-                                warn!(
-                                    session_id = %session_id_str,
-                                    "{}Upstream returned in-stream retriable error {} ({}) for {} {}. Retrying in {:?} (attempt {}/{})...",
-                                    session_prefix,
-                                    in_stream_status,
-                                    err_msg,
-                                    method,
-                                    endpoint,
-                                    delay,
-                                    attempt + 1,
-                                    max_retries
-                                );
-
-                                if model_from_path.is_some() {
-                                    state.usage.record_session_retry(session.as_ref());
-                                }
-                                tokio::time::sleep(delay).await;
-                                attempt += 1;
-                                continue;
-                            } else {
-                                warn!(
-                                    session_id = %session_id_str,
-                                    "{}Max retries ({}) reached for in-stream error {}. Forwarding stream to client.",
-                                    session_prefix, max_retries, in_stream_status
-                                );
-                            }
-                        }
-
-                        // Stream is healthy or retries exhausted: chain first chunk with remainder
-                        let full_stream = futures_util::stream::once(async move {
-                            Ok::<_, std::io::Error>(first_chunk)
-                        })
-                        .chain(stream.map(|res| res.map_err(std::io::Error::other)));
-
-                        let passthrough_stream: BoxByteStream = if let Some(req_model) =
-                            model_from_path
-                        {
-                            let tracker = state.usage.clone();
-                            let initial_status = status.as_u16();
-                            let retries_used = attempt;
-                            let extractor = StreamUsageExtractor::new();
-                            let inner_stream: BoxByteStream = Box::pin(full_stream);
-                            let session_for_stream = session.clone();
-                            let sid_for_stream = session_id_str.clone();
-                            let sprefix_for_stream = session_prefix.clone();
-                            let method_for_stream = method.clone();
-                            let endpoint_for_stream = endpoint.clone();
-                            Box::pin(futures_util::stream::unfold(
-                                (
-                                    inner_stream,
-                                    extractor,
-                                    active_guard,
-                                    initial_status,
-                                    0usize,
-                                ),
-                                move |(
-                                    mut s,
-                                    mut ext,
-                                    mut guard,
-                                    mut eff_status,
-                                    mut chunk_idx,
-                                )| {
-                                    let tracker = tracker.clone();
-                                    let req_model = req_model.clone();
-                                    let session_for_stream = session_for_stream.clone();
-                                    let sid = sid_for_stream.clone();
-                                    let sprefix = sprefix_for_stream.clone();
-                                    let req_method = method_for_stream.clone();
-                                    let req_endpoint = endpoint_for_stream.clone();
-                                    async move {
-                                        match s.next().await {
-                                            Some(Ok(chunk)) => {
-                                                chunk_idx += 1;
-                                                if is_sse {
-                                                    debug!(
-                                                        session_id = %sid,
-                                                        "{}Received SSE chunk #{} ({} bytes) for {} {}",
-                                                        sprefix,
-                                                        chunk_idx,
-                                                        chunk.len(),
-                                                        req_method,
-                                                        req_endpoint
-                                                    );
-                                                }
-                                                if (200..300).contains(&eff_status)
-                                                    && let Some((in_stream_status, _)) =
-                                                        parse_in_stream_error(&chunk)
-                                                {
-                                                    eff_status = in_stream_status.as_u16();
-                                                }
-                                                ext.feed_chunk(&chunk);
-                                                Some((
-                                                    Ok(chunk),
-                                                    (s, ext, guard, eff_status, chunk_idx),
-                                                ))
-                                            }
-                                            Some(Err(err)) => {
-                                                if guard.take().is_some() {
-                                                    let raw_usage = ext.finish(None);
-                                                    let effective_model = ext
-                                                        .model_version
-                                                        .as_deref()
-                                                        .unwrap_or(&req_model);
-                                                    tracker.record_session_completed_request(
-                                                        session_for_stream.as_ref(),
-                                                        effective_model,
-                                                        StatusCode::BAD_GATEWAY.as_u16(),
-                                                        retries_used,
-                                                        req_start.elapsed(),
-                                                        raw_usage.as_ref(),
-                                                    );
-                                                }
-                                                Some((
-                                                    Err(err),
-                                                    (s, ext, guard, eff_status, chunk_idx),
-                                                ))
-                                            }
-                                            None => {
-                                                if guard.take().is_some() {
-                                                    let raw_usage = ext.finish(None);
-                                                    let effective_model = ext
-                                                        .model_version
-                                                        .as_deref()
-                                                        .unwrap_or(&req_model);
-                                                    tracker.record_session_completed_request(
-                                                        session_for_stream.as_ref(),
-                                                        effective_model,
-                                                        eff_status,
-                                                        retries_used,
-                                                        req_start.elapsed(),
-                                                        raw_usage.as_ref(),
-                                                    );
-                                                }
-                                                None
-                                            }
-                                        }
-                                    }
-                                },
-                            ))
-                        } else {
-                            Box::pin(full_stream)
-                        };
-
-                        return UpstreamOutcome {
-                            status,
-                            headers: res_headers,
-                            body: UpstreamBody::Passthrough(passthrough_stream),
-                        };
-                    }
-                    Some(Err(err)) => {
-                        if is_retriable_error(&err) && attempt < max_retries {
-                            let delay = calculate_backoff(
-                                attempt,
-                                initial_delay,
-                                max_delay,
-                                with_jitter,
-                                None,
-                            );
-
-                            warn!(
-                                session_id = %session_id_str,
-                                "{}Upstream stream error on initial chunk for {} {}: {}. Retrying in {:?} (attempt {}/{})...",
-                                session_prefix,
-                                method,
-                                endpoint,
-                                err,
-                                delay,
-                                attempt + 1,
-                                max_retries
-                            );
-
-                            if model_from_path.is_some() {
-                                state.usage.record_session_retry(session.as_ref());
-                            }
-                            tokio::time::sleep(delay).await;
-                            attempt += 1;
-                            continue;
-                        } else {
-                            error!(
-                                session_id = %session_id_str,
-                                "{}Upstream error reading initial stream chunk for {} {}: {}",
-                                session_prefix, method, endpoint, err
-                            );
-                            drop(active_guard);
-                            if let Some(ref req_model) = model_from_path {
-                                state.usage.record_session_completed_request(
-                                    session.as_ref(),
-                                    req_model,
-                                    StatusCode::BAD_GATEWAY.as_u16(),
-                                    attempt,
-                                    req_start.elapsed(),
-                                    None,
-                                );
-                            }
-                            return UpstreamOutcome::bad_gateway(format!(
-                                "Bad Gateway: upstream stream read failed: {}",
-                                err
-                            ));
-                        }
-                    }
-                    None => {
-                        drop(active_guard);
-                        if let Some(ref req_model) = model_from_path {
-                            state.usage.record_session_completed_request(
-                                session.as_ref(),
-                                req_model,
-                                status.as_u16(),
-                                attempt,
-                                req_start.elapsed(),
-                                None,
-                            );
-                        }
-                        return UpstreamOutcome {
-                            status,
-                            headers: res_headers,
-                            body: UpstreamBody::Empty,
-                        };
-                    }
-                }
-            }
-            Err(err) => {
-                if is_retriable_error(&err) && attempt < max_retries {
-                    let delay =
-                        calculate_backoff(attempt, initial_delay, max_delay, with_jitter, None);
-
-                    warn!(
-                        session_id = %session_id_str,
-                        "{}Upstream network error for {} {}: {}. Retrying in {:?} (attempt {}/{})...",
-                        session_prefix,
-                        method,
-                        endpoint,
-                        err,
-                        delay,
-                        attempt + 1,
-                        max_retries
-                    );
-
-                    if model_from_path.is_some() {
-                        state.usage.record_session_retry(session.as_ref());
-                    }
-                    tokio::time::sleep(delay).await;
-                    attempt += 1;
-                    continue;
-                } else {
-                    error!(
-                        session_id = %session_id_str,
-                        "{}Upstream error for {} {}: {} (retries exhausted or non-retriable)",
-                        session_prefix, method, endpoint, err
-                    );
-                    drop(active_guard);
-                    if let Some(ref req_model) = model_from_path {
-                        state.usage.record_session_completed_request(
-                            session.as_ref(),
-                            req_model,
-                            StatusCode::BAD_GATEWAY.as_u16(),
-                            attempt,
-                            req_start.elapsed(),
-                            None,
-                        );
-                    }
-                    return UpstreamOutcome::bad_gateway(format!(
-                        "Bad Gateway: upstream request failed: {}",
-                        err
-                    ));
-                }
-            }
-        }
-    }
+    endpoint: String,
+    session_prefix: String,
+    span: tracing::Span,
 }
 
 pub async fn proxy_handler(
@@ -1112,7 +1101,9 @@ pub async fn proxy_handler(
         .as_ref()
         .map(SessionMeta::log_prefix)
         .unwrap_or_default();
-    let session_id_str = session.as_ref().map(|s| s.id.clone()).unwrap_or_default();
+    let session_id_str = session.as_ref().map(|s| s.id.as_str()).unwrap_or("");
+    let req_span = info_span!("proxy_request", session_id = %session_id_str);
+    let _enter = req_span.enter();
 
     let path_and_query = original_uri
         .path_and_query()
@@ -1124,7 +1115,6 @@ pub async fn proxy_handler(
         Ok(url) => url,
         Err(err) => {
             error!(
-                session_id = %session_id_str,
                 "{}Failed to parse target URL {}: {}",
                 session_prefix, target_url_str, err
             );
@@ -1140,28 +1130,27 @@ pub async fn proxy_handler(
     let keep_alive_interval = state.keep_alive_interval;
     let endpoint = format_endpoint(&target_url);
 
-    let mut work_fut = Box::pin(execute_proxy_request(
-        state,
-        method.clone(),
-        target_url,
-        headers,
-        body,
-        session,
-    ));
+    drop(_enter);
+
+    let mut work_fut = Box::pin(
+        execute_proxy_request(state, method.clone(), target_url, headers, body, session)
+            .instrument(req_span.clone()),
+    );
 
     // Wait up to `keep_alive_interval` for the request (including buffering/retries) to finish
     // before committing HTTP 200 OK headers and starting keep-alive heartbeats.
     if let Ok(outcome) = tokio::time::timeout(keep_alive_interval, &mut work_fut).await {
-        return outcome.into_fast_response(&session_id_str, &session_prefix);
+        let _enter = req_span.enter();
+        return outcome.into_fast_response(&session_prefix);
     }
 
+    let _enter = req_span.enter();
     debug!(
-        session_id = %session_id_str,
         "{}Request {} {} still in progress after {:?}; committing 200 OK headers and starting keep-alive stream",
         session_prefix, method, endpoint, keep_alive_interval
     );
 
-    let heartbeat_bytes = if is_sse {
+    let heartbeat = if is_sse {
         Bytes::from_static(b": keep-alive\n\n")
     } else {
         Bytes::from_static(b"\n")
@@ -1173,51 +1162,53 @@ pub async fn proxy_handler(
     );
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
-    let initial_phase = KeepAlivePhase::SendInitialHeartbeat { work_fut, interval };
+    let keep_alive_state = KeepAliveStreamState {
+        phase: KeepAlivePhase::SendInitialHeartbeat { work_fut, interval },
+        heartbeat,
+        is_sse,
+        method,
+        endpoint,
+        session_prefix: session_prefix.clone(),
+        span: req_span.clone(),
+    };
 
-    let keep_alive_session_id = session_id_str.clone();
-    let keep_alive_session_prefix = session_prefix.clone();
-
-    let keep_alive_stream = futures_util::stream::unfold(initial_phase, move |phase| {
-        let heartbeat = heartbeat_bytes.clone();
-        let req_method = method.clone();
-        let req_endpoint = endpoint.clone();
-        let sid = keep_alive_session_id.clone();
-        let sprefix = keep_alive_session_prefix.clone();
-        async move {
-            match phase {
-                KeepAlivePhase::SendInitialHeartbeat { work_fut, interval } => Some((
-                    Ok::<Bytes, std::io::Error>(heartbeat),
-                    KeepAlivePhase::Waiting { work_fut, interval },
-                )),
-                KeepAlivePhase::Waiting {
-                    mut work_fut,
-                    mut interval,
-                } => {
-                    tokio::select! {
-                        biased;
-                        outcome = &mut work_fut => {
-                            let mut payload_stream = outcome.into_late_stream(is_sse).await;
-                            let item = payload_stream.next().await?;
-                            Some((item, KeepAlivePhase::Flushing { payload_stream }))
-                        }
-                        _ = interval.tick() => {
+    let keep_alive_stream = futures_util::stream::unfold(keep_alive_state, |mut st| async move {
+        match st.phase {
+            KeepAlivePhase::SendInitialHeartbeat { work_fut, interval } => {
+                let hb = st.heartbeat.clone();
+                st.phase = KeepAlivePhase::Waiting { work_fut, interval };
+                Some((Ok::<Bytes, std::io::Error>(hb), st))
+            }
+            KeepAlivePhase::Waiting {
+                mut work_fut,
+                mut interval,
+            } => {
+                tokio::select! {
+                    biased;
+                    outcome = &mut work_fut => {
+                        let mut payload_stream = outcome.into_late_stream(st.is_sse).await;
+                        let item = payload_stream.next().await?;
+                        st.phase = KeepAlivePhase::Flushing { payload_stream };
+                        Some((item, st))
+                    }
+                    _ = interval.tick() => {
+                        {
+                            let _enter = st.span.enter();
                             debug!(
-                                session_id = %sid,
                                 "{}Sending keep-alive heartbeat for in-flight request {} {}",
-                                sprefix, req_method, req_endpoint
+                                st.session_prefix, st.method, st.endpoint
                             );
-                            Some((
-                                Ok(heartbeat),
-                                KeepAlivePhase::Waiting { work_fut, interval },
-                            ))
                         }
+                        let hb = st.heartbeat.clone();
+                        st.phase = KeepAlivePhase::Waiting { work_fut, interval };
+                        Some((Ok(hb), st))
                     }
                 }
-                KeepAlivePhase::Flushing { mut payload_stream } => {
-                    let item = payload_stream.next().await?;
-                    Some((item, KeepAlivePhase::Flushing { payload_stream }))
-                }
+            }
+            KeepAlivePhase::Flushing { mut payload_stream } => {
+                let item = payload_stream.next().await?;
+                st.phase = KeepAlivePhase::Flushing { payload_stream };
+                Some((item, st))
             }
         }
     });
@@ -1235,7 +1226,6 @@ pub async fn proxy_handler(
         Ok(res) => res,
         Err(err) => {
             error!(
-                session_id = %session_id_str,
                 "{}Failed to build keep-alive proxy response: {}",
                 session_prefix, err
             );
