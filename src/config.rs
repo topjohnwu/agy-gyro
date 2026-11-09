@@ -5,32 +5,10 @@ use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 
+pub use crate::models::{DEFAULT_GATEWAY_MODELS, EXCLUDED_MODELS, MODEL_EFFORT_LEVELS};
+
 /// Default TCP port for the local gateway server and monitor (`6470` = `GYRO` in leetspeak).
 pub const DEFAULT_PORT: u16 = 6470;
-
-/// Fallback list of Gemini models if dynamic discovery fails.
-pub const DEFAULT_GATEWAY_MODELS: &[&str] = &["gemini-4-argon", "gemini-3.8-flash"];
-
-/// Effort suffixes expanded for each thinking-capable Gemini model.
-pub const MODEL_EFFORT_LEVELS: &[&str] = &["low", "medium", "high"];
-
-/// Fixed list of older, lite, alias, or specialized-variant Core Gemini Text / Reasoning
-/// models to exclude when dynamically building the model list from `/v1beta/models`.
-pub const EXCLUDED_MODELS: &[&str] = &[
-    "gemini-flash-latest",
-    "gemini-flash-lite-latest",
-    "gemini-pro-latest",
-    "gemini-2.5-flash-lite",
-    "gemini-3-flash-preview",
-    "gemini-3.1-pro-preview",
-    "gemini-3.1-pro-preview-customtools",
-    "gemini-3.1-flash-lite-preview",
-    "gemini-3.1-flash-lite",
-    "gemini-3.5-flash",
-    "gemini-3.5-flash-lite",
-    "gemini-3.6-flash",
-    "gemini-3.7-flash",
-];
 
 #[derive(Debug, Clone)]
 pub struct Cli {

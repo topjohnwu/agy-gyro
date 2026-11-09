@@ -1,6 +1,10 @@
 // SPDX-License-Identifier: MIT
 
-use crate::config::{Config, DEFAULT_GATEWAY_MODELS, EXCLUDED_MODELS, MODEL_EFFORT_LEVELS};
+use crate::config::Config;
+pub use crate::models::{
+    DEFAULT_GATEWAY_MODELS, EXCLUDED_MODELS, GeminiModelInfo, GeminiModelsResponse,
+    MODEL_EFFORT_LEVELS, expand_gateway_models, filter_core_gemini_models, resolve_gateway_models,
+};
 use crate::retry::{
     calculate_backoff, is_retriable_error, is_retriable_status, parse_in_stream_error,
     parse_retry_after,
@@ -26,157 +30,6 @@ use serde::{Deserialize, Serialize};
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 use tracing::{debug, error, info, warn};
-
-#[derive(Debug, Clone, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct GeminiModelsResponse {
-    #[serde(default)]
-    pub models: Vec<GeminiModelInfo>,
-    pub next_page_token: Option<String>,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct GeminiModelInfo {
-    pub name: String,
-    #[serde(default)]
-    pub supported_generation_methods: Vec<String>,
-    #[serde(default)]
-    pub thinking: bool,
-}
-
-/// Filters a list of `/v1beta/models` entries to retain only Core Gemini Text / Reasoning
-/// models, excluding [`EXCLUDED_MODELS`], ordered newest-first.
-pub fn filter_core_gemini_models(models: &[GeminiModelInfo]) -> Vec<String> {
-    const NON_TEXT_KEYWORDS: &[&str] = &[
-        "-image",
-        "-banana",
-        "-tts",
-        "-audio",
-        "-live",
-        "-transcribe",
-        "-omni",
-        "-robotics",
-        "-computer-use",
-        "-embedding",
-    ];
-
-    let mut filtered: Vec<String> = models
-        .iter()
-        .filter_map(|m| {
-            let id = m.name.strip_prefix("models/").unwrap_or(&m.name);
-            if !id.starts_with("gemini-") {
-                return None;
-            }
-            if !m.thinking {
-                return None;
-            }
-            if !m
-                .supported_generation_methods
-                .iter()
-                .any(|method| method == "generateContent")
-            {
-                return None;
-            }
-            if NON_TEXT_KEYWORDS.iter().any(|kw| id.contains(kw)) {
-                return None;
-            }
-            if EXCLUDED_MODELS.contains(&id) {
-                return None;
-            }
-            Some(id.to_string())
-        })
-        .collect();
-
-    // The Gemini API returns models oldest-first; reverse so newest models appear first.
-    filtered.reverse();
-    filtered
-}
-
-/// Expands a list of base Gemini model names into a comma-separated list of
-/// effort-suffixed model IDs (`<model>-low`, `<model>-medium`, `<model>-high`).
-pub fn expand_gateway_models<S: AsRef<str>>(models: &[S]) -> String {
-    models
-        .iter()
-        .flat_map(|model| {
-            let base = model.as_ref();
-            MODEL_EFFORT_LEVELS
-                .iter()
-                .map(move |effort| format!("{}-{}", base, effort))
-        })
-        .collect::<Vec<_>>()
-        .join(",")
-}
-
-/// Queries `GET {upstream}/v1beta/models` and returns the comma-separated list of
-/// active Core Gemini Text / Reasoning models expanded with effort suffixes
-/// (falling back to [`DEFAULT_GATEWAY_MODELS`] if the request fails).
-pub async fn resolve_gateway_models(client: &reqwest::Client, config: &Config) -> String {
-    let api_key = config.api_key.trim();
-    let upstream_base = config.upstream.trim_end_matches('/');
-    let mut all_models = Vec::new();
-    let mut page_token: Option<String> = None;
-
-    loop {
-        let mut url = format!("{}/v1beta/models?pageSize=100", upstream_base);
-        if let Some(ref token) = page_token {
-            url.push_str("&pageToken=");
-            url.push_str(token);
-        }
-
-        let res = match client
-            .get(&url)
-            .header("x-goog-api-key", api_key)
-            .timeout(Duration::from_secs(10))
-            .send()
-            .await
-        {
-            Ok(res) if res.status().is_success() => res,
-            Ok(res) => {
-                warn!(
-                    "Failed to fetch models from {} (status {}); falling back to default model list",
-                    url,
-                    res.status()
-                );
-                return expand_gateway_models(DEFAULT_GATEWAY_MODELS);
-            }
-            Err(err) => {
-                warn!(
-                    "Error fetching models from {}: {}; falling back to default model list",
-                    url, err
-                );
-                return expand_gateway_models(DEFAULT_GATEWAY_MODELS);
-            }
-        };
-
-        match res.json::<GeminiModelsResponse>().await {
-            Ok(parsed) => {
-                all_models.extend(parsed.models);
-                if let Some(next) = parsed.next_page_token.filter(|t| !t.is_empty()) {
-                    page_token = Some(next);
-                } else {
-                    break;
-                }
-            }
-            Err(err) => {
-                warn!(
-                    "Failed to parse /v1beta/models JSON response: {}; falling back to default model list",
-                    err
-                );
-                return expand_gateway_models(DEFAULT_GATEWAY_MODELS);
-            }
-        }
-    }
-
-    let models = filter_core_gemini_models(&all_models);
-    if models.is_empty() {
-        warn!("No core Gemini models matched filter; falling back to default model list");
-        expand_gateway_models(DEFAULT_GATEWAY_MODELS)
-    } else {
-        info!("Discovered available Gemini models: {}", models.join(","));
-        expand_gateway_models(&models)
-    }
-}
 
 /// Default interval before committing early 200 OK headers and between keep-alive heartbeats.
 /// Set to 15 seconds to stay well below agy's 60-second ResponseHeaderTimeout.
@@ -661,7 +514,7 @@ async fn execute_proxy_request(
     let endpoint = format_endpoint(&target_url);
     let session_prefix = session
         .as_ref()
-        .map(|s| format!("[#{} {}] ", s.id, s.label))
+        .map(SessionMeta::log_prefix)
         .unwrap_or_default();
     let session_id_str = session.as_ref().map(|s| s.id.clone()).unwrap_or_default();
     let model_from_path = extract_model_from_path(target_url.path());
@@ -1257,7 +1110,7 @@ pub async fn proxy_handler(
     let session = extract_session_from_headers(&headers);
     let session_prefix = session
         .as_ref()
-        .map(|s| format!("[#{} {}] ", s.id, s.label))
+        .map(SessionMeta::log_prefix)
         .unwrap_or_default();
     let session_id_str = session.as_ref().map(|s| s.id.clone()).unwrap_or_default();
 
