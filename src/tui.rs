@@ -1,7 +1,9 @@
 // SPDX-License-Identifier: MIT
 
 use crate::config::Config;
-use crate::usage::{LogEntry, ModelUsageStats, ScopeUsageStats, SessionUsageStats, UsageSnapshot};
+use crate::usage::{
+    LogEntry, ModelUsageStats, ScopeUsageStats, SessionUsageStats, UsageSnapshot, short_session_id,
+};
 use crossterm::{
     event::{self, Event, KeyCode, KeyEventKind, KeyModifiers},
     execute,
@@ -562,7 +564,7 @@ fn render_header(frame: &mut Frame, area: Rect, state: &DashboardState) {
             let tab_text = format!(
                 " {} #{} {}{} · {} ",
                 indicator,
-                sess.id,
+                short_session_id(&sess.id),
                 sess.label,
                 suffix,
                 format_usd(sess.totals.total_cost_usd)

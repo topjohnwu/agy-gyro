@@ -540,7 +540,7 @@ async fn test_run_wrapper_executes_child_and_propagates_exit_code() {
             r#"
                 test -n "$AGY_LLM_GATEWAY_URL" &&
                 test "$AGY_LLM_GATEWAY_WIRE_PROTOCOL" = "genai" &&
-                case "$AGY_LLM_GATEWAY_API_KEY" in "gyro:1:$$:"*) ;; *) exit 1 ;; esac &&
+                case "$AGY_LLM_GATEWAY_API_KEY" in "gyro:"*":$$:"*) ;; *) exit 1 ;; esac &&
                 test -n "$AGY_LLM_GATEWAY_MODELS" &&
                 test "$AGY_ENABLE_HUB" = "1" &&
                 exit 42
@@ -559,7 +559,7 @@ async fn test_run_wrapper_executes_child_and_propagates_exit_code() {
         .await
         .unwrap();
     assert_eq!(snap.sessions.len(), 1);
-    assert_eq!(snap.sessions[0].id, "1");
+    assert_eq!(snap.sessions[0].id.len(), 36);
     assert!(!snap.sessions[0].active);
 }
 
@@ -1294,9 +1294,9 @@ async fn test_multi_session_registration_attribution_and_exit() {
         .json()
         .await
         .unwrap();
-    assert_eq!(reg1.session_id, "1");
+    assert_eq!(reg1.session_id.len(), 36);
 
-    // Re-registering with the same active PID is idempotent and returns session #1
+    // Re-registering with the same active PID is idempotent and returns session 1's UUID
     let reg1_dup: RegisterSessionResponse = client
         .post(format!("{}/sessions", proxy_url))
         .json(&RegisterSessionRequest {
@@ -1309,7 +1309,7 @@ async fn test_multi_session_registration_attribution_and_exit() {
         .json()
         .await
         .unwrap();
-    assert_eq!(reg1_dup.session_id, "1");
+    assert_eq!(reg1_dup.session_id, reg1.session_id);
 
     let reg2: RegisterSessionResponse = client
         .post(format!("{}/sessions", proxy_url))
@@ -1323,10 +1323,11 @@ async fn test_multi_session_registration_attribution_and_exit() {
         .json()
         .await
         .unwrap();
-    assert_eq!(reg2.session_id, "2");
+    assert_eq!(reg2.session_id.len(), 36);
+    assert_ne!(reg2.session_id, reg1.session_id);
     assert_eq!(
         reg2.api_key,
-        format!("gyro:2:{}:workspace-two", session2_pid)
+        format!("gyro:{}:{}:workspace-two", reg2.session_id, session2_pid)
     );
 
     // Send 1 request for each session
@@ -1353,28 +1354,28 @@ async fn test_multi_session_registration_attribution_and_exit() {
     assert_eq!(snap.total_requests, 2);
     assert_eq!(snap.totals.input_tokens, 100_000);
     assert_eq!(snap.sessions.len(), 2);
-    assert_eq!(snap.sessions[0].id, "1");
+    assert_eq!(snap.sessions[0].id, reg1.session_id);
     assert_eq!(snap.sessions[0].label, "workspace-one");
     assert!(snap.sessions[0].active);
     assert_eq!(snap.sessions[0].totals.input_tokens, 50_000);
 
-    assert_eq!(snap.sessions[1].id, "2");
+    assert_eq!(snap.sessions[1].id, reg2.session_id);
     assert_eq!(snap.sessions[1].label, "workspace-two");
     assert!(!snap.sessions[1].active);
     assert_eq!(snap.sessions[1].totals.input_tokens, 50_000);
 
     // Selectively resetting exited session 2 removes it and subtracts its tokens from global totals
-    let snap_after = reset_remote_session_usage(&client, &usage_url, Some("2"))
+    let snap_after = reset_remote_session_usage(&client, &usage_url, Some(&reg2.session_id))
         .await
         .unwrap();
     assert_eq!(snap_after.sessions.len(), 1);
-    assert_eq!(snap_after.sessions[0].id, "1");
+    assert_eq!(snap_after.sessions[0].id, reg1.session_id);
     assert_eq!(snap_after.total_requests, 1);
     assert_eq!(snap_after.totals.input_tokens, 50_000);
 
-    // Unconditionally removing session 1 via DELETE /sessions/1 removes it even while active
+    // Unconditionally removing session 1 via DELETE /sessions/<id> removes it even while active
     let del_res = client
-        .delete(format!("{}/sessions/1", proxy_url))
+        .delete(format!("{}/sessions/{}", proxy_url, reg1.session_id))
         .send()
         .await
         .unwrap();

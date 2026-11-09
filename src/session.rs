@@ -11,10 +11,47 @@ pub struct SessionMeta {
     pub pid: Option<u32>,
 }
 
+/// Generates a random RFC 4122 version 4 UUID string (`xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx`).
+pub fn generate_session_uuid() -> String {
+    let mut bytes: [u8; 16] = rand::random();
+    bytes[6] = (bytes[6] & 0x0f) | 0x40;
+    bytes[8] = (bytes[8] & 0x3f) | 0x80;
+    format!(
+        "{:02x}{:02x}{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
+        bytes[0],
+        bytes[1],
+        bytes[2],
+        bytes[3],
+        bytes[4],
+        bytes[5],
+        bytes[6],
+        bytes[7],
+        bytes[8],
+        bytes[9],
+        bytes[10],
+        bytes[11],
+        bytes[12],
+        bytes[13],
+        bytes[14],
+        bytes[15]
+    )
+}
+
+/// Returns the short 8-character prefix of a session ID (everything before the first `-`)
+/// for compact display in logs and TUI tabs.
+pub fn short_session_id(id: &str) -> &str {
+    id.split('-').next().unwrap_or(id)
+}
+
 impl SessionMeta {
-    /// Formats a bracketed log prefix (`"[#<id> <label>] "`) for this session.
+    /// Returns the short display prefix of this session's ID.
+    pub fn short_id(&self) -> &str {
+        short_session_id(&self.id)
+    }
+
+    /// Formats a bracketed log prefix (`"[#<short_id> <label>] "`) for this session.
     pub fn log_prefix(&self) -> String {
-        format!("[#{} {}] ", self.id, self.label)
+        format!("[#{} {}] ", self.short_id(), self.label)
     }
 }
 

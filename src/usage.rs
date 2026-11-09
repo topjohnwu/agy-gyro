@@ -6,8 +6,8 @@ pub use crate::pricing::{
     parse_models_dev_pricing,
 };
 pub use crate::session::{
-    SessionMeta, extract_session_from_headers, format_session_api_key, is_pid_alive,
-    parse_session_api_key, sanitize_session_label,
+    SessionMeta, extract_session_from_headers, format_session_api_key, generate_session_uuid,
+    is_pid_alive, parse_session_api_key, sanitize_session_label, short_session_id,
 };
 
 use axum::body::Bytes;
@@ -473,6 +473,7 @@ impl DerefMut for UsageSnapshot {
 
 #[derive(Debug, Clone)]
 struct SessionEntry {
+    seq: u64,
     stats: SessionUsageStats,
     track_pid_liveness: bool,
 }
@@ -488,7 +489,7 @@ struct UsageInner {
 pub struct UsageTracker {
     started_at: Instant,
     next_request_id: AtomicU64,
-    next_session_id: AtomicU64,
+    next_session_seq: AtomicU64,
     next_log_id: AtomicU64,
     pricing: RwLock<PricingTable>,
     inner: RwLock<UsageInner>,
@@ -509,7 +510,7 @@ impl UsageTracker {
         Self {
             started_at: Instant::now(),
             next_request_id: AtomicU64::new(1),
-            next_session_id: AtomicU64::new(1),
+            next_session_seq: AtomicU64::new(1),
             next_log_id: AtomicU64::new(1),
             pricing: RwLock::new(pricing),
             inner: RwLock::new(UsageInner::default()),
@@ -607,7 +608,7 @@ impl UsageTracker {
                 info!(
                     session_id = %id,
                     "[#{} {}] Session exited (pid={})",
-                    id,
+                    short_session_id(&id),
                     label,
                     pid
                 );
@@ -690,15 +691,14 @@ impl UsageTracker {
             };
         }
 
-        let id = self
-            .next_session_id
-            .fetch_add(1, Ordering::Relaxed)
-            .to_string();
+        let id = generate_session_uuid();
+        let seq = self.next_session_seq.fetch_add(1, Ordering::Relaxed);
 
         if let Ok(mut inner) = self.inner.write() {
             inner.sessions.insert(
                 id.clone(),
                 SessionEntry {
+                    seq,
                     stats: SessionUsageStats {
                         id: id.clone(),
                         label: clean_label.clone(),
@@ -714,7 +714,7 @@ impl UsageTracker {
         info!(
             session_id = %id,
             "[#{} {}] Session started (pid={})",
-            id,
+            short_session_id(&id),
             clean_label,
             pid.map(|p| p.to_string()).unwrap_or_else(|| "n/a".to_string())
         );
@@ -754,7 +754,7 @@ impl UsageTracker {
             info!(
                 session_id = %session_id,
                 "[#{} {}] Session exited",
-                session_id,
+                short_session_id(session_id),
                 label
             );
             self.notify_usage_change();
@@ -769,12 +769,6 @@ impl UsageTracker {
         inner: &'a mut UsageInner,
         meta: &SessionMeta,
     ) -> &'a mut SessionEntry {
-        if let Ok(num_id) = meta.id.parse::<u64>() {
-            let _ = self
-                .next_session_id
-                .fetch_max(num_id.saturating_add(1), Ordering::Relaxed);
-        }
-
         inner
             .sessions
             .entry(meta.id.clone())
@@ -788,6 +782,7 @@ impl UsageTracker {
                 }
             })
             .or_insert_with(|| SessionEntry {
+                seq: self.next_session_seq.fetch_add(1, Ordering::Relaxed),
                 stats: SessionUsageStats {
                     id: meta.id.clone(),
                     label: meta.label.clone(),
@@ -923,7 +918,7 @@ impl UsageTracker {
             info!(
                 session_id = %meta.id,
                 "[#{} {}] Request #{} [{}] status={} duration={}ms retries={} | in={} (uncached={}, cached={}) out={} (think={}) | cost=${:.6}",
-                meta.id,
+                meta.short_id(),
                 meta.label,
                 req_id,
                 canonical_model,
@@ -970,9 +965,6 @@ impl UsageTracker {
             for entry in inner.sessions.values_mut() {
                 entry.stats.reset_completed();
             }
-            if inner.sessions.is_empty() {
-                self.next_session_id.store(1, Ordering::Relaxed);
-            }
         }
         self.notify_usage_change();
         self.notify_log_change();
@@ -999,9 +991,6 @@ impl UsageTracker {
             inner
                 .logs
                 .retain(|l| l.session_id.as_deref() != Some(session_id));
-            if inner.sessions.is_empty() {
-                self.next_session_id.store(1, Ordering::Relaxed);
-            }
         }
         self.notify_usage_change();
         self.notify_log_change();
@@ -1017,20 +1006,19 @@ impl UsageTracker {
             .map(|p| p.source.clone())
             .unwrap_or_else(|_| "built-in".to_string());
 
-        let (stats, mut sessions) = match self.inner.read() {
+        let (stats, sessions) = match self.inner.read() {
             Ok(inner) => {
-                let sessions: Vec<SessionUsageStats> =
-                    inner.sessions.values().map(|e| e.stats.clone()).collect();
+                let mut entries: Vec<(u64, SessionUsageStats)> = inner
+                    .sessions
+                    .values()
+                    .map(|e| (e.seq, e.stats.clone()))
+                    .collect();
+                entries.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.id.cmp(&b.1.id)));
+                let sessions = entries.into_iter().map(|(_, s)| s).collect();
                 (inner.global.clone(), sessions)
             }
             Err(_) => (ScopeUsageStats::default(), Vec::new()),
         };
-
-        sessions.sort_by(|a, b| {
-            let a_num = a.id.parse::<u64>().unwrap_or(u64::MAX);
-            let b_num = b.id.parse::<u64>().unwrap_or(u64::MAX);
-            a_num.cmp(&b_num).then_with(|| a.id.cmp(&b.id))
-        });
 
         UsageSnapshot {
             uptime_secs: self.started_at.elapsed().as_secs(),
@@ -1264,8 +1252,10 @@ mod tests {
         let tracker = Arc::new(UsageTracker::default());
         let s1 = tracker.register_session(None, "proj-alpha");
         let s2 = tracker.register_session(None, "proj-beta");
-        assert_eq!(s1.id, "1");
-        assert_eq!(s2.id, "2");
+        assert_eq!(s1.id.len(), 36);
+        assert_eq!(s2.id.len(), 36);
+        assert_ne!(s1.id, s2.id);
+        assert_eq!(s1.short_id().len(), 8);
 
         let u1 = RawUsageMetadata {
             prompt_token_count: 10_000,
@@ -1315,7 +1305,7 @@ mod tests {
         tracker.reset_session(&s2.id);
         let snap2 = tracker.snapshot();
         assert_eq!(snap2.sessions.len(), 1);
-        assert_eq!(snap2.sessions[0].id, "1");
+        assert_eq!(snap2.sessions[0].id, s1.id);
         assert_eq!(snap2.totals.input_tokens, 10_000);
     }
 }
