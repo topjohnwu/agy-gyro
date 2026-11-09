@@ -10,10 +10,77 @@ pub use crate::models::{DEFAULT_GATEWAY_MODELS, EXCLUDED_MODELS, MODEL_EFFORT_LE
 /// Default TCP port for the local gateway server and monitor (`6470` = `GYRO` in leetspeak).
 pub const DEFAULT_PORT: u16 = 6470;
 
+pub const ENV_GEMINI_API_KEY: &str = "GEMINI_API_KEY";
+pub const ENV_API_KEY: &str = "AGY_GYRO_API_KEY";
+pub const ENV_HOST: &str = "AGY_GYRO_HOST";
+pub const ENV_PORT: &str = "AGY_GYRO_PORT";
+pub const ENV_UPSTREAM: &str = "AGY_GYRO_UPSTREAM";
+pub const ENV_UPSTREAM_URL: &str = "AGY_GYRO_UPSTREAM_URL";
+pub const ENV_AGY_PATH: &str = "AGY_GYRO_AGY_PATH";
+pub const ENV_LOG_FILE: &str = "AGY_GYRO_LOG_FILE";
+pub const ENV_MAX_RETRIES: &str = "AGY_GYRO_MAX_RETRIES";
+pub const ENV_INITIAL_DELAY_MS: &str = "AGY_GYRO_INITIAL_DELAY_MS";
+pub const ENV_MAX_DELAY_MS: &str = "AGY_GYRO_MAX_DELAY_MS";
+pub const ENV_NO_JITTER: &str = "AGY_GYRO_NO_JITTER";
+pub const ENV_NO_BUFFER: &str = "AGY_GYRO_NO_BUFFER";
+pub const ENV_REQUEST_TIMEOUT_SECS: &str = "AGY_GYRO_REQUEST_TIMEOUT_SECS";
+pub const ENV_URL: &str = "AGY_GYRO_URL";
+
+/// All configuration environment variables recognized by [`Cli::try_parse_with_config_from`].
+pub const KNOWN_ENV_VARS: &[&str] = &[
+    ENV_GEMINI_API_KEY,
+    ENV_API_KEY,
+    ENV_HOST,
+    ENV_PORT,
+    ENV_UPSTREAM,
+    ENV_UPSTREAM_URL,
+    ENV_AGY_PATH,
+    ENV_LOG_FILE,
+    ENV_MAX_RETRIES,
+    ENV_INITIAL_DELAY_MS,
+    ENV_MAX_DELAY_MS,
+    ENV_NO_JITTER,
+    ENV_NO_BUFFER,
+    ENV_REQUEST_TIMEOUT_SECS,
+    ENV_URL,
+];
+
+/// Converts a wildcard bind address (`0.0.0.0`) into a loopback connect address (`127.0.0.1`).
+pub fn connect_host(bind_host: &str) -> &str {
+    if bind_host == "0.0.0.0" {
+        "127.0.0.1"
+    } else {
+        bind_host
+    }
+}
+
+/// Normalizes a raw gateway URL or endpoint URL into a base `http(s)://host:port` URL without
+/// trailing `/usage` or `/logs` suffixes.
+pub fn normalize_base_url(raw_url: &str) -> String {
+    let trimmed = raw_url.trim().trim_end_matches('/');
+    let with_scheme = if trimmed.starts_with("http://") || trimmed.starts_with("https://") {
+        trimmed.to_string()
+    } else {
+        format!("http://{}", trimmed)
+    };
+
+    with_scheme
+        .strip_suffix("/usage")
+        .or_else(|| with_scheme.strip_suffix("/logs"))
+        .unwrap_or(&with_scheme)
+        .to_string()
+}
+
+/// Normalizes a raw gateway base URL or endpoint URL and appends `/<endpoint_path>`.
+pub fn resolve_endpoint_url(raw_url: &str, endpoint_path: &str) -> String {
+    let base = normalize_base_url(raw_url);
+    let path = endpoint_path.trim_start_matches('/');
+    format!("{}/{}", base, path)
+}
+
 #[derive(Debug, Clone)]
 pub struct Cli {
-    pub command: Option<Commands>,
-    pub wrapper_args: WrapperArgs,
+    pub command: Commands,
 }
 
 /// Configuration loaded from `~/.gemini/config/agy-gyro.toml`.
@@ -126,45 +193,45 @@ impl Cli {
             None => FileConfig::default(),
         };
 
-        let host = env_non_empty("AGY_GYRO_HOST")
+        let host = env_non_empty(ENV_HOST)
             .or(file_config.host)
             .unwrap_or_else(|| "127.0.0.1".to_string());
-        let port = env_parse::<u16>("AGY_GYRO_PORT")?
+        let port = env_parse::<u16>(ENV_PORT)?
             .or(file_config.port)
             .unwrap_or(DEFAULT_PORT);
-        let upstream = env_non_empty("AGY_GYRO_UPSTREAM")
-            .or_else(|| env_non_empty("AGY_GYRO_UPSTREAM_URL"))
+        let upstream = env_non_empty(ENV_UPSTREAM)
+            .or_else(|| env_non_empty(ENV_UPSTREAM_URL))
             .or(file_config.upstream)
             .unwrap_or_else(|| "https://generativelanguage.googleapis.com".to_string());
-        let max_retries = env_parse::<u32>("AGY_GYRO_MAX_RETRIES")?
+        let max_retries = env_parse::<u32>(ENV_MAX_RETRIES)?
             .or(file_config.max_retries)
             .unwrap_or(15);
-        let initial_delay_ms = env_parse::<u64>("AGY_GYRO_INITIAL_DELAY_MS")?
+        let initial_delay_ms = env_parse::<u64>(ENV_INITIAL_DELAY_MS)?
             .or(file_config.initial_delay_ms)
             .unwrap_or(1000);
-        let max_delay_ms = env_parse::<u64>("AGY_GYRO_MAX_DELAY_MS")?
+        let max_delay_ms = env_parse::<u64>(ENV_MAX_DELAY_MS)?
             .or(file_config.max_delay_ms)
             .unwrap_or(60000);
-        let no_jitter = env_bool("AGY_GYRO_NO_JITTER")?
+        let no_jitter = env_bool(ENV_NO_JITTER)?
             .or(file_config.no_jitter)
             .unwrap_or(false);
-        let no_buffer = env_bool("AGY_GYRO_NO_BUFFER")?
+        let no_buffer = env_bool(ENV_NO_BUFFER)?
             .or(file_config.no_buffer)
             .unwrap_or(false);
-        let request_timeout_secs = env_parse::<u64>("AGY_GYRO_REQUEST_TIMEOUT_SECS")?
+        let request_timeout_secs = env_parse::<u64>(ENV_REQUEST_TIMEOUT_SECS)?
             .or(file_config.request_timeout_secs)
             .unwrap_or(600);
-        let api_key = env_non_empty("GEMINI_API_KEY")
-            .or_else(|| env_non_empty("AGY_GYRO_API_KEY"))
+        let api_key = env_non_empty(ENV_GEMINI_API_KEY)
+            .or_else(|| env_non_empty(ENV_API_KEY))
             .or(file_config.api_key)
             .unwrap_or_default();
-        let agy_path = env_non_empty("AGY_GYRO_AGY_PATH")
+        let agy_path = env_non_empty(ENV_AGY_PATH)
             .or(file_config.agy_path)
             .unwrap_or_else(|| "agy".to_string());
-        let log_file = env_non_empty("AGY_GYRO_LOG_FILE")
+        let log_file = env_non_empty(ENV_LOG_FILE)
             .map(PathBuf::from)
             .or(file_config.log_file);
-        let url = env_non_empty("AGY_GYRO_URL");
+        let url = env_non_empty(ENV_URL);
 
         let config = Config {
             host: host.clone(),
@@ -180,50 +247,38 @@ impl Cli {
         };
 
         let command = match args.first().map(|s| s.as_str()) {
-            Some("server") => Some(Commands::Server(ServerArgs {
-                config: config.clone(),
-                log_file: log_file.clone(),
-            })),
-            Some("monitor") => Some(Commands::Monitor(MonitorArgs {
-                url: url.clone(),
-                host: host.clone(),
-                port,
-            })),
-            Some("stop") => Some(Commands::Stop(MonitorArgs { url, host, port })),
-            _ => None,
+            Some("server") => Commands::Server(ServerArgs { config, log_file }),
+            Some("monitor") => Commands::Monitor(MonitorArgs { url, host, port }),
+            Some("stop") => Commands::Stop(MonitorArgs { url, host, port }),
+            _ => {
+                let agy_args = if args.first().map(|s| s.as_str()) == Some("--") {
+                    args[1..].to_vec()
+                } else {
+                    args
+                };
+                Commands::Run(WrapperArgs {
+                    config,
+                    agy_path,
+                    log_file,
+                    agy_args,
+                })
+            }
         };
 
-        let agy_args = if command.is_some() {
-            Vec::new()
-        } else if args.first().map(|s| s.as_str()) == Some("--") {
-            args[1..].to_vec()
-        } else {
-            args
+        let missing_api_key = match &command {
+            Commands::Server(s) => s.config.api_key.trim().is_empty(),
+            Commands::Run(w) => w.config.api_key.trim().is_empty(),
+            Commands::Monitor(_) | Commands::Stop(_) => false,
         };
 
-        let wrapper_args = WrapperArgs {
-            config,
-            agy_path,
-            log_file,
-            agy_args,
-        };
-
-        let requires_api_key = matches!(
-            command,
-            Some(Commands::Server(_)) | Some(Commands::Run(_)) | None
-        );
-
-        if requires_api_key && wrapper_args.config.api_key.trim().is_empty() {
+        if missing_api_key {
             return Err(
                 "missing Gemini API key: set GEMINI_API_KEY or configure `api_key` in ~/.gemini/config/agy-gyro.toml"
                     .to_string(),
             );
         }
 
-        Ok(Self {
-            command,
-            wrapper_args,
-        })
+        Ok(Self { command })
     }
 }
 
@@ -252,32 +307,14 @@ pub struct MonitorArgs {
 impl MonitorArgs {
     pub fn resolve_base_url(&self) -> String {
         if let Some(ref u) = self.url {
-            let trimmed = u.trim().trim_end_matches('/');
-            let base = trimmed
-                .strip_suffix("/usage")
-                .or_else(|| trimmed.strip_suffix("/logs"))
-                .unwrap_or(trimmed);
-            if base.starts_with("http://") || base.starts_with("https://") {
-                base.to_string()
-            } else {
-                format!("http://{}", base)
-            }
+            normalize_base_url(u)
         } else {
-            let host = if self.host == "0.0.0.0" {
-                "127.0.0.1"
-            } else {
-                &self.host
-            };
-            format!("http://{}:{}", host, self.port)
+            format!("http://{}:{}", connect_host(&self.host), self.port)
         }
     }
 
     pub fn resolve_endpoint_url(&self) -> String {
-        if let Some(ref u) = self.url {
-            crate::tui::resolve_usage_endpoint_url(u)
-        } else {
-            format!("{}/usage", self.resolve_base_url())
-        }
+        format!("{}/usage", self.resolve_base_url())
     }
 }
 
@@ -330,5 +367,32 @@ impl Config {
 
     pub fn is_buffer_enabled(&self) -> bool {
         !self.no_buffer
+    }
+
+    /// Serializes this [`Config`] into environment variables on a child [`std::process::Command`].
+    pub fn apply_env_to_command(
+        &self,
+        cmd: &mut std::process::Command,
+        port: u16,
+        log_file: Option<&Path>,
+    ) {
+        cmd.env(ENV_HOST, &self.host)
+            .env(ENV_PORT, port.to_string())
+            .env(ENV_UPSTREAM, &self.upstream)
+            .env(ENV_UPSTREAM_URL, &self.upstream)
+            .env(ENV_MAX_RETRIES, self.max_retries.to_string())
+            .env(ENV_INITIAL_DELAY_MS, self.initial_delay_ms.to_string())
+            .env(ENV_MAX_DELAY_MS, self.max_delay_ms.to_string())
+            .env(ENV_NO_JITTER, self.no_jitter.to_string())
+            .env(ENV_NO_BUFFER, self.no_buffer.to_string())
+            .env(
+                ENV_REQUEST_TIMEOUT_SECS,
+                self.request_timeout_secs.to_string(),
+            )
+            .env(ENV_GEMINI_API_KEY, &self.api_key);
+
+        if let Some(log_file) = log_file {
+            cmd.env(ENV_LOG_FILE, log_file);
+        }
     }
 }

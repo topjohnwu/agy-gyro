@@ -21,38 +21,12 @@ use std::time::{Duration, Instant};
 
 /// Normalizes a gateway base URL or endpoint URL into a full `.../usage` endpoint URL.
 pub fn resolve_usage_endpoint_url(raw_url: &str) -> String {
-    let trimmed = raw_url.trim().trim_end_matches('/');
-    let with_scheme = if trimmed.starts_with("http://") || trimmed.starts_with("https://") {
-        trimmed.to_string()
-    } else {
-        format!("http://{}", trimmed)
-    };
-
-    if let Some(base) = with_scheme.strip_suffix("/logs") {
-        format!("{}/usage", base)
-    } else if with_scheme.ends_with("/usage") {
-        with_scheme
-    } else {
-        format!("{}/usage", with_scheme)
-    }
+    crate::config::resolve_endpoint_url(raw_url, "usage")
 }
 
 /// Normalizes a gateway base URL or endpoint URL into a full `.../logs` endpoint URL.
 pub fn resolve_logs_endpoint_url(raw_url: &str) -> String {
-    let trimmed = raw_url.trim().trim_end_matches('/');
-    let with_scheme = if trimmed.starts_with("http://") || trimmed.starts_with("https://") {
-        trimmed.to_string()
-    } else {
-        format!("http://{}", trimmed)
-    };
-
-    if let Some(base) = with_scheme.strip_suffix("/usage") {
-        format!("{}/logs", base)
-    } else if with_scheme.ends_with("/logs") {
-        with_scheme
-    } else {
-        format!("{}/logs", with_scheme)
-    }
+    crate::config::resolve_endpoint_url(raw_url, "logs")
 }
 
 /// Drains complete `\n`-terminated SSE `data:` JSON payloads from a raw byte buffer,

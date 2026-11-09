@@ -5,16 +5,19 @@ use agy_gyro::proxy::{ProxyState, create_router};
 use agy_gyro::runner::{run_wrapper, start_daemon, stop_daemon};
 use agy_gyro::tui::run_monitor;
 use agy_gyro::usage::{DEFAULT_PRICING_URL, UsageLogLayer, fetch_model_pricing};
+use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 use tracing::info;
-use tracing_subscriber::{EnvFilter, layer::SubscriberExt, util::SubscriberInitExt};
+use tracing_subscriber::{
+    EnvFilter, fmt::writer::BoxMakeWriter, layer::SubscriberExt, util::SubscriberInitExt,
+};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::load();
 
     match cli.command {
-        Some(Commands::Server(server_args)) => {
+        Commands::Server(server_args) => {
             if std::env::var_os("AGY_GYRO_DAEMON_WORKER").is_some() {
                 let rt = tokio::runtime::Builder::new_multi_thread()
                     .enable_all()
@@ -27,35 +30,30 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 rt.block_on(start_daemon(server_args))
             }
         }
-        Some(Commands::Monitor(monitor_args)) => {
+        Commands::Monitor(monitor_args) => {
             let rt = tokio::runtime::Builder::new_multi_thread()
                 .enable_all()
                 .build()?;
             rt.block_on(run_monitor(monitor_args))
         }
-        Some(Commands::Stop(stop_args)) => {
+        Commands::Stop(stop_args) => {
             let rt = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
                 .build()?;
             rt.block_on(stop_daemon(stop_args))
         }
-        Some(Commands::Run(wrapper_args)) => {
+        Commands::Run(wrapper_args) => {
             let code = run_wrapper(wrapper_args)?;
-            std::process::exit(code);
-        }
-        None => {
-            let code = run_wrapper(cli.wrapper_args)?;
             std::process::exit(code);
         }
     }
 }
 
-async fn run_server(server_args: ServerArgs) -> Result<(), Box<dyn std::error::Error>> {
-    // Initialize tracing subscriber with env filter
+fn init_server_tracing(log_file: Option<&Path>) -> Result<(), Box<dyn std::error::Error>> {
     let env_filter =
         EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info,agy_gyro=debug"));
 
-    if let Some(ref path) = server_args.log_file {
+    let (writer, use_ansi) = if let Some(path) = log_file {
         if let Some(parent) = path.parent() {
             let _ = std::fs::create_dir_all(parent);
         }
@@ -63,23 +61,26 @@ async fn run_server(server_args: ServerArgs) -> Result<(), Box<dyn std::error::E
             .create(true)
             .append(true)
             .open(path)?;
-
-        let _ = tracing_subscriber::registry()
-            .with(env_filter)
-            .with(
-                tracing_subscriber::fmt::layer()
-                    .with_writer(file)
-                    .with_ansi(false),
-            )
-            .with(UsageLogLayer)
-            .try_init();
+        (BoxMakeWriter::new(file), false)
     } else {
-        let _ = tracing_subscriber::registry()
-            .with(env_filter)
-            .with(tracing_subscriber::fmt::layer())
-            .with(UsageLogLayer)
-            .try_init();
-    }
+        (BoxMakeWriter::new(std::io::stdout), true)
+    };
+
+    let _ = tracing_subscriber::registry()
+        .with(env_filter)
+        .with(
+            tracing_subscriber::fmt::layer()
+                .with_writer(writer)
+                .with_ansi(use_ansi),
+        )
+        .with(UsageLogLayer)
+        .try_init();
+
+    Ok(())
+}
+
+async fn run_server(server_args: ServerArgs) -> Result<(), Box<dyn std::error::Error>> {
+    init_server_tracing(server_args.log_file.as_deref())?;
 
     let config = server_args.config;
 
@@ -114,7 +115,7 @@ async fn run_server(server_args: ServerArgs) -> Result<(), Box<dyn std::error::E
             fetch_model_pricing(&client, DEFAULT_PRICING_URL)
         ),
     };
-    state.set_gateway_models(gateway_models.clone());
+    state.set_gateway_models(gateway_models);
     state.usage.set_pricing(pricing);
 
     let shutdown_rx = state.subscribe_shutdown();
