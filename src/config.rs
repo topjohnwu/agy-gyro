@@ -12,9 +12,9 @@ pub const DEFAULT_PORT: u16 = 6470;
 
 pub const ENV_GEMINI_API_KEY: &str = "GEMINI_API_KEY";
 pub const ENV_API_KEY: &str = "AGY_GYRO_API_KEY";
+pub const ENV_OAUTH: &str = "AGY_GYRO_OAUTH";
 pub const ENV_HOST: &str = "AGY_GYRO_HOST";
 pub const ENV_PORT: &str = "AGY_GYRO_PORT";
-pub const ENV_UPSTREAM: &str = "AGY_GYRO_UPSTREAM";
 pub const ENV_AGY_PATH: &str = "AGY_GYRO_AGY_PATH";
 pub const ENV_LOG_FILE: &str = "AGY_GYRO_LOG_FILE";
 pub const ENV_MAX_RETRIES: &str = "AGY_GYRO_MAX_RETRIES";
@@ -28,9 +28,9 @@ pub const ENV_REQUEST_TIMEOUT_SECS: &str = "AGY_GYRO_REQUEST_TIMEOUT_SECS";
 pub const KNOWN_ENV_VARS: &[&str] = &[
     ENV_GEMINI_API_KEY,
     ENV_API_KEY,
+    ENV_OAUTH,
     ENV_HOST,
     ENV_PORT,
-    ENV_UPSTREAM,
     ENV_AGY_PATH,
     ENV_LOG_FILE,
     ENV_MAX_RETRIES,
@@ -78,9 +78,9 @@ pub enum Commands {
 pub struct FileConfig {
     pub host: Option<String>,
     pub port: Option<u16>,
-    pub upstream: Option<String>,
     #[serde(alias = "api-key")]
     pub api_key: Option<String>,
+    pub oauth: Option<bool>,
     #[serde(alias = "agy-path")]
     pub agy_path: Option<String>,
     #[serde(alias = "log-file")]
@@ -151,6 +151,8 @@ pub struct Config {
     pub upstream: String,
     /// Gemini API key for authenticating upstream requests
     pub api_key: String,
+    /// Explicitly lock to OAuth passthrough mode (token and price tracking only)
+    pub oauth: bool,
     /// Executable path or command name for Antigravity CLI
     pub agy_path: String,
     /// Optional log file path for agy-gyro proxy tracing logs
@@ -176,6 +178,7 @@ impl Default for Config {
             port: DEFAULT_PORT,
             upstream: "https://generativelanguage.googleapis.com".to_string(),
             api_key: String::new(),
+            oauth: false,
             agy_path: "agy".to_string(),
             log_file: None,
             max_retries: 15,
@@ -189,6 +192,17 @@ impl Default for Config {
 }
 
 impl Config {
+    /// Returns `true` if a non-empty Gemini API key is configured in this process.
+    pub fn has_api_key(&self) -> bool {
+        !self.api_key.trim().is_empty()
+    }
+
+    /// Returns `true` if Enterprise Gateway + retry/buffering proxy mode is enabled
+    /// in this process (`!self.oauth && self.has_api_key()`).
+    pub fn is_gateway_enabled(&self) -> bool {
+        !self.oauth && self.has_api_key()
+    }
+
     pub fn is_jitter_enabled(&self) -> bool {
         !self.no_jitter
     }
@@ -216,7 +230,6 @@ impl Config {
     pub fn apply_env_to_command(&self, cmd: &mut std::process::Command, port: u16) {
         cmd.env(ENV_HOST, &self.host)
             .env(ENV_PORT, port.to_string())
-            .env(ENV_UPSTREAM, &self.upstream)
             .env(ENV_MAX_RETRIES, self.max_retries.to_string())
             .env(ENV_INITIAL_DELAY_MS, self.initial_delay_ms.to_string())
             .env(ENV_MAX_DELAY_MS, self.max_delay_ms.to_string())
@@ -226,6 +239,7 @@ impl Config {
                 ENV_REQUEST_TIMEOUT_SECS,
                 self.request_timeout_secs.to_string(),
             )
+            .env_remove(ENV_OAUTH)
             .env(ENV_API_KEY, &self.api_key)
             .env(ENV_GEMINI_API_KEY, &self.api_key);
 
@@ -281,9 +295,6 @@ impl Cli {
         let port = env_parse::<u16>(ENV_PORT)?
             .or(file_config.port)
             .unwrap_or(DEFAULT_PORT);
-        let upstream = env_non_empty(ENV_UPSTREAM)
-            .or(file_config.upstream)
-            .unwrap_or_else(|| "https://generativelanguage.googleapis.com".to_string());
         let max_retries = env_parse::<u32>(ENV_MAX_RETRIES)?
             .or(file_config.max_retries)
             .unwrap_or(15);
@@ -306,6 +317,7 @@ impl Cli {
             .or_else(|| env_non_empty(ENV_GEMINI_API_KEY))
             .or(file_config.api_key)
             .unwrap_or_default();
+        let oauth = env_bool(ENV_OAUTH)?.or(file_config.oauth).unwrap_or(false);
         let agy_path = env_non_empty(ENV_AGY_PATH)
             .or(file_config.agy_path)
             .unwrap_or_else(|| "agy".to_string());
@@ -316,7 +328,7 @@ impl Cli {
         let config = Config {
             host,
             port,
-            upstream,
+            upstream: "https://generativelanguage.googleapis.com".to_string(),
             max_retries,
             initial_delay_ms,
             max_delay_ms,
@@ -324,6 +336,7 @@ impl Cli {
             no_buffer,
             request_timeout_secs,
             api_key,
+            oauth,
             agy_path,
             log_file,
         };
@@ -341,14 +354,6 @@ impl Cli {
                 Commands::Run(agy_args)
             }
         };
-
-        let requires_api_key = matches!(command, Commands::Server | Commands::Run(_));
-        if requires_api_key && config.api_key.trim().is_empty() {
-            return Err(
-                "missing Gemini API key: set GEMINI_API_KEY or configure `api_key` in ~/.gemini/config/agy-gyro.toml"
-                    .to_string(),
-            );
-        }
 
         Ok(Self { config, command })
     }

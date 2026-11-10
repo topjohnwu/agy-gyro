@@ -123,6 +123,23 @@ pub fn extract_session_from_headers(headers: &axum::http::HeaderMap) -> Option<S
     None
 }
 
+/// Strips a leading `/s/<session_id>` prefix from a request path (and query), returning
+/// `(Some(session_id), remaining_path_and_query)` when present, or `(None, path_and_query)` otherwise.
+pub fn strip_session_prefix(path_and_query: &str) -> (Option<&str>, &str) {
+    if let Some(after_s) = path_and_query.strip_prefix("/s/")
+        && let Some(slash_idx) = after_s.find('/')
+    {
+        let session_id = after_s[..slash_idx].trim();
+        let rest = &after_s[slash_idx..];
+        if !session_id.is_empty() {
+            let trimmed_rest = rest.trim_start_matches('/');
+            let normalized_rest = &rest[rest.len() - trimmed_rest.len() - 1..];
+            return (Some(session_id), normalized_rest);
+        }
+    }
+    (None, path_and_query)
+}
+
 /// Returns `true` if the OS process with the given `pid` is currently alive.
 pub fn is_pid_alive(pid: u32) -> bool {
     if pid == 0 {

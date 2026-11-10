@@ -98,10 +98,7 @@ fn resolve_daemon_exe() -> Result<PathBuf, Box<dyn std::error::Error>> {
     Err("Unable to locate agy-gyro executable to spawn background daemon".into())
 }
 
-fn spawn_background_daemon(
-    cfg: &Config,
-    port: u16,
-) -> Result<(), Box<dyn std::error::Error>> {
+fn spawn_background_daemon(cfg: &Config, port: u16) -> Result<(), Box<dyn std::error::Error>> {
     let exe = resolve_daemon_exe()?;
 
     let mut cmd = std::process::Command::new(exe);
@@ -217,7 +214,7 @@ async fn ensure_daemon_and_register(
     config: &Config,
     pid: Option<u32>,
     label: &str,
-) -> Result<(String, String, String), Box<dyn std::error::Error>> {
+) -> Result<(String, RegisterSessionResponse), Box<dyn std::error::Error>> {
     let label_owned = label.to_string();
     let (daemon_url, reg, _) = ensure_daemon_ready(config, move |client, url| {
         let lbl = label_owned.clone();
@@ -225,7 +222,7 @@ async fn ensure_daemon_and_register(
     })
     .await?;
 
-    Ok((daemon_url, reg.session_id, reg.api_key))
+    Ok((daemon_url, reg))
 }
 
 fn cleanup_failed_session(daemon_url: &str, session_id: &str) {
@@ -254,32 +251,46 @@ fn cleanup_failed_session(daemon_url: &str, session_id: &str) {
 /// Ensures the background `agy-gyro` daemon is running, registers a session for this `agy`
 /// instance, configures the gateway environment variables, and replaces the current process
 /// in-place with `agy` (`execvp` on Unix) so no wrapper process remains.
-pub fn run_wrapper(config: Config, agy_args: Vec<String>) -> Result<i32, Box<dyn std::error::Error>> {
+pub fn run_wrapper(
+    config: Config,
+    agy_args: Vec<String>,
+) -> Result<i32, Box<dyn std::error::Error>> {
     let pid = Some(std::process::id());
     let label = current_workspace_label();
 
-    let (daemon_url, session_id, session_api_key) = {
+    let (daemon_url, reg) = {
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()?;
         rt.block_on(ensure_daemon_and_register(&config, pid, &label))?
     };
 
+    let use_gateway = config.is_gateway_enabled() && reg.gateway_enabled;
+
     let mut cmd = std::process::Command::new(&config.agy_path);
     cmd.args(&agy_args)
-        .env("AGY_LLM_GATEWAY_URL", &daemon_url)
-        .env("AGY_LLM_GATEWAY_WIRE_PROTOCOL", "genai")
-        .env("AGY_LLM_GATEWAY_API_KEY", &session_api_key)
         .env("AGY_ENABLE_HUB", "1")
         .stdin(Stdio::inherit())
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit());
 
+    if use_gateway {
+        cmd.env("AGY_LLM_GATEWAY_URL", &daemon_url)
+            .env("AGY_LLM_GATEWAY_WIRE_PROTOCOL", "genai")
+            .env("AGY_LLM_GATEWAY_API_KEY", &reg.api_key);
+    } else {
+        let session_base_url = format!("{}/s/{}", daemon_url.trim_end_matches('/'), reg.session_id);
+        cmd.env("CLOUD_CODE_URL", &session_base_url)
+            .env_remove("AGY_LLM_GATEWAY_URL")
+            .env_remove("AGY_LLM_GATEWAY_WIRE_PROTOCOL")
+            .env_remove("AGY_LLM_GATEWAY_API_KEY");
+    }
+
     #[cfg(unix)]
     {
         use std::os::unix::process::CommandExt;
         let err = cmd.exec();
-        cleanup_failed_session(&daemon_url, &session_id);
+        cleanup_failed_session(&daemon_url, &reg.session_id);
         eprintln!("agy-gyro: failed to execute '{}': {}", config.agy_path, err);
         Ok(127)
     }
@@ -289,7 +300,7 @@ pub fn run_wrapper(config: Config, agy_args: Vec<String>) -> Result<i32, Box<dyn
         match cmd.status() {
             Ok(status) => Ok(status.code().unwrap_or(1)),
             Err(err) => {
-                cleanup_failed_session(&daemon_url, &session_id);
+                cleanup_failed_session(&daemon_url, &reg.session_id);
                 eprintln!("agy-gyro: failed to execute '{}': {}", config.agy_path, err);
                 Ok(127)
             }

@@ -47,9 +47,44 @@ async fn spawn_test_proxy_with_keep_alive(
     };
 
     let client = build_http_client(&config).unwrap();
+    let pricing = agy_gyro::usage::parse_models_dev_pricing(
+        r#"{
+            "google": {
+                "models": {
+                    "gemini-2.5-pro": {
+                        "cost": {
+                            "input": 1.25,
+                            "output": 10.0,
+                            "cache_read": 0.125,
+                            "context_over_200k": {
+                                "input": 2.5,
+                                "output": 15.0,
+                                "cache_read": 0.25
+                            }
+                        }
+                    }
+                }
+            },
+            "anthropic": {
+                "models": {
+                    "claude-sonnet-4-5": {
+                        "cost": {
+                            "input": 3.0,
+                            "output": 15.0,
+                            "cache_read": 0.3
+                        }
+                    }
+                }
+            }
+        }"#,
+    )
+    .unwrap();
 
-    let state =
-        Arc::new(ProxyState::new(config, client).with_keep_alive_interval(keep_alive_interval));
+    let state = Arc::new(
+        ProxyState::new(config, client)
+            .with_keep_alive_interval(keep_alive_interval)
+            .with_pricing(pricing),
+    );
 
     let app = create_router(state);
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -829,9 +864,15 @@ fn test_cli_parse_toml_config() {
     let temp_path = std::env::temp_dir().join(format!("agy-gyro-test-{}.toml", std::process::id()));
     let _ = std::fs::remove_file(&temp_path);
 
-    // Missing config file uses defaults; fails if api_key is not configured
-    assert!(Cli::try_parse_with_config_from(["agy-gyro"], Some(&temp_path)).is_err());
-    assert!(Cli::try_parse_with_config_from(["agy-gyro", "server"], Some(&temp_path)).is_err());
+    // Missing config file uses defaults; succeeds in OAuth passthrough mode when api_key is absent
+    let cli_no_key = Cli::try_parse_with_config_from(["agy-gyro"], Some(&temp_path)).unwrap();
+    assert!(cli_no_key.config.api_key.is_empty());
+    assert!(!cli_no_key.config.oauth);
+    assert!(!cli_no_key.config.is_gateway_enabled());
+
+    let cli_server_no_key =
+        Cli::try_parse_with_config_from(["agy-gyro", "server"], Some(&temp_path)).unwrap();
+    assert!(!cli_server_no_key.config.is_gateway_enabled());
 
     // Create temporary agy-gyro.toml
     std::fs::write(
@@ -839,7 +880,6 @@ fn test_cli_parse_toml_config() {
         r#"
 host = "192.168.1.10"
 port = 7070
-upstream = "https://custom.googleapis.com"
 api_key = "toml-gemini-key"
 agy_path = "/toml/agy"
 log_file = "/tmp/toml.log"
@@ -858,7 +898,10 @@ request_timeout_secs = 120
     assert_eq!(cli.command, Commands::Run(Vec::new()));
     assert_eq!(cli.config.host, "192.168.1.10");
     assert_eq!(cli.config.port, 7070);
-    assert_eq!(cli.config.upstream, "https://custom.googleapis.com");
+    assert_eq!(
+        cli.config.upstream,
+        "https://generativelanguage.googleapis.com"
+    );
     assert_eq!(cli.config.api_key, "toml-gemini-key");
     assert_eq!(cli.config.agy_path, "/toml/agy");
     assert_eq!(
@@ -898,10 +941,20 @@ request_timeout_secs = 120
     assert_eq!(cli_env.config.agy_path, "/custom/agy");
     assert!(!cli_env.config.no_buffer);
     assert!(cli_env.config.is_buffer_enabled());
+    assert!(cli_env.config.is_gateway_enabled());
     assert_eq!(cli_env.config.api_key, "env-gemini-key-123");
     // TOML still applies for fields not set via Env
     assert_eq!(cli_env.config.port, 7070);
     assert_eq!(cli_env.config.initial_delay_ms, 500);
+
+    // 3b. Explicit `AGY_GYRO_OAUTH=1` or `oauth = true` locks to OAuth passthrough even with api_key set
+    unsafe {
+        std::env::set_var("AGY_GYRO_OAUTH", "1");
+    }
+    let cli_oauth_env = Cli::try_parse_with_config_from(["agy-gyro"], Some(&temp_path)).unwrap();
+    clear_test_env_vars();
+    assert!(cli_oauth_env.config.oauth);
+    assert!(!cli_oauth_env.config.is_gateway_enabled());
 
     // 4. Unknown TOML keys are ignored
     std::fs::write(
@@ -1275,24 +1328,25 @@ async fn test_live_usage_endpoint_tracks_tokens_retries_and_cost() {
     assert_eq!(snap.totals.thoughts_tokens, 3_000);
     assert_eq!(snap.totals.total_tokens, 156_000);
 
-    // Verify per-model cost for gemini-4-argon ($2/1M in, $0.10/1M cached, $10/1M out):
-    // uncached: 20k * $2/1M = $0.04; cached: 80k * $0.10/1M = $0.008; output: 5k * $10/1M = $0.05 -> total = $0.098
+    // Verify gemini-4-argon (unknown upstream pricing) has zero cost and no pricing entry
     let argon = &snap.models["gemini-4-argon"];
     assert_eq!(argon.totals.requests, 1);
     assert_eq!(argon.totals.retries, 1);
-    assert!((argon.totals.uncached_input_cost_usd - 0.04).abs() < 1e-9);
-    assert!((argon.totals.cached_input_cost_usd - 0.008).abs() < 1e-9);
-    assert!((argon.totals.output_cost_usd - 0.05).abs() < 1e-9);
-    assert!((argon.totals.total_cost_usd - 0.098).abs() < 1e-9);
+    assert!(argon.pricing.is_none());
+    assert_eq!(argon.totals.uncached_input_cost_usd, 0.0);
+    assert_eq!(argon.totals.cached_input_cost_usd, 0.0);
+    assert_eq!(argon.totals.output_cost_usd, 0.0);
+    assert_eq!(argon.totals.total_cost_usd, 0.0);
 
     // Verify per-model cost for gemini-2.5-pro ($1.25/1M in, $0.125/1M cached, $10/1M out):
     // uncached: 40k * $1.25/1M = $0.05; cached: 10k * $0.125/1M = $0.00125; output: 1k * $10/1M = $0.01 -> total = $0.06125
     let pro = &snap.models["gemini-2.5-pro"];
     assert_eq!(pro.totals.requests, 1);
+    assert!(pro.pricing.is_some());
     assert!((pro.totals.total_cost_usd - 0.06125).abs() < 1e-9);
 
-    // Verify total cost across both models: $0.098 + $0.06125 = $0.15925
-    assert!((snap.totals.total_cost_usd - 0.15925).abs() < 1e-9);
+    // Verify total cost across both models: $0.0 + $0.06125 = $0.06125
+    assert!((snap.totals.total_cost_usd - 0.06125).abs() < 1e-9);
 
     // Verify real-time tracing logs (including 429 retry warning and completed request logs) are streamed on /logs
     let logs_url = format!("{}/logs", proxy_url);
@@ -1304,7 +1358,10 @@ async fn test_live_usage_endpoint_tracks_tokens_retries_and_cost() {
     );
     assert!(logs.iter().any(|l| l.level == "INFO"
         && l.message.contains("gemini-4-argon")
-        && l.message.contains("cost=$0.098000")));
+        && !l.message.contains("cost=")));
+    assert!(logs.iter().any(|l| l.level == "INFO"
+        && l.message.contains("gemini-2.5-pro")
+        && l.message.contains("cost=$0.061250")));
 
     // Verify reset endpoint clears counters and logs
     let reset_snap = reset_remote_usage(&client, &usage_url).await.unwrap();
@@ -1316,7 +1373,7 @@ async fn test_live_usage_endpoint_tracks_tokens_retries_and_cost() {
     assert!(
         !reset_logs
             .iter()
-            .any(|l| l.message.contains("cost=$0.098000"))
+            .any(|l| l.message.contains("cost=$0.061250"))
     );
 }
 
@@ -1361,7 +1418,7 @@ async fn test_no_buffer_passthrough_mode_records_usage_on_stream_completion() {
     assert_eq!(snap.totals.uncached_input_tokens, 15_000);
     assert_eq!(snap.totals.cached_input_tokens, 5_000);
     assert_eq!(snap.totals.output_tokens, 1_000);
-    assert!(snap.totals.total_cost_usd > 0.0);
+    assert_eq!(snap.totals.total_cost_usd, 0.0);
 }
 
 #[test]
@@ -1551,7 +1608,6 @@ async fn test_multi_session_registration_attribution_and_exit() {
 
 #[tokio::test]
 async fn test_server_and_stop_subcommands_spawn_and_stop_background_daemon() {
-    let mock_server = MockServer::start().await;
     let free_port = {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         listener.local_addr().unwrap().port()
@@ -1563,11 +1619,7 @@ async fn test_server_and_stop_subcommands_spawn_and_stop_background_daemon() {
     std::fs::create_dir_all(&config_dir).unwrap();
     std::fs::write(
         config_dir.join("agy-gyro.toml"),
-        format!(
-            "host = \"127.0.0.1\"\nport = {}\nupstream = \"{}\"\napi_key = \"test-gemini-key\"\n",
-            free_port,
-            mock_server.uri()
-        ),
+        format!("host = \"127.0.0.1\"\nport = {}\n", free_port),
     )
     .unwrap();
 
@@ -1607,4 +1659,240 @@ async fn test_server_and_stop_subcommands_spawn_and_stop_background_daemon() {
     assert!(out_stop.status.success());
     let stdout_stop = String::from_utf8_lossy(&out_stop.stdout);
     assert!(stdout_stop.contains("Stopped agy-gyro daemon"));
+}
+
+#[tokio::test]
+async fn test_oauth_passthrough_tracks_tokens_and_cost_with_zero_retries_and_no_buffering() {
+    use agy_gyro::proxy::{RegisterSessionRequest, RegisterSessionResponse};
+    use agy_gyro::tui::fetch_usage_snapshot;
+
+    let mock_server = MockServer::start().await;
+
+    // 1. Non-generation metadata RPC (:loadCodeAssist) preserves Bearer token and is not counted in /usage
+    Mock::given(method("POST"))
+        .and(path("/v1internal:loadCodeAssist"))
+        .and(header("authorization", "Bearer test-oauth-token"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "application/json")
+                .set_body_json(serde_json::json!({
+                    "currentTier": { "id": "g1-pro-tier" },
+                    "paidTier": { "id": "g1-pro-tier", "usesGcpTos": false }
+                })),
+        )
+        .expect(1)
+        .mount(&mock_server)
+        .await;
+
+    // 2. Generation RPC (:streamGenerateContent) with nested CCPA response envelope and Claude model
+    Mock::given(method("POST"))
+        .and(path("/v1internal:streamGenerateContent"))
+        .and(query_param("alt", "sse"))
+        .and(header("authorization", "Bearer test-oauth-token"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "text/event-stream")
+                .set_body_string(
+                    "data: {\"response\": {\"candidates\": [{\"content\": {\"parts\": [{\"text\": \"Hello from Claude\"}]}}], \"usageMetadata\": {\"promptTokenCount\": 100000, \"cachedContentTokenCount\": 40000, \"candidatesTokenCount\": 2000, \"thoughtsTokenCount\": 3000, \"totalTokenCount\": 105000}, \"modelVersion\": \"claude-sonnet-4-5@20250929\"}}\n\n",
+                ),
+        )
+        .expect(1)
+        .mount(&mock_server)
+        .await;
+
+    // 3. Non-streaming generation RPC (:generateContent) returning 429 must NOT be retried even when max_retries = 5
+    Mock::given(method("POST"))
+        .and(path("/v1internal:generateContent"))
+        .and(header("authorization", "Bearer test-oauth-token"))
+        .respond_with(
+            ResponseTemplate::new(429)
+                .insert_header("retry-after", "0")
+                .set_body_string("RESOURCE_EXHAUSTED"),
+        )
+        .expect(1)
+        .mount(&mock_server)
+        .await;
+
+    // Start daemon with API key and max_retries = 5
+    let proxy_url = spawn_test_proxy(mock_server.uri(), 5).await;
+    let client = Client::new();
+
+    let reg: RegisterSessionResponse = client
+        .post(format!("{}/sessions", proxy_url))
+        .json(&RegisterSessionRequest {
+            pid: Some(std::process::id()),
+            label: "oauth-workspace".to_string(),
+        })
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(reg.gateway_enabled);
+
+    // Send :loadCodeAssist via /s/<session_id>
+    let load_res = client
+        .post(format!(
+            "{}/s/{}/v1internal:loadCodeAssist",
+            proxy_url, reg.session_id
+        ))
+        .header("Authorization", "Bearer test-oauth-token")
+        .body(r#"{"metadata":{"ideType":"ANTIGRAVITY"}}"#)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(load_res.status(), 200);
+
+    // Verify :loadCodeAssist did not increment request counters and did not inject x-goog-api-key
+    let snap_after_load = fetch_usage_snapshot(&client, &format!("{}/usage", proxy_url))
+        .await
+        .unwrap();
+    assert_eq!(snap_after_load.total_requests, 0);
+
+    let received = mock_server.received_requests().await.unwrap();
+    assert_eq!(received.len(), 1);
+    assert!(!received[0].headers.contains_key("x-goog-api-key"));
+
+    // Send :streamGenerateContent via /s/<session_id>
+    let stream_res = client
+        .post(format!(
+            "{}/s/{}/v1internal:streamGenerateContent?alt=sse",
+            proxy_url, reg.session_id
+        ))
+        .header("Authorization", "Bearer test-oauth-token")
+        .body(r#"{"model":"models/claude-sonnet-4-5-thinking","request":{"contents":[]}}"#)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(stream_res.status(), 200);
+    let body_text = stream_res.text().await.unwrap();
+    assert!(body_text.contains("Hello from Claude"));
+    assert!(!body_text.contains(": keep-alive"));
+
+    let snap = fetch_usage_snapshot(&client, &format!("{}/usage", proxy_url))
+        .await
+        .unwrap();
+    assert_eq!(snap.total_requests, 1);
+    assert_eq!(snap.successful_requests, 1);
+    assert_eq!(snap.total_retries, 0);
+    assert_eq!(snap.totals.input_tokens, 100_000);
+    assert_eq!(snap.totals.uncached_input_tokens, 60_000);
+    assert_eq!(snap.totals.cached_input_tokens, 40_000);
+    assert_eq!(snap.totals.output_tokens, 5_000);
+
+    // claude-sonnet-4-5@20250929 pricing ($3/1M uncached in, $0.30/1M cached in, $15/1M out):
+    // 60k * $3/1M = $0.18 + 40k * $0.30/1M = $0.012 + 5k * $15/1M = $0.075 -> total = $0.267
+    let claude_stats = &snap.models["claude-sonnet-4-5@20250929"];
+    assert_eq!(claude_stats.totals.requests, 1);
+    assert!((claude_stats.totals.total_cost_usd - 0.267).abs() < 1e-9);
+    assert_eq!(snap.sessions.len(), 1);
+    assert_eq!(snap.sessions[0].id, reg.session_id);
+    assert_eq!(snap.sessions[0].totals.input_tokens, 100_000);
+
+    // Send 429 request: must NOT retry in OAuth passthrough mode even though daemon has max_retries = 5
+    let err_res = client
+        .post(format!(
+            "{}/s/{}/v1internal:generateContent",
+            proxy_url, reg.session_id
+        ))
+        .header("Authorization", "Bearer test-oauth-token")
+        .body(r#"{"model":"models/gemini-2.5-pro","request":{"contents":[]}}"#)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(err_res.status(), 429);
+
+    let snap_after_429 = fetch_usage_snapshot(&client, &format!("{}/usage", proxy_url))
+        .await
+        .unwrap();
+    assert_eq!(snap_after_429.total_requests, 2);
+    assert_eq!(snap_after_429.failed_requests, 1);
+    assert_eq!(snap_after_429.total_retries, 0);
+}
+
+#[tokio::test]
+async fn test_run_wrapper_oauth_mode_sets_endpoint_env_vars() {
+    let mock_server = MockServer::start().await;
+    // Start a daemon that HAS an API key configured
+    let proxy_url = spawn_test_proxy(mock_server.uri(), 3).await;
+    let port = reqwest::Url::parse(&proxy_url)
+        .unwrap()
+        .port()
+        .expect("proxy port");
+
+    let temp_home = std::env::temp_dir().join(format!(
+        "agy-gyro-oauth-wrapper-home-{}",
+        std::process::id()
+    ));
+    let config_dir = temp_home.join(".gemini").join("config");
+    std::fs::create_dir_all(&config_dir).unwrap();
+
+    // Case 1: Client config has NO api_key -> locked to Functionality 2 (OAuth passthrough)
+    // even though the daemon has an API key
+    std::fs::write(
+        config_dir.join("agy-gyro.toml"),
+        format!("host = \"127.0.0.1\"\nport = {}\nagy_path = \"sh\"\n", port),
+    )
+    .unwrap();
+
+    let status1 = tokio::process::Command::new(env!("CARGO_BIN_EXE_agy-gyro"))
+        .env("HOME", &temp_home)
+        .env("USERPROFILE", &temp_home)
+        .env_remove("GEMINI_API_KEY")
+        .env_remove("AGY_GYRO_API_KEY")
+        .args([
+            "-c",
+            r#"
+                case "$CLOUD_CODE_URL" in "http://127.0.0.1:"*"/s/"*) ;; *) exit 1 ;; esac &&
+                test -z "$AGY_LLM_GATEWAY_URL" &&
+                test -z "$AGY_LLM_GATEWAY_WIRE_PROTOCOL" &&
+                test -z "$AGY_LLM_GATEWAY_API_KEY" &&
+                exit 43
+            "#,
+        ])
+        .status()
+        .await
+        .unwrap();
+    assert_eq!(status1.code(), Some(43));
+
+    // Case 2: Client config HAS api_key, but AGY_GYRO_OAUTH=1 is set -> locked to Functionality 2
+    std::fs::write(
+        config_dir.join("agy-gyro.toml"),
+        format!(
+            "host = \"127.0.0.1\"\nport = {}\napi_key = \"client-key\"\nagy_path = \"sh\"\n",
+            port
+        ),
+    )
+    .unwrap();
+
+    let status2 = tokio::process::Command::new(env!("CARGO_BIN_EXE_agy-gyro"))
+        .env("HOME", &temp_home)
+        .env("USERPROFILE", &temp_home)
+        .env("AGY_GYRO_OAUTH", "1")
+        .args([
+            "-c",
+            r#"
+                case "$CLOUD_CODE_URL" in "http://127.0.0.1:"*"/s/"*) ;; *) exit 1 ;; esac &&
+                test -z "$AGY_LLM_GATEWAY_URL" &&
+                exit 44
+            "#,
+        ])
+        .status()
+        .await
+        .unwrap();
+
+    let _ = std::fs::remove_dir_all(&temp_home);
+    assert_eq!(status2.code(), Some(44));
+}
+
+#[test]
+fn test_oauth_upstream_routing() {
+    use agy_gyro::proxy::{DEFAULT_OAUTH_UPSTREAM, resolve_oauth_upstream_base};
+
+    let config = Config::default(); // upstream = DEFAULT_GENAI_UPSTREAM, api_key = ""
+    let client = build_http_client(&config).unwrap();
+    let state = ProxyState::new(config, client);
+    assert!(state.gateway_models().is_empty());
+    assert_eq!(resolve_oauth_upstream_base(&state), DEFAULT_OAUTH_UPSTREAM);
 }

@@ -120,7 +120,6 @@ Settings are resolved in order of precedence: **Environment variables > `~/.gemi
 | :--------------------------- | :------------------------------------------ | :------------------------------------------------------- |
 | `host`                       | `127.0.0.1`                                 | Host address to bind or connect to the gateway server    |
 | `port`                       | `6470`                                      | Port to listen on or connect to (`0` = OS-assigned port) |
-| `upstream`                   | `https://generativelanguage.googleapis.com` | Target upstream Gemini API base URL                      |
 | `api_key`                    | _Required_                                  | Gemini API key for authenticating upstream requests      |
 | `agy_path`                   | `agy`                                       | Executable path for Antigravity CLI                      |
 | `log_file`                   | _None_                                      | Path to log file for daemon proxy tracing logs           |
