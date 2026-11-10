@@ -220,16 +220,34 @@ impl PricingTable {
             return Some(p.clone());
         }
 
-        // Try matching by longest prefix in the pricing table (e.g. "gemini-2.5-pro-preview-05-06")
+        // Try matching by longest prefix in the pricing table (e.g. "gemini-2.5-pro-preview-05-06"),
+        // without cross-matching a base `-flash` key against a `-flash-lite` model.
+        let is_lite = cleaned.contains("-lite");
         let mut best_match: Option<(&str, &ModelPricing)> = None;
         for (key, pricing) in &self.models {
             if cleaned.starts_with(key.as_str())
+                && (key.contains("-lite") == is_lite)
                 && best_match.is_none_or(|(best_k, _)| key.len() > best_k.len())
             {
                 best_match = Some((key.as_str(), pricing));
             }
         }
-        best_match.map(|(_, pricing)| pricing.clone())
+        if let Some((_, pricing)) = best_match {
+            return Some(pricing.clone());
+        }
+
+        // Family fallback for newly released Gemini models not yet listed in the pricing table.
+        if cleaned.starts_with("gemini-") && !cleaned.contains("embedding") {
+            if cleaned.contains("flash-lite") {
+                return self.models.get("gemini-3.5-flash-lite").cloned();
+            }
+            if cleaned.contains("flash") {
+                return self.models.get("gemini-3.8-flash").cloned();
+            }
+            return self.models.get("gemini-4-argon").cloned();
+        }
+
+        None
     }
 }
 
@@ -423,5 +441,29 @@ mod tests {
         assert_eq!(custom.input_over_200k_per_1m, Some(3.0));
         assert_eq!(custom.cached_over_200k_per_1m, Some(0.30));
         assert_eq!(custom.output_over_200k_per_1m, Some(12.0));
+    }
+
+    #[test]
+    fn test_pricing_lookup_future_gemini_family_fallback() {
+        let table = PricingTable::built_in();
+
+        let future_primary = table.lookup("gemini-5-neon-high").unwrap();
+        assert_eq!(future_primary.input_per_1m, 2.0);
+        assert_eq!(future_primary.output_per_1m, 10.0);
+
+        let future_flash = table.lookup("gemini-3.9-flash-medium").unwrap();
+        assert_eq!(future_flash.input_per_1m, 0.75);
+        assert_eq!(future_flash.output_per_1m, 3.75);
+
+        let future_lite = table.lookup("gemini-3.9-flash-lite").unwrap();
+        assert_eq!(future_lite.input_per_1m, 0.30);
+        assert_eq!(future_lite.output_per_1m, 2.50);
+
+        // Must not prefix-match "gemini-3.8-flash" when looking up "gemini-3.8-flash-lite"
+        let same_ver_lite = table.lookup("gemini-3.8-flash-lite").unwrap();
+        assert_eq!(same_ver_lite.input_per_1m, 0.30);
+        assert_eq!(same_ver_lite.output_per_1m, 2.50);
+
+        assert!(table.lookup("non-gemini-model").is_none());
     }
 }

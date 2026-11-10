@@ -2,8 +2,10 @@
 
 use crate::config::Config;
 pub use crate::models::{
-    DEFAULT_GATEWAY_MODELS, EXCLUDED_MODELS, GeminiModelInfo, GeminiModelsResponse,
-    MODEL_EFFORT_LEVELS, expand_gateway_models, filter_core_gemini_models, resolve_gateway_models,
+    DEFAULT_GATEWAY_MODELS, GatewayModelEntry, GatewayModelsResponse, GeminiModelInfo,
+    GeminiModelsResponse, MODEL_EFFORT_LEVELS, NON_CORE_KEYWORDS, default_gateway_models,
+    expand_gateway_models, filter_core_gemini_models, inject_thinking_level_if_missing,
+    resolve_gateway_models, rewrite_request_path_and_extract_effort,
 };
 use crate::retry::{
     calculate_backoff, is_retriable_error, is_retriable_status, parse_in_stream_error,
@@ -41,7 +43,7 @@ pub struct ProxyState {
     pub upstream_base: String,
     pub keep_alive_interval: Duration,
     pub usage: Arc<UsageTracker>,
-    pub gateway_models: RwLock<String>,
+    pub gateway_models: RwLock<Vec<GatewayModelEntry>>,
     shutdown_tx: tokio::sync::watch::Sender<bool>,
 }
 
@@ -58,7 +60,7 @@ impl ProxyState {
         let usage = Arc::new(UsageTracker::default());
         usage.register_global_logger();
         usage.spawn_process_monitor();
-        let default_models = expand_gateway_models(DEFAULT_GATEWAY_MODELS);
+        let default_models = default_gateway_models();
         let (shutdown_tx, _) = tokio::sync::watch::channel(false);
         Self {
             config,
@@ -81,17 +83,17 @@ impl ProxyState {
         self
     }
 
-    pub fn set_gateway_models(&self, models: impl Into<String>) {
+    pub fn set_gateway_models(&self, models: Vec<GatewayModelEntry>) {
         if let Ok(mut guard) = self.gateway_models.write() {
-            *guard = models.into();
+            *guard = models;
         }
     }
 
-    pub fn gateway_models(&self) -> String {
+    pub fn gateway_models(&self) -> Vec<GatewayModelEntry> {
         self.gateway_models
             .read()
             .map(|g| g.clone())
-            .unwrap_or_else(|_| expand_gateway_models(DEFAULT_GATEWAY_MODELS))
+            .unwrap_or_else(|_| default_gateway_models())
     }
 
     pub fn subscribe_shutdown(&self) -> tokio::sync::watch::Receiver<bool> {
@@ -190,20 +192,31 @@ pub struct RegisterSessionRequest {
 pub struct RegisterSessionResponse {
     pub session_id: String,
     pub api_key: String,
-    pub gateway_models: String,
 }
 
 /// Response payload from `GET /sessions` for checking daemon liveness and active model list.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DaemonStatusResponse {
     pub pid: u32,
-    pub gateway_models: String,
+    pub gateway_models: Vec<String>,
 }
 
 async fn daemon_status_handler(State(state): State<Arc<ProxyState>>) -> Json<DaemonStatusResponse> {
+    let gateway_models = state
+        .gateway_models()
+        .into_iter()
+        .map(|m| m.id().to_string())
+        .collect();
     Json(DaemonStatusResponse {
         pid: std::process::id(),
-        gateway_models: state.gateway_models(),
+        gateway_models,
+    })
+}
+
+async fn models_handler(State(state): State<Arc<ProxyState>>) -> Json<GatewayModelsResponse> {
+    Json(GatewayModelsResponse {
+        models: state.gateway_models(),
+        next_page_token: None,
     })
 }
 
@@ -213,11 +226,9 @@ async fn register_session_handler(
 ) -> Json<RegisterSessionResponse> {
     let meta = state.usage.register_session(req.pid, &req.label);
     let api_key = format_session_api_key(&meta.id, meta.pid, &meta.label);
-    let gateway_models = state.gateway_models();
     Json(RegisterSessionResponse {
         session_id: meta.id,
         api_key,
-        gateway_models,
     })
 }
 
@@ -297,6 +308,7 @@ pub fn create_router(state: Arc<ProxyState>) -> Router {
         )
         .route("/sessions/{id}", delete(remove_session_handler))
         .route("/shutdown", post(shutdown_handler))
+        .route("/v1beta/models", get(models_handler))
         .route("/", any(proxy_handler))
         .route("/{*path}", any(proxy_handler))
         .layer(DefaultBodyLimit::disable())
@@ -1105,12 +1117,18 @@ pub async fn proxy_handler(
     let req_span = info_span!("proxy_request", session_id = %session_id_str);
     let _enter = req_span.enter();
 
-    let path_and_query = original_uri
+    let raw_path_and_query = original_uri
         .path_and_query()
         .map(|pq| pq.as_str())
         .unwrap_or("/");
+    let (rewritten_path_and_query, effort_from_path) =
+        rewrite_request_path_and_extract_effort(raw_path_and_query);
+    let body = match effort_from_path {
+        Some(effort) => inject_thinking_level_if_missing(body, effort),
+        None => body,
+    };
 
-    let target_url_str = format!("{}{}", state.upstream_base, path_and_query);
+    let target_url_str = format!("{}{}", state.upstream_base, rewritten_path_and_query);
     let target_url = match reqwest::Url::parse(&target_url_str) {
         Ok(url) => url,
         Err(err) => {
@@ -1126,7 +1144,7 @@ pub async fn proxy_handler(
         }
     };
 
-    let is_sse = is_sse_request(path_and_query, &headers);
+    let is_sse = is_sse_request(&rewritten_path_and_query, &headers);
     let keep_alive_interval = state.keep_alive_interval;
     let endpoint = format_endpoint(&target_url);
 

@@ -5,7 +5,7 @@ use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 
-pub use crate::models::{DEFAULT_GATEWAY_MODELS, EXCLUDED_MODELS, MODEL_EFFORT_LEVELS};
+pub use crate::models::{DEFAULT_GATEWAY_MODELS, MODEL_EFFORT_LEVELS, NON_CORE_KEYWORDS};
 
 /// Default TCP port for the local gateway server and monitor (`6470` = `GYRO` in leetspeak).
 pub const DEFAULT_PORT: u16 = 6470;

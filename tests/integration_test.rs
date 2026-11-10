@@ -541,7 +541,7 @@ async fn test_run_wrapper_executes_child_and_propagates_exit_code() {
                 test -n "$AGY_LLM_GATEWAY_URL" &&
                 test "$AGY_LLM_GATEWAY_WIRE_PROTOCOL" = "genai" &&
                 case "$AGY_LLM_GATEWAY_API_KEY" in "gyro:"*":$$:"*) ;; *) exit 1 ;; esac &&
-                test -n "$AGY_LLM_GATEWAY_MODELS" &&
+                test -z "$AGY_LLM_GATEWAY_MODELS" &&
                 test "$AGY_ENABLE_HUB" = "1" &&
                 exit 42
             "#,
@@ -565,8 +565,9 @@ async fn test_run_wrapper_executes_child_and_propagates_exit_code() {
 
 #[tokio::test]
 async fn test_resolve_gateway_models_fetches_and_expands_models() {
-    use agy_gyro::config::EXCLUDED_MODELS;
-    use agy_gyro::proxy::resolve_gateway_models;
+    use agy_gyro::proxy::{
+        GatewayModelsResponse, ProxyState, create_router, resolve_gateway_models,
+    };
 
     let mock_server = MockServer::start().await;
     Mock::given(method("GET"))
@@ -578,22 +579,48 @@ async fn test_resolve_gateway_models_fetches_and_expands_models() {
                 .set_body_json(serde_json::json!({
                     "models": [
                         {
-                            "name": format!("models/{}", EXCLUDED_MODELS[0]),
+                            "name": "models/gemini-flash-latest",
+                            "supportedGenerationMethods": ["generateContent", "countTokens"],
+                            "thinking": true
+                        },
+                        {
+                            "name": "models/gemini-3.1-pro-preview",
                             "supportedGenerationMethods": ["generateContent", "countTokens"],
                             "thinking": true
                         },
                         {
                             "name": "models/gemini-99-flash",
+                            "displayName": "Gemini 99 Flash",
+                            "description": "Fast next-gen Flash model",
+                            "inputTokenLimit": 1048576,
+                            "outputTokenLimit": 65536,
                             "supportedGenerationMethods": ["generateContent", "countTokens"],
                             "thinking": true
                         },
                         {
                             "name": "models/gemini-99-pro",
+                            "displayName": "Gemini 99 Pro",
+                            "description": "Flagship next-gen reasoning model",
+                            "inputTokenLimit": 2097152,
+                            "outputTokenLimit": 32768,
                             "supportedGenerationMethods": ["generateContent", "countTokens"],
                             "thinking": true
                         },
                         {
                             "name": "models/gemini-99-flash-image",
+                            "displayName": "Nano Banana 99",
+                            "description": "Gemini 99 Flash Image",
+                            "inputTokenLimit": 65536,
+                            "outputTokenLimit": 65536,
+                            "supportedGenerationMethods": ["generateContent", "countTokens"],
+                            "thinking": true
+                        },
+                        {
+                            "name": "models/gemini-99-flash-lite",
+                            "displayName": "Gemini 99 Flash-Lite",
+                            "description": "Gemini 99 Flash-Lite",
+                            "inputTokenLimit": 1048576,
+                            "outputTokenLimit": 65536,
                             "supportedGenerationMethods": ["generateContent", "countTokens"],
                             "thinking": true
                         }
@@ -620,10 +647,132 @@ async fn test_resolve_gateway_models_fetches_and_expands_models() {
 
     let client = Client::new();
     let models = resolve_gateway_models(&client, &config).await;
+    let model_ids: Vec<&str> = models.iter().map(|m| m.id()).collect();
     assert_eq!(
-        models,
-        "gemini-99-pro-low,gemini-99-pro-medium,gemini-99-pro-high,gemini-99-flash-low,gemini-99-flash-medium,gemini-99-flash-high"
+        model_ids,
+        vec![
+            "gemini-99-pro-medium",
+            "gemini-99-pro-high",
+            "gemini-99-pro-low",
+            "gemini-99-flash-high",
+            "gemini-99-flash-medium",
+            "gemini-99-flash-low",
+            "gemini-99-flash-image",
+            "gemini-99-flash-lite",
+        ]
     );
+
+    // Verify local `GET /v1beta/models` endpoint serves the curated catalog with real upstream metadata
+    let state = Arc::new(ProxyState::new(config, client.clone()));
+    state.set_gateway_models(models);
+    let app = create_router(state);
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+
+    let gateway_res: GatewayModelsResponse = client
+        .get(format!("http://{}/v1beta/models?pageSize=1000", addr))
+        .header("Authorization", "Bearer gyro:1:123:test")
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+
+    let model_names: Vec<&str> = gateway_res.models.iter().map(|m| m.name.as_str()).collect();
+    assert_eq!(
+        model_names,
+        vec![
+            "models/gemini-99-pro-medium",
+            "models/gemini-99-pro-high",
+            "models/gemini-99-pro-low",
+            "models/gemini-99-flash-high",
+            "models/gemini-99-flash-medium",
+            "models/gemini-99-flash-low",
+            "models/gemini-99-flash-image",
+            "models/gemini-99-flash-lite",
+        ]
+    );
+    let first_entry = gateway_res.models.first().unwrap();
+    assert_eq!(
+        first_entry.display_name.as_deref(),
+        Some("Gemini 99 Pro (Medium)")
+    );
+    assert_eq!(
+        first_entry.description.as_deref(),
+        Some("Flagship next-gen reasoning model")
+    );
+    assert_eq!(first_entry.input_token_limit, Some(2_097_152));
+    assert_eq!(first_entry.output_token_limit, Some(32_768));
+    assert_eq!(first_entry.thinking, Some(true));
+
+    let image_entry = &gateway_res.models[6];
+    assert_eq!(image_entry.name, "models/gemini-99-flash-image");
+    assert_eq!(image_entry.display_name.as_deref(), Some("Nano Banana 99"));
+    assert_eq!(image_entry.input_token_limit, Some(65_536));
+    assert_eq!(image_entry.output_token_limit, Some(65_536));
+    assert_eq!(image_entry.thinking, None);
+
+    let flash_lite_entry = gateway_res.models.last().unwrap();
+    assert_eq!(
+        flash_lite_entry.display_name.as_deref(),
+        Some("Gemini 99 Flash-Lite")
+    );
+    assert_eq!(flash_lite_entry.input_token_limit, Some(1_048_576));
+    assert_eq!(flash_lite_entry.output_token_limit, Some(65_536));
+    assert_eq!(flash_lite_entry.thinking, Some(true));
+}
+
+#[tokio::test]
+async fn test_effort_suffixed_request_rewrites_upstream_path_and_thinking_level() {
+    let mock_server = MockServer::start().await;
+
+    Mock::given(method("POST"))
+        .and(path("/v1beta/models/gemini-99-pro:streamGenerateContent"))
+        .and(query_param("alt", "sse"))
+        .and(header("x-goog-api-key", "test-key-123"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "text/event-stream")
+                .set_body_string(
+                    "data: {\"candidates\": [{\"content\": {\"parts\": [{\"text\": \"Rewritten response\"}]}}], \"usageMetadata\": {\"promptTokenCount\": 1000, \"candidatesTokenCount\": 500, \"totalTokenCount\": 1500}}\n\n",
+                ),
+        )
+        .expect(1)
+        .mount(&mock_server)
+        .await;
+
+    let proxy_url = spawn_test_proxy(mock_server.uri(), 3).await;
+    let client = Client::new();
+
+    let url = format!(
+        "{}/v1beta/models/gemini-99-pro-high:streamGenerateContent?alt=sse",
+        proxy_url
+    );
+    let res = client
+        .post(&url)
+        .header("Authorization", "Bearer gyro:1:123:test")
+        .header("Content-Type", "application/json")
+        .body(r#"{"contents":[{"role":"user","parts":[{"text":"hi"}]}],"generationConfig":{"thinkingConfig":{"includeThoughts":true,"thinkingBudget":1024}}}"#)
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(res.status(), 200);
+    let body = res.text().await.unwrap();
+    assert!(body.contains("Rewritten response"));
+
+    let received = mock_server.received_requests().await.unwrap();
+    assert_eq!(received.len(), 1);
+    let forwarded_json: serde_json::Value = serde_json::from_slice(&received[0].body).unwrap();
+    assert_eq!(
+        forwarded_json["generationConfig"]["thinkingConfig"]["thinkingLevel"],
+        "HIGH"
+    );
+    assert!(forwarded_json["generationConfig"]["thinkingConfig"]["thinkingBudget"].is_null());
 }
 
 #[tokio::test]
@@ -1224,7 +1373,10 @@ fn test_cli_parse_monitor_subcommand_without_api_key() {
     let cli_default = Cli::try_parse_with_config_from(["agy-gyro", "monitor"], None).unwrap();
     assert_eq!(cli_default.command, Commands::Monitor);
     assert_eq!(cli_default.config.port, 6470);
-    assert_eq!(cli_default.config.usage_url(), "http://127.0.0.1:6470/usage");
+    assert_eq!(
+        cli_default.config.usage_url(),
+        "http://127.0.0.1:6470/usage"
+    );
 
     let temp_path =
         std::env::temp_dir().join(format!("agy-gyro-monitor-test-{}.toml", std::process::id()));

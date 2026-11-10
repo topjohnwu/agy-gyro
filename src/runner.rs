@@ -217,7 +217,7 @@ async fn ensure_daemon_and_register(
     config: &Config,
     pid: Option<u32>,
     label: &str,
-) -> Result<(String, String, String, String), Box<dyn std::error::Error>> {
+) -> Result<(String, String, String), Box<dyn std::error::Error>> {
     let label_owned = label.to_string();
     let (daemon_url, reg, _) = ensure_daemon_ready(config, move |client, url| {
         let lbl = label_owned.clone();
@@ -225,7 +225,7 @@ async fn ensure_daemon_and_register(
     })
     .await?;
 
-    Ok((daemon_url, reg.session_id, reg.api_key, reg.gateway_models))
+    Ok((daemon_url, reg.session_id, reg.api_key))
 }
 
 fn cleanup_failed_session(daemon_url: &str, session_id: &str) {
@@ -258,7 +258,7 @@ pub fn run_wrapper(config: Config, agy_args: Vec<String>) -> Result<i32, Box<dyn
     let pid = Some(std::process::id());
     let label = current_workspace_label();
 
-    let (daemon_url, session_id, session_api_key, gateway_models) = {
+    let (daemon_url, session_id, session_api_key) = {
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()?;
@@ -270,7 +270,6 @@ pub fn run_wrapper(config: Config, agy_args: Vec<String>) -> Result<i32, Box<dyn
         .env("AGY_LLM_GATEWAY_URL", &daemon_url)
         .env("AGY_LLM_GATEWAY_WIRE_PROTOCOL", "genai")
         .env("AGY_LLM_GATEWAY_API_KEY", &session_api_key)
-        .env("AGY_LLM_GATEWAY_MODELS", &gateway_models)
         .env("AGY_ENABLE_HUB", "1")
         .stdin(Stdio::inherit())
         .stdout(Stdio::inherit())
