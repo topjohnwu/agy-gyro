@@ -16,13 +16,6 @@ pub const ENV_OAUTH: &str = "AGY_GYRO_OAUTH";
 pub const ENV_HOST: &str = "AGY_GYRO_HOST";
 pub const ENV_PORT: &str = "AGY_GYRO_PORT";
 pub const ENV_AGY_PATH: &str = "AGY_GYRO_AGY_PATH";
-pub const ENV_LOG_FILE: &str = "AGY_GYRO_LOG_FILE";
-pub const ENV_MAX_RETRIES: &str = "AGY_GYRO_MAX_RETRIES";
-pub const ENV_INITIAL_DELAY_MS: &str = "AGY_GYRO_INITIAL_DELAY_MS";
-pub const ENV_MAX_DELAY_MS: &str = "AGY_GYRO_MAX_DELAY_MS";
-pub const ENV_NO_JITTER: &str = "AGY_GYRO_NO_JITTER";
-pub const ENV_NO_BUFFER: &str = "AGY_GYRO_NO_BUFFER";
-pub const ENV_REQUEST_TIMEOUT_SECS: &str = "AGY_GYRO_REQUEST_TIMEOUT_SECS";
 
 /// All configuration environment variables recognized by [`Cli::try_parse_with_config_from`].
 pub const KNOWN_ENV_VARS: &[&str] = &[
@@ -32,13 +25,6 @@ pub const KNOWN_ENV_VARS: &[&str] = &[
     ENV_HOST,
     ENV_PORT,
     ENV_AGY_PATH,
-    ENV_LOG_FILE,
-    ENV_MAX_RETRIES,
-    ENV_INITIAL_DELAY_MS,
-    ENV_MAX_DELAY_MS,
-    ENV_NO_JITTER,
-    ENV_NO_BUFFER,
-    ENV_REQUEST_TIMEOUT_SECS,
 ];
 
 /// Converts a wildcard bind address (`0.0.0.0`) into a loopback connect address (`127.0.0.1`).
@@ -230,25 +216,9 @@ impl Config {
     pub fn apply_env_to_command(&self, cmd: &mut std::process::Command, port: u16) {
         cmd.env(ENV_HOST, &self.host)
             .env(ENV_PORT, port.to_string())
-            .env(ENV_MAX_RETRIES, self.max_retries.to_string())
-            .env(ENV_INITIAL_DELAY_MS, self.initial_delay_ms.to_string())
-            .env(ENV_MAX_DELAY_MS, self.max_delay_ms.to_string())
-            .env(ENV_NO_JITTER, self.no_jitter.to_string())
-            .env(ENV_NO_BUFFER, self.no_buffer.to_string())
-            .env(
-                ENV_REQUEST_TIMEOUT_SECS,
-                self.request_timeout_secs.to_string(),
-            )
             .env_remove(ENV_OAUTH)
             .env(ENV_API_KEY, &self.api_key)
             .env(ENV_GEMINI_API_KEY, &self.api_key);
-
-        if let Some(ref log_file) = self.log_file {
-            cmd.env(ENV_LOG_FILE, log_file);
-        }
-        if !self.agy_path.is_empty() {
-            cmd.env(ENV_AGY_PATH, &self.agy_path);
-        }
     }
 }
 
@@ -267,9 +237,13 @@ impl Cli {
     /// and resolves settings from environment variables and an optional TOML configuration file.
     ///
     /// Settings precedence order (highest to lowest):
-    /// 1. Environment variables
+    /// 1. Environment variables (for client/wrapper and network connection settings)
     /// 2. Configuration file (`~/.gemini/config/agy-gyro.toml`)
     /// 3. Built-in default values
+    ///
+    /// Note: Daemon-only settings (`max_retries`, `initial_delay_ms`, `max_delay_ms`,
+    /// `no_jitter`, `no_buffer`, `request_timeout_secs`, `log_file`) cannot be configured
+    /// via environment variables and must be configured via the TOML configuration file.
     pub fn try_parse_with_config_from<I, T>(
         itr: I,
         config_path: Option<&Path>,
@@ -295,24 +269,12 @@ impl Cli {
         let port = env_parse::<u16>(ENV_PORT)?
             .or(file_config.port)
             .unwrap_or(DEFAULT_PORT);
-        let max_retries = env_parse::<u32>(ENV_MAX_RETRIES)?
-            .or(file_config.max_retries)
-            .unwrap_or(15);
-        let initial_delay_ms = env_parse::<u64>(ENV_INITIAL_DELAY_MS)?
-            .or(file_config.initial_delay_ms)
-            .unwrap_or(1000);
-        let max_delay_ms = env_parse::<u64>(ENV_MAX_DELAY_MS)?
-            .or(file_config.max_delay_ms)
-            .unwrap_or(60000);
-        let no_jitter = env_bool(ENV_NO_JITTER)?
-            .or(file_config.no_jitter)
-            .unwrap_or(false);
-        let no_buffer = env_bool(ENV_NO_BUFFER)?
-            .or(file_config.no_buffer)
-            .unwrap_or(false);
-        let request_timeout_secs = env_parse::<u64>(ENV_REQUEST_TIMEOUT_SECS)?
-            .or(file_config.request_timeout_secs)
-            .unwrap_or(600);
+        let max_retries = file_config.max_retries.unwrap_or(15);
+        let initial_delay_ms = file_config.initial_delay_ms.unwrap_or(1000);
+        let max_delay_ms = file_config.max_delay_ms.unwrap_or(60000);
+        let no_jitter = file_config.no_jitter.unwrap_or(false);
+        let no_buffer = file_config.no_buffer.unwrap_or(false);
+        let request_timeout_secs = file_config.request_timeout_secs.unwrap_or(600);
         let api_key = env_non_empty(ENV_API_KEY)
             .or_else(|| env_non_empty(ENV_GEMINI_API_KEY))
             .or(file_config.api_key)
@@ -321,9 +283,7 @@ impl Cli {
         let agy_path = env_non_empty(ENV_AGY_PATH)
             .or(file_config.agy_path)
             .unwrap_or_else(|| "agy".to_string());
-        let log_file = env_non_empty(ENV_LOG_FILE)
-            .map(PathBuf::from)
-            .or(file_config.log_file);
+        let log_file = file_config.log_file;
 
         let config = Config {
             host,

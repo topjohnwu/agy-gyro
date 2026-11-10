@@ -297,6 +297,19 @@ fn clear_test_env_vars() {
             std::env::remove_var(var);
         }
     }
+    for &var in &[
+        "AGY_GYRO_MAX_RETRIES",
+        "AGY_GYRO_INITIAL_DELAY_MS",
+        "AGY_GYRO_MAX_DELAY_MS",
+        "AGY_GYRO_NO_JITTER",
+        "AGY_GYRO_NO_BUFFER",
+        "AGY_GYRO_REQUEST_TIMEOUT_SECS",
+        "AGY_GYRO_LOG_FILE",
+    ] {
+        unsafe {
+            std::env::remove_var(var);
+        }
+    }
 }
 
 #[test]
@@ -570,6 +583,7 @@ async fn test_run_wrapper_executes_child_and_propagates_exit_code() {
     let status = tokio::process::Command::new(env!("CARGO_BIN_EXE_agy-gyro"))
         .env("HOME", &temp_home)
         .env("USERPROFILE", &temp_home)
+        .env_remove("AGY_LLM_GATEWAY_MODELS")
         .args([
             "-c",
             r#"
@@ -924,7 +938,8 @@ request_timeout_secs = 120
     assert_eq!(cli_server.config.port, 7070);
     assert_eq!(cli_server.config.max_retries, 25);
 
-    // 3. Precedence: Environment variables override TOML
+    // 3. Precedence: Environment variables override TOML for wrapper/network settings,
+    // but daemon-only settings cannot be overridden via environment variables.
     unsafe {
         std::env::set_var("AGY_GYRO_MAX_RETRIES", "42");
         std::env::set_var("AGY_GYRO_HOST", "10.0.0.1");
@@ -937,12 +952,13 @@ request_timeout_secs = 120
     clear_test_env_vars();
 
     assert_eq!(cli_env.config.host, "10.0.0.1");
-    assert_eq!(cli_env.config.max_retries, 42);
     assert_eq!(cli_env.config.agy_path, "/custom/agy");
-    assert!(!cli_env.config.no_buffer);
-    assert!(cli_env.config.is_buffer_enabled());
-    assert!(cli_env.config.is_gateway_enabled());
     assert_eq!(cli_env.config.api_key, "env-gemini-key-123");
+    assert!(cli_env.config.is_gateway_enabled());
+    // Daemon-only settings remain as configured in TOML (not overridden by env)
+    assert_eq!(cli_env.config.max_retries, 25);
+    assert!(cli_env.config.no_buffer);
+    assert!(!cli_env.config.is_buffer_enabled());
     // TOML still applies for fields not set via Env
     assert_eq!(cli_env.config.port, 7070);
     assert_eq!(cli_env.config.initial_delay_ms, 500);
