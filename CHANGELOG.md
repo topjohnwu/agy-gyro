@@ -5,6 +5,21 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.1] - 2026-11-10
+
+### Added
+- **OAuth Passthrough Mode (`oauth` / `AGY_GYRO_OAUTH`)**: Support running `agy` sessions with personal OAuth credentials via `/s/<session_id>/...` (`CLOUD_CODE_URL`), tracking per-session token usage and estimated costs across Google Gemini, Anthropic Claude, and OpenAI models from `models.dev` while bypassing retries and buffering. `api_key` is now optional, automatically running in OAuth passthrough mode when omitted or when `oauth = true` (`AGY_GYRO_OAUTH=1`) is set.
+- **Dynamic `/v1beta/models` Discovery Endpoint**: Serves a curated model discovery catalog directly at `GET /v1beta/models` instead of setting `AGY_LLM_GATEWAY_MODELS`, preserving upstream model metadata (`displayName`, `description`, token limits, `supportedGenerationMethods`, and `thinking`) across expanded effort variants (`-low`, `-medium`, `-high`) and dynamically including the newest `-flash-image` and `-flash-lite` models.
+- **Dynamic Effort Suffix Rewriting**: Automatically strips `-low`, `-medium`, and `-high` suffixes from upstream request paths and injects `thinkingLevel` into `generationConfig.thinkingConfig` when missing, enabling effort-level variants for newly released Gemini models without requiring `agy` updates.
+
+### Changed
+- **UUID v4 Session Identifiers**: Replaced sequential integer session IDs with RFC 4122 UUID v4 identifiers (displaying 8-character short prefixes `#<short_id>` in the TUI dashboard and logs) to prevent session ID collisions across daemon restarts.
+- **Live Pricing Resolution**: Removed built-in default pricing and family fallbacks; pricing is now loaded strictly from `models.dev/api.json` across Google, Anthropic, and OpenAI providers (treating unlisted models as zero cost).
+
+### Removed
+- **Daemon-Only Environment Variables**: Removed environment variable overrides for daemon-only proxy settings (`AGY_GYRO_LOG_FILE`, `AGY_GYRO_MAX_RETRIES`, `AGY_GYRO_INITIAL_DELAY_MS`, `AGY_GYRO_MAX_DELAY_MS`, `AGY_GYRO_NO_JITTER`, `AGY_GYRO_NO_BUFFER`, and `AGY_GYRO_REQUEST_TIMEOUT_SECS`); these options must now be configured via `~/.gemini/config/agy-gyro.toml`.
+- **Configurable `upstream` Option**: Removed user-configurable `upstream` option from `agy-gyro.toml` and environment variables.
+
 ## [0.2.0] - 2026-11-08
 
 ### Added

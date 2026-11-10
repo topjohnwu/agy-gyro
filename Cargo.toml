@@ -1,6 +1,6 @@
 [package]
 name = "agy-gyro"
-version = "0.2.0"
+version = "0.2.1"
 edition = "2024"
 authors = ["John Wu <topjohnwu@gmail.com>"]
 description = "Local Antigravity Enterprise Gateway, retry proxy, and live token usage monitor for the Antigravity CLI (agy)"
