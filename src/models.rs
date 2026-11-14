@@ -8,6 +8,7 @@ use tracing::{info, warn};
 
 /// Fallback list of Gemini models if dynamic discovery fails.
 pub const DEFAULT_GATEWAY_MODELS: &[&str] = &[
+    "gemini-4-hydrogen",
     "gemini-4-argon",
     "gemini-3.8-flash",
     "gemini-3.1-flash-image",
@@ -20,6 +21,9 @@ pub const MODEL_EFFORT_LEVELS: &[&str] = &["medium", "high", "low"];
 
 /// Effort ordering for Flash models (`high -> medium -> low`).
 const FLASH_EFFORT_LEVELS: &[&str] = &["high", "medium", "low"];
+
+/// Effort ordering for Hydrogen models (`medium -> high -> xhigh -> low`), matching normal `agy`.
+const HYDROGEN_EFFORT_LEVELS: &[&str] = &["medium", "high", "xhigh", "low"];
 
 /// Keywords identifying preview, lite, rolling-alias, or non-text/specialized Gemini variants
 /// that should be excluded when discovering core reasoning models from `/v1beta/models`.
@@ -94,7 +98,7 @@ impl GeminiModelInfo {
                 Some((base_id, eff)) => Some(format!(
                     "{} ({})",
                     humanize_model_id(base_id),
-                    capitalize_ascii_word(eff)
+                    format_effort_label(eff)
                 )),
                 None => Some(humanize_model_id(clean)),
             }
@@ -125,6 +129,23 @@ fn capitalize_ascii_word(word: &str) -> String {
     }
 }
 
+fn format_effort_label(effort: &str) -> String {
+    match effort {
+        "xhigh" => "XHigh".to_string(),
+        _ => capitalize_ascii_word(effort),
+    }
+}
+
+fn effort_levels_for_model(base_id: &str) -> &'static [&'static str] {
+    if base_id.contains("hydrogen") {
+        HYDROGEN_EFFORT_LEVELS
+    } else if base_id.contains("flash") {
+        FLASH_EFFORT_LEVELS
+    } else {
+        MODEL_EFFORT_LEVELS
+    }
+}
+
 /// Converts a base Gemini model ID (e.g. `gemini-4-argon` or `gemini-3.5-flash-lite`) into a
 /// human-readable title (`Gemini 4 Argon`, `Gemini 3.5 Flash Lite`).
 pub fn humanize_model_id(base_id: &str) -> String {
@@ -137,10 +158,10 @@ pub fn humanize_model_id(base_id: &str) -> String {
         .join(" ")
 }
 
-/// Splits a trailing `-<effort>` suffix (where `<effort>` is in [`MODEL_EFFORT_LEVELS`])
-/// from a model identifier, returning `(base_model, effort)`.
+/// Splits a trailing `-<effort>` suffix (where `<effort>` is a recognized effort level such as
+/// `low`, `medium`, `high`, or `xhigh`) from a model identifier, returning `(base_model, effort)`.
 pub fn split_effort_suffix(model_id: &str) -> Option<(&str, &'static str)> {
-    for &effort in MODEL_EFFORT_LEVELS {
+    for &effort in HYDROGEN_EFFORT_LEVELS {
         if let Some(prefix) = model_id.strip_suffix(effort)
             && let Some(base) = prefix.strip_suffix('-')
             && !base.is_empty()
@@ -151,13 +172,13 @@ pub fn split_effort_suffix(model_id: &str) -> Option<(&str, &'static str)> {
     None
 }
 
-/// Strips a trailing `-<effort>` suffix (where `<effort>` is in [`MODEL_EFFORT_LEVELS`]) if present.
+/// Strips a trailing `-<effort>` suffix if present.
 pub fn strip_effort_suffix(model_id: &str) -> Option<&str> {
     split_effort_suffix(model_id).map(|(base, _)| base)
 }
 
 /// Normalizes a model identifier by stripping `models/` prefix and effort suffixes
-/// (`-low`, `-medium`, `-high`) if the base model is a Gemini model.
+/// (`-low`, `-medium`, `-high`, `-xhigh`) if the base model is a Gemini model.
 pub fn normalize_model_id(raw: &str) -> String {
     let trimmed = raw.trim();
     let without_prefix = trimmed.strip_prefix("models/").unwrap_or(trimmed);
@@ -243,10 +264,10 @@ pub fn rewrite_request_path_and_extract_effort(
     (path_and_query.to_string(), None)
 }
 
-/// Ensures `generationConfig.thinkingConfig.thinkingLevel` is set to `"LOW"`, `"MEDIUM"`, or
-/// `"HIGH"` when a request arrived with an unstripped `-<effort>` model suffix and the client
-/// did not already populate `thinkingLevel` (e.g. when using a newly released model that falls
-/// back to `thinkingBudget` on the client).
+/// Ensures `generationConfig.thinkingConfig.thinkingLevel` is set to `"LOW"`, `"MEDIUM"`,
+/// `"HIGH"`, or `"XHIGH"` when a request arrived with an unstripped `-<effort>` model suffix and
+/// the client did not already populate `thinkingLevel` (e.g. when using a newly released model that
+/// falls back to `thinkingBudget` on the client).
 pub fn inject_thinking_level_if_missing(body: Bytes, effort: &str) -> Bytes {
     if body.is_empty() {
         return body;
@@ -256,6 +277,7 @@ pub fn inject_thinking_level_if_missing(body: Bytes, effort: &str) -> Bytes {
         "low" => "LOW",
         "medium" => "MEDIUM",
         "high" => "HIGH",
+        "xhigh" => "XHIGH",
         _ => return body,
     };
 
@@ -422,19 +444,11 @@ pub fn expand_gateway_models(models: &[GeminiModelInfo]) -> Vec<GatewayModelEntr
                 .filter(|s| !s.is_empty())
                 .map(str::to_string)
                 .unwrap_or_else(|| humanize_model_id(base_id));
-            let efforts = if base_id.contains("flash") {
-                FLASH_EFFORT_LEVELS
-            } else {
-                MODEL_EFFORT_LEVELS
-            };
+            let efforts = effort_levels_for_model(base_id);
             for effort in efforts {
                 expanded.push(GatewayModelEntry {
                     name: format!("models/{}-{}", base_id, effort),
-                    display_name: Some(format!(
-                        "{} ({})",
-                        base_display,
-                        capitalize_ascii_word(effort)
-                    )),
+                    display_name: Some(format!("{} ({})", base_display, format_effort_label(effort))),
                     description: model.description.clone(),
                     input_token_limit: model.input_token_limit,
                     output_token_limit: model.output_token_limit,
@@ -544,6 +558,10 @@ mod tests {
             extract_model_from_path("/v1beta/models/gemini-2.5-pro-high:generateContent"),
             Some("gemini-2.5-pro".to_string())
         );
+        assert_eq!(
+            extract_model_from_path("/v1beta/models/gemini-4-hydrogen-xhigh:streamGenerateContent"),
+            Some("gemini-4-hydrogen".to_string())
+        );
         assert_eq!(extract_model_from_path("/v1beta/models"), None);
     }
 
@@ -585,6 +603,10 @@ mod tests {
         assert_eq!(
             ids,
             vec![
+                "gemini-4-hydrogen-medium",
+                "gemini-4-hydrogen-high",
+                "gemini-4-hydrogen-xhigh",
+                "gemini-4-hydrogen-low",
                 "gemini-4-argon-medium",
                 "gemini-4-argon-high",
                 "gemini-4-argon-low",
@@ -595,6 +617,10 @@ mod tests {
                 "gemini-3.5-flash-lite",
             ]
         );
+        assert_eq!(
+            expanded[2].display_name.as_deref(),
+            Some("Gemini 4 Hydrogen (XHigh)")
+        );
 
         let upstream = vec![
             GeminiModelInfo {
@@ -603,6 +629,18 @@ mod tests {
                 description: Some("Primary reasoning model".to_string()),
                 input_token_limit: Some(1_048_576),
                 output_token_limit: Some(32_768),
+                supported_generation_methods: vec![
+                    "generateContent".to_string(),
+                    "countTokens".to_string(),
+                ],
+                thinking: Some(true),
+            },
+            GeminiModelInfo {
+                name: "models/gemini-4-hydrogen".to_string(),
+                display_name: Some("Gemini 4 Hydrogen".to_string()),
+                description: Some("Flagship reasoning model".to_string()),
+                input_token_limit: Some(1_048_576),
+                output_token_limit: Some(65_536),
                 supported_generation_methods: vec![
                     "generateContent".to_string(),
                     "countTokens".to_string(),
@@ -621,7 +659,7 @@ mod tests {
         ];
 
         let rich_expanded = expand_gateway_models(&upstream);
-        assert_eq!(rich_expanded.len(), 4);
+        assert_eq!(rich_expanded.len(), 8);
         assert_eq!(rich_expanded[0].name, "models/gemini-4-argon-medium");
         assert_eq!(
             rich_expanded[0].display_name.as_deref(),
@@ -635,7 +673,13 @@ mod tests {
         assert_eq!(rich_expanded[0].output_token_limit, Some(32_768));
         assert_eq!(rich_expanded[0].thinking, Some(true));
 
-        let image = &rich_expanded[3];
+        assert_eq!(rich_expanded[5].name, "models/gemini-4-hydrogen-xhigh");
+        assert_eq!(
+            rich_expanded[5].display_name.as_deref(),
+            Some("Gemini 4 Hydrogen (XHigh)")
+        );
+
+        let image = &rich_expanded[7];
         assert_eq!(image.name, "models/gemini-3.1-flash-image");
         assert_eq!(image.display_name.as_deref(), Some("Nano Banana 2"));
         assert_eq!(image.input_token_limit, Some(65_536));
@@ -656,6 +700,15 @@ mod tests {
         );
         assert_eq!(
             rewrite_request_path_and_extract_effort(
+                "/v1beta/models/gemini-4-hydrogen-xhigh:streamGenerateContent?alt=sse"
+            ),
+            (
+                "/v1beta/models/gemini-4-hydrogen:streamGenerateContent?alt=sse".to_string(),
+                Some("xhigh")
+            )
+        );
+        assert_eq!(
+            rewrite_request_path_and_extract_effort(
                 "/v1beta/models/gemini-4-argon:streamGenerateContent?alt=sse"
             ),
             (
@@ -671,13 +724,21 @@ mod tests {
         let fallback_body = Bytes::from(
             r#"{"contents":[{"role":"user","parts":[{"text":"hi"}]}],"generationConfig":{"thinkingConfig":{"includeThoughts":true,"thinkingBudget":1024}}}"#,
         );
-        let updated = inject_thinking_level_if_missing(fallback_body, "high");
+        let updated = inject_thinking_level_if_missing(fallback_body.clone(), "high");
         let parsed: serde_json::Value = serde_json::from_slice(&updated).unwrap();
         assert_eq!(
             parsed["generationConfig"]["thinkingConfig"]["thinkingLevel"],
             "HIGH"
         );
         assert!(parsed["generationConfig"]["thinkingConfig"]["thinkingBudget"].is_null());
+
+        let updated_xhigh = inject_thinking_level_if_missing(fallback_body, "xhigh");
+        let parsed_xhigh: serde_json::Value = serde_json::from_slice(&updated_xhigh).unwrap();
+        assert_eq!(
+            parsed_xhigh["generationConfig"]["thinkingConfig"]["thinkingLevel"],
+            "XHIGH"
+        );
+        assert!(parsed_xhigh["generationConfig"]["thinkingConfig"]["thinkingBudget"].is_null());
 
         // Preserves existing thinkingLevel untouched
         let existing_body = Bytes::from(

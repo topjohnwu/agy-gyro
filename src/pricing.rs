@@ -142,7 +142,7 @@ impl Default for PricingTable {
 
 impl PricingTable {
     /// Resolves pricing for a model ID from the upstream pricing table, normalizing prefixes
-    /// (`models/`), version suffixes (`@...`), effort suffixes (`-low`, `-medium`, `-high`),
+    /// (`models/`), version suffixes (`@...`), effort suffixes (`-low`, `-medium`, `-high`, `-xhigh`),
     /// and `-thinking` suffixes. Returns `None` when the model's pricing is unknown upstream.
     pub fn lookup(&self, raw_model: &str) -> Option<ModelPricing> {
         let normalized = normalize_model_id(raw_model);
@@ -393,6 +393,9 @@ mod tests {
         assert_eq!(custom.input_over_200k_per_1m, Some(3.0));
         assert_eq!(custom.cached_over_200k_per_1m, Some(0.30));
         assert_eq!(custom.output_over_200k_per_1m, Some(12.0));
+
+        let custom_xhigh = table.lookup("gemini-custom-test-xhigh").unwrap();
+        assert_eq!(custom_xhigh.input_per_1m, 1.5);
 
         let claude_thinking = table.lookup("models/claude-sonnet-4-5-thinking").unwrap();
         assert_eq!(claude_thinking.input_per_1m, 3.0);
