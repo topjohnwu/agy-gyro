@@ -13,10 +13,10 @@ use crate::retry::{
     parse_retry_after,
 };
 use crate::usage::{
-    ActiveRequestGuard, DEFAULT_PRICING_URL, PricingTable, RawUsageMetadata, SessionMeta,
-    StreamUsageExtractor, UsageLogLayer, UsageSnapshot, UsageTracker, extract_model_from_path,
-    extract_session_from_headers, extract_usage_from_chunks, format_session_api_key,
-    try_fetch_model_pricing,
+    ActiveRequestGuard, DEFAULT_PRICING_URL, LogStreamCursor, PricingTable, RawUsageMetadata,
+    SessionMeta, StreamUsageExtractor, UsageLogLayer, UsageSnapshot, UsageTracker,
+    extract_model_from_path, extract_session_from_headers, extract_usage_from_chunks,
+    format_session_api_key, try_fetch_model_pricing,
 };
 use axum::{
     Json, Router,
@@ -398,32 +398,37 @@ async fn logs_handler(
     let shutdown_rx = state.subscribe_shutdown();
 
     let stream = futures_util::stream::unfold(
-        (tracker, rx, shutdown_rx, true),
-        |(tracker, mut rx, mut shutdown_rx, is_first)| async move {
-            if *shutdown_rx.borrow() {
-                return None;
-            }
-            if !is_first {
-                tokio::select! {
-                    res = rx.changed() => {
-                        if res.is_err() {
-                            return None;
+        (tracker, rx, shutdown_rx, LogStreamCursor::default(), true),
+        |(tracker, mut rx, mut shutdown_rx, mut cursor, mut is_first)| async move {
+            loop {
+                if *shutdown_rx.borrow() {
+                    return None;
+                }
+                if !is_first {
+                    tokio::select! {
+                        res = rx.changed() => {
+                            if res.is_err() {
+                                return None;
+                            }
                         }
-                    }
-                    _ = shutdown_rx.changed() => {
-                        if *shutdown_rx.borrow() {
-                            return None;
+                        _ = shutdown_rx.changed() => {
+                            if *shutdown_rx.borrow() {
+                                return None;
+                            }
                         }
                     }
                 }
+                is_first = false;
+                let _ = rx.borrow_and_update();
+                if let Some(event) = tracker.next_log_stream_event(&mut cursor) {
+                    let json = serde_json::to_string(&event)
+                        .unwrap_or_else(|_| r#"{"type":"snapshot","entries":[]}"#.to_string());
+                    return Some((
+                        Ok(Event::default().data(json)),
+                        (tracker, rx, shutdown_rx, cursor, false),
+                    ));
+                }
             }
-            let _ = rx.borrow_and_update();
-            let logs = tracker.logs_snapshot();
-            let json = serde_json::to_string(&logs).unwrap_or_else(|_| "[]".to_string());
-            Some((
-                Ok(Event::default().data(json)),
-                (tracker, rx, shutdown_rx, false),
-            ))
         },
     );
 

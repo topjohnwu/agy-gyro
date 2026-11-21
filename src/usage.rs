@@ -21,7 +21,7 @@ use tracing::info;
 use tracing_subscriber::registry::LookupSpan;
 
 /// Maximum number of real-time log entries retained in the log ring buffer.
-const MAX_LOG_ENTRIES: usize = 200;
+pub const MAX_LOG_ENTRIES: usize = 10_000;
 
 /// Raw `usageMetadata` fields returned in Gemini `generateContent` / `streamGenerateContent` JSON.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -446,6 +446,24 @@ pub struct LogEntry {
     pub session_id: Option<String>,
 }
 
+/// Incremental SSE event payload streamed by `GET /logs`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum LogStreamEvent {
+    /// Full replacement of the buffered log list (sent on initial connect, reset, or lag resync).
+    Snapshot { entries: Vec<LogEntry> },
+    /// Incremental batch of newly appended log entries.
+    Append { entries: Vec<LogEntry> },
+}
+
+/// Server-side cursor tracking a `GET /logs` SSE subscriber's position in the log buffer.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct LogStreamCursor {
+    generation: u64,
+    last_id: u64,
+    initialized: bool,
+}
+
 /// Point-in-time JSON payload streamed by `GET /usage`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct UsageSnapshot {
@@ -484,7 +502,25 @@ struct SessionEntry {
 struct UsageInner {
     global: ScopeUsageStats,
     sessions: BTreeMap<String, SessionEntry>,
-    logs: VecDeque<LogEntry>,
+}
+
+#[derive(Debug)]
+struct LogBuffer {
+    next_id: u64,
+    generation: u64,
+    evicted_through_id: u64,
+    entries: VecDeque<LogEntry>,
+}
+
+impl Default for LogBuffer {
+    fn default() -> Self {
+        Self {
+            next_id: 1,
+            generation: 0,
+            evicted_through_id: 0,
+            entries: VecDeque::new(),
+        }
+    }
 }
 
 /// Thread-safe live usage, cost, and log tracker shared across proxy handlers.
@@ -492,10 +528,10 @@ pub struct UsageTracker {
     started_at: Instant,
     next_request_id: AtomicU64,
     next_session_seq: AtomicU64,
-    next_log_id: AtomicU64,
     buffer_enabled: AtomicBool,
     pricing: RwLock<PricingTable>,
     inner: RwLock<UsageInner>,
+    logs: RwLock<LogBuffer>,
     usage_change_tx: tokio::sync::watch::Sender<u64>,
     log_change_tx: tokio::sync::watch::Sender<u64>,
 }
@@ -514,10 +550,10 @@ impl UsageTracker {
             started_at: Instant::now(),
             next_request_id: AtomicU64::new(1),
             next_session_seq: AtomicU64::new(1),
-            next_log_id: AtomicU64::new(1),
             buffer_enabled: AtomicBool::new(false),
             pricing: RwLock::new(pricing),
             inner: RwLock::new(UsageInner::default()),
+            logs: RwLock::new(LogBuffer::default()),
             usage_change_tx,
             log_change_tx,
         }
@@ -669,21 +705,22 @@ impl UsageTracker {
         session_id: Option<String>,
         message: impl Into<String>,
     ) {
-        let log_id = self.next_log_id.fetch_add(1, Ordering::Relaxed);
         let timestamp_secs = self.started_at.elapsed().as_secs();
-        let entry = LogEntry {
-            id: log_id,
-            timestamp_secs,
-            level: level.to_string(),
-            target: target.to_string(),
-            message: message.into(),
-            session_id,
-        };
-
-        if let Ok(mut inner) = self.inner.write() {
-            inner.logs.push_back(entry);
-            while inner.logs.len() > MAX_LOG_ENTRIES {
-                inner.logs.pop_front();
+        if let Ok(mut buf) = self.logs.write() {
+            let log_id = buf.next_id;
+            buf.next_id = buf.next_id.saturating_add(1);
+            buf.entries.push_back(LogEntry {
+                id: log_id,
+                timestamp_secs,
+                level: level.to_string(),
+                target: target.to_string(),
+                message: message.into(),
+                session_id,
+            });
+            while buf.entries.len() > MAX_LOG_ENTRIES {
+                if let Some(evicted) = buf.entries.pop_front() {
+                    buf.evicted_through_id = evicted.id;
+                }
             }
         }
         self.notify_log_change();
@@ -691,10 +728,44 @@ impl UsageTracker {
 
     /// Returns a snapshot of all buffered log entries for the `/logs` endpoint.
     pub fn logs_snapshot(&self) -> Vec<LogEntry> {
-        match self.inner.read() {
-            Ok(inner) => inner.logs.iter().cloned().collect(),
+        match self.logs.read() {
+            Ok(buf) => buf.entries.iter().cloned().collect(),
             Err(_) => Vec::new(),
         }
+    }
+
+    /// Computes the next incremental [`LogStreamEvent`] for a subscriber at `cursor`,
+    /// advancing `cursor` in place. Returns `None` if no new log changes have occurred.
+    pub fn next_log_stream_event(&self, cursor: &mut LogStreamCursor) -> Option<LogStreamEvent> {
+        let buf = self.logs.read().ok()?;
+        let latest_id = buf.entries.back().map_or(0, |e| e.id);
+
+        if !cursor.initialized
+            || buf.generation != cursor.generation
+            || buf.evicted_through_id > cursor.last_id
+        {
+            cursor.initialized = true;
+            cursor.generation = buf.generation;
+            cursor.last_id = latest_id;
+            return Some(LogStreamEvent::Snapshot {
+                entries: buf.entries.iter().cloned().collect(),
+            });
+        }
+
+        if latest_id <= cursor.last_id {
+            return None;
+        }
+
+        let new_count = buf
+            .entries
+            .iter()
+            .rev()
+            .take_while(|e| e.id > cursor.last_id)
+            .count();
+        let start_idx = buf.entries.len().saturating_sub(new_count);
+        let entries: Vec<LogEntry> = buf.entries.range(start_idx..).cloned().collect();
+        cursor.last_id = latest_id;
+        Some(LogStreamEvent::Append { entries })
     }
 
     /// Replaces the pricing table (e.g. after live pricing discovery completes).
@@ -1016,16 +1087,20 @@ impl UsageTracker {
     /// Exited sessions are removed while active sessions are retained with zeroed counters.
     pub fn reset(&self) {
         self.next_request_id.store(1, Ordering::Relaxed);
-        self.next_log_id.store(1, Ordering::Relaxed);
         if let Ok(mut inner) = self.inner.write() {
             inner.global.reset_completed();
-            inner.logs.clear();
             inner
                 .sessions
                 .retain(|_, entry| entry.stats.active || entry.stats.active_requests > 0);
             for entry in inner.sessions.values_mut() {
                 entry.stats.reset_completed();
             }
+        }
+        if let Ok(mut buf) = self.logs.write() {
+            buf.entries.clear();
+            buf.next_id = 1;
+            buf.generation = buf.generation.wrapping_add(1);
+            buf.evicted_through_id = 0;
         }
         self.notify_usage_change();
         self.notify_log_change();
@@ -1034,27 +1109,46 @@ impl UsageTracker {
     /// Resets a single session's accumulated stats (or removes the session if it has already exited),
     /// subtracting its contribution from the global totals.
     pub fn reset_session(&self, session_id: &str) {
-        if let Ok(mut inner) = self.inner.write() {
-            let Some(entry) = inner.sessions.get_mut(session_id) else {
-                return;
-            };
+        let existed = if let Ok(mut inner) = self.inner.write() {
+            if let Some(entry) = inner.sessions.get_mut(session_id) {
+                let removed_stats = entry.stats.stats.clone();
+                let keep_session = entry.stats.active || entry.stats.active_requests > 0;
 
-            let removed_stats = entry.stats.stats.clone();
-            let keep_session = entry.stats.active || entry.stats.active_requests > 0;
+                if keep_session {
+                    entry.stats.reset_completed();
+                } else {
+                    inner.sessions.remove(session_id);
+                }
 
-            if keep_session {
-                entry.stats.reset_completed();
+                inner.global.subtract(&removed_stats);
+                true
             } else {
-                inner.sessions.remove(session_id);
+                false
             }
+        } else {
+            false
+        };
 
-            inner.global.subtract(&removed_stats);
-            inner
-                .logs
-                .retain(|l| l.session_id.as_deref() != Some(session_id));
+        if !existed {
+            return;
         }
+
+        let mut removed_any_logs = false;
+        if let Ok(mut buf) = self.logs.write() {
+            let before = buf.entries.len();
+            buf.entries
+                .retain(|l| l.session_id.as_deref() != Some(session_id));
+            if buf.entries.len() != before {
+                buf.generation = buf.generation.wrapping_add(1);
+                buf.evicted_through_id = 0;
+                removed_any_logs = true;
+            }
+        }
+
         self.notify_usage_change();
-        self.notify_log_change();
+        if removed_any_logs {
+            self.notify_log_change();
+        }
     }
 
     /// Returns a point-in-time [`UsageSnapshot`] for the `/usage` endpoint.
@@ -1369,5 +1463,110 @@ mod tests {
         assert_eq!(snap2.sessions.len(), 1);
         assert_eq!(snap2.sessions[0].id, s1.id);
         assert_eq!(snap2.totals.input_tokens, 10_000);
+    }
+
+    #[test]
+    fn test_incremental_log_stream_cursor_and_ring_buffer() {
+        let tracker = UsageTracker::default();
+        let mut cursor = LogStreamCursor::default();
+
+        // 1. Initial read on empty tracker returns empty Snapshot
+        assert_eq!(
+            tracker.next_log_stream_event(&mut cursor),
+            Some(LogStreamEvent::Snapshot { entries: vec![] })
+        );
+        // No changes -> None
+        assert_eq!(tracker.next_log_stream_event(&mut cursor), None);
+
+        // 2. Appending logs returns only newly added entries as Append (batched)
+        let s1 = tracker.register_session(None, "alpha");
+        let s2 = tracker.register_session(None, "beta");
+        tracker.record_log_with_session("INFO", "agy_gyro", Some(s1.id.clone()), "msg 1");
+        tracker.record_log_with_session("WARN", "agy_gyro", Some(s2.id.clone()), "msg 2");
+        tracker.record_log_with_session("INFO", "agy_gyro", Some(s1.id.clone()), "msg 3");
+
+        match tracker.next_log_stream_event(&mut cursor) {
+            Some(LogStreamEvent::Append { entries }) => {
+                let msgs: Vec<&str> = entries.iter().map(|e| e.message.as_str()).collect();
+                assert_eq!(msgs, vec!["msg 1", "msg 2", "msg 3"]);
+            }
+            other => panic!("expected Append, got {:?}", other),
+        }
+        assert_eq!(tracker.next_log_stream_event(&mut cursor), None);
+
+        // 3. Per-session reset removes only that session's logs and resyncs via Snapshot
+        tracker.reset_session(&s2.id);
+        match tracker.next_log_stream_event(&mut cursor) {
+            Some(LogStreamEvent::Snapshot { entries }) => {
+                let msgs: Vec<&str> = entries.iter().map(|e| e.message.as_str()).collect();
+                assert_eq!(msgs, vec!["msg 1", "msg 3"]);
+            }
+            other => panic!("expected Snapshot after reset_session, got {:?}", other),
+        }
+
+        // Subsequent append after reset_session resumes incremental Append events
+        tracker.record_log("INFO", "agy_gyro", "msg 4");
+        match tracker.next_log_stream_event(&mut cursor) {
+            Some(LogStreamEvent::Append { entries }) => {
+                assert_eq!(entries.len(), 1);
+                assert_eq!(entries[0].message, "msg 4");
+            }
+            other => panic!("expected Append after reset_session, got {:?}", other),
+        }
+
+        // 4. Global reset clears buffer and resyncs via empty Snapshot
+        tracker.reset();
+        assert_eq!(
+            tracker.next_log_stream_event(&mut cursor),
+            Some(LogStreamEvent::Snapshot { entries: vec![] })
+        );
+
+        // 5. Ring buffer holds up to MAX_LOG_ENTRIES (> 200) and evicts oldest on overflow.
+        //    An up-to-date subscriber still receives Append when only already-seen entries are evicted.
+        const { assert!(MAX_LOG_ENTRIES >= 10_000) };
+        for i in 1..=MAX_LOG_ENTRIES {
+            tracker.record_log("INFO", "agy_gyro", format!("bulk {}", i));
+        }
+        match tracker.next_log_stream_event(&mut cursor) {
+            Some(LogStreamEvent::Append { entries }) => {
+                assert_eq!(entries.len(), MAX_LOG_ENTRIES);
+                assert_eq!(entries.first().unwrap().id, 1);
+                assert_eq!(entries.last().unwrap().id, MAX_LOG_ENTRIES as u64);
+            }
+            other => panic!("expected full Append batch, got {:?}", other),
+        }
+
+        // Pushing 3 more evicts entries 1..=3 (which cursor already saw) -> still Append!
+        for i in 1..=3 {
+            tracker.record_log("INFO", "agy_gyro", format!("overflow {}", i));
+        }
+        assert_eq!(tracker.logs_snapshot().len(), MAX_LOG_ENTRIES);
+        assert_eq!(tracker.logs_snapshot().first().unwrap().id, 4);
+        match tracker.next_log_stream_event(&mut cursor) {
+            Some(LogStreamEvent::Append { entries }) => {
+                assert_eq!(entries.len(), 3);
+                assert_eq!(entries[0].id, MAX_LOG_ENTRIES as u64 + 1);
+                assert_eq!(entries[2].id, MAX_LOG_ENTRIES as u64 + 3);
+            }
+            other => panic!(
+                "expected Append when only seen entries were evicted, got {:?}",
+                other
+            ),
+        }
+
+        // 6. Lagged subscriber (more than MAX_LOG_ENTRIES added without reading) resyncs via Snapshot
+        for i in 1..=(MAX_LOG_ENTRIES + 5) {
+            tracker.record_log("INFO", "agy_gyro", format!("lag {}", i));
+        }
+        match tracker.next_log_stream_event(&mut cursor) {
+            Some(LogStreamEvent::Snapshot { entries }) => {
+                assert_eq!(entries.len(), MAX_LOG_ENTRIES);
+                assert_eq!(
+                    entries.last().unwrap().message,
+                    format!("lag {}", MAX_LOG_ENTRIES + 5)
+                );
+            }
+            other => panic!("expected Snapshot resync on lag, got {:?}", other),
+        }
     }
 }

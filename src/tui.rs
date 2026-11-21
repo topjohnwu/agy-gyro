@@ -3,7 +3,8 @@
 use crate::config::Config;
 use crate::proxy::SetBufferRequest;
 use crate::usage::{
-    LogEntry, ModelUsageStats, ScopeUsageStats, SessionUsageStats, UsageSnapshot, short_session_id,
+    LogEntry, LogStreamEvent, MAX_LOG_ENTRIES, ModelUsageStats, ScopeUsageStats, SessionUsageStats,
+    UsageSnapshot, short_session_id,
 };
 use crossterm::{
     event::{self, Event, KeyCode, KeyEventKind, KeyModifiers},
@@ -19,8 +20,10 @@ use ratatui::{
     text::{Line, Span},
     widgets::{Block, Borders, Cell, Paragraph, Row, Table},
 };
+use serde::Deserialize;
 use serde::de::DeserializeOwned;
 use std::cell::RefCell;
+use std::collections::VecDeque;
 use std::io;
 use std::rc::Rc;
 use std::time::{Duration, Instant};
@@ -84,12 +87,32 @@ pub async fn fetch_usage_snapshot(
     fetch_sse_first_event(client, endpoint_url).await
 }
 
-/// Connects to the SSE `GET /logs` stream and reads the initial `Vec<LogEntry>` event.
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+enum WireLogEvent {
+    Event(LogStreamEvent),
+    LegacySnapshot(Vec<LogEntry>),
+}
+
+impl From<WireLogEvent> for LogStreamEvent {
+    fn from(wire: WireLogEvent) -> Self {
+        match wire {
+            WireLogEvent::Event(event) => event,
+            WireLogEvent::LegacySnapshot(entries) => LogStreamEvent::Snapshot { entries },
+        }
+    }
+}
+
+/// Connects to the SSE `GET /logs` stream and reads the initial log snapshot event.
 pub async fn fetch_logs_snapshot(
     client: &reqwest::Client,
     logs_url: &str,
 ) -> Result<Vec<LogEntry>, String> {
-    fetch_sse_first_event(client, logs_url).await
+    let event: WireLogEvent = fetch_sse_first_event(client, logs_url).await?;
+    let entries = match LogStreamEvent::from(event) {
+        LogStreamEvent::Snapshot { entries } | LogStreamEvent::Append { entries } => entries,
+    };
+    Ok(entries)
 }
 
 /// Resets usage statistics on the target `agy-gyro` instance via `DELETE /usage`.
@@ -150,14 +173,14 @@ pub async fn toggle_remote_buffer(
         .map_err(|e| format!("Invalid JSON response: {}", e))
 }
 
-#[derive(Clone)]
 struct WrappedLogsCache {
     selected_session: Option<String>,
     inner_width: usize,
     log_count: usize,
     first_log_id: Option<u64>,
     last_log_id: Option<u64>,
-    lines: Rc<[(u64, usize, Line<'static>)]>,
+    visible_entry_count: usize,
+    lines: VecDeque<(u64, usize, Line<'static>)>,
 }
 
 /// State held by the TUI monitor dashboard.
@@ -165,7 +188,7 @@ pub struct DashboardState {
     pub endpoint_url: String,
     pub buffer_url: String,
     pub snapshot: Option<UsageSnapshot>,
-    pub logs: Vec<LogEntry>,
+    pub logs: VecDeque<LogEntry>,
     pub selected_session: Option<String>,
     pub connected: bool,
     pub last_error: Option<String>,
@@ -185,7 +208,7 @@ impl DashboardState {
             endpoint_url,
             buffer_url,
             snapshot: None,
-            logs: Vec::new(),
+            logs: VecDeque::new(),
             selected_session: None,
             connected: false,
             last_error: None,
@@ -290,66 +313,89 @@ impl DashboardState {
         list
     }
 
-    /// Returns log entries filtered by the active session tab (or all logs when `[All Sessions]` is selected).
-    pub fn visible_logs(&self) -> Vec<&LogEntry> {
-        match self.selected_session.as_deref() {
-            Some(sid) => self
-                .logs
-                .iter()
-                .filter(|l| l.session_id.as_deref() == Some(sid))
-                .collect(),
-            None => self.logs.iter().collect(),
+    fn matches_session(entry: &LogEntry, selected_session: Option<&str>) -> bool {
+        match selected_session {
+            Some(sid) => entry.session_id.as_deref() == Some(sid),
+            None => true,
         }
     }
 
-    fn cached_visual_log_lines(&self, inner_width: usize) -> Rc<[(u64, usize, Line<'static>)]> {
-        let first_id = self.logs.first().map(|l| l.id);
-        let last_id = self.logs.last().map(|l| l.id);
+    /// Returns log entries filtered by the active session tab (or all logs when `[All Sessions]` is selected).
+    pub fn visible_logs(&self) -> Vec<&LogEntry> {
+        self.logs
+            .iter()
+            .filter(|l| Self::matches_session(l, self.selected_session.as_deref()))
+            .collect()
+    }
+
+    fn ensure_wrapped_logs_cache(&self, inner_width: usize) {
+        let first_id = self.logs.front().map(|l| l.id);
+        let last_id = self.logs.back().map(|l| l.id);
         let log_count = self.logs.len();
 
-        if let Some(ref cache) = *self.wrapped_logs_cache.borrow()
-            && cache.inner_width == inner_width
-            && cache.log_count == log_count
-            && cache.first_log_id == first_id
-            && cache.last_log_id == last_id
-            && cache.selected_session == self.selected_session
         {
-            return Rc::clone(&cache.lines);
-        }
-
-        let mut out = Vec::new();
-        for entry in self.visible_logs() {
-            for (sub_idx, line) in format_wrapped_log_entry(entry, inner_width)
-                .into_iter()
-                .enumerate()
+            let cache_ref = self.wrapped_logs_cache.borrow();
+            if let Some(ref cache) = *cache_ref
+                && cache.inner_width == inner_width
+                && cache.log_count == log_count
+                && cache.first_log_id == first_id
+                && cache.last_log_id == last_id
+                && cache.selected_session == self.selected_session
             {
-                out.push((entry.id, sub_idx, line));
+                return;
             }
         }
-        let lines: Rc<[(u64, usize, Line<'static>)]> = out.into();
+
+        let mut lines = VecDeque::new();
+        let mut visible_entry_count = 0usize;
+        for entry in &self.logs {
+            if Self::matches_session(entry, self.selected_session.as_deref()) {
+                visible_entry_count += 1;
+                for (sub_idx, line) in format_wrapped_log_entry(entry, inner_width)
+                    .into_iter()
+                    .enumerate()
+                {
+                    lines.push_back((entry.id, sub_idx, line));
+                }
+            }
+        }
+
         *self.wrapped_logs_cache.borrow_mut() = Some(WrappedLogsCache {
             selected_session: self.selected_session.clone(),
             inner_width,
             log_count,
             first_log_id: first_id,
             last_log_id: last_id,
-            lines: Rc::clone(&lines),
+            visible_entry_count,
+            lines,
         });
-        lines
+    }
+
+    fn with_wrapped_logs_cache<R>(
+        &self,
+        inner_width: usize,
+        f: impl FnOnce(&WrappedLogsCache) -> R,
+    ) -> R {
+        self.ensure_wrapped_logs_cache(inner_width);
+        let cache_ref = self.wrapped_logs_cache.borrow();
+        f(cache_ref.as_ref().expect("wrapped logs cache initialized"))
     }
 
     /// Returns all visible log entries pre-wrapped into visual terminal [`Line`]s for `inner_width`,
     /// tagged with `(entry_id, subline_index, line)`.
     pub fn visual_log_lines(&self, inner_width: usize) -> Vec<(u64, usize, Line<'static>)> {
-        self.cached_visual_log_lines(inner_width).to_vec()
+        self.with_wrapped_logs_cache(inner_width, |cache| cache.lines.iter().cloned().collect())
     }
 
     /// Maximum number of visual lines the log panel can scroll up from the bottom
     /// while keeping the viewport full.
     pub fn max_log_scroll(&self) -> usize {
-        self.cached_visual_log_lines(self.log_viewport_width)
-            .len()
-            .saturating_sub(self.log_viewport_height.max(1))
+        self.with_wrapped_logs_cache(self.log_viewport_width, |cache| {
+            cache
+                .lines
+                .len()
+                .saturating_sub(self.log_viewport_height.max(1))
+        })
     }
 
     pub fn update_viewport_size(&mut self, area: Rect) {
@@ -375,38 +421,191 @@ impl DashboardState {
             .saturating_sub(lines);
     }
 
-    /// Updates the log buffer while keeping the viewport anchored on the same visual log line when paused.
+    /// Applies an incremental [`LogStreamEvent`] received from `GET /logs`.
+    pub fn apply_log_event(&mut self, event: LogStreamEvent) {
+        match event {
+            LogStreamEvent::Snapshot { entries } => self.set_logs(entries),
+            LogStreamEvent::Append { entries } => self.append_logs(entries),
+        }
+    }
+
+    /// Replaces the log buffer while keeping the viewport anchored on the same visual log line when paused.
     pub fn set_logs(&mut self, new_logs: Vec<LogEntry>) {
+        let mut deque = VecDeque::from(new_logs);
+        while deque.len() > MAX_LOG_ENTRIES {
+            deque.pop_front();
+        }
+
         if self.log_scroll_from_bottom > 0 {
             let width = self.log_viewport_width;
-            let visual = self.cached_visual_log_lines(width);
-            if !visual.is_empty() {
-                let max_prev_scroll = visual.len().saturating_sub(self.log_viewport_height.max(1));
-                let effective_prev_scroll = self.log_scroll_from_bottom.min(max_prev_scroll);
-                let prev_end_idx = visual.len().saturating_sub(effective_prev_scroll);
-                if prev_end_idx > 0
-                    && let Some(&(anchor_id, anchor_sub, _)) = visual.get(prev_end_idx - 1)
-                {
-                    self.logs = new_logs;
-                    let new_visual = self.cached_visual_log_lines(width);
-                    if let Some(pos) = new_visual
-                        .iter()
-                        .position(|(id, sub, _)| *id == anchor_id && *sub == anchor_sub)
-                    {
-                        let new_scroll = new_visual.len().saturating_sub(pos + 1);
-                        self.log_scroll_from_bottom = new_scroll.min(self.max_log_scroll());
-                    } else {
-                        self.log_scroll_from_bottom = self.max_log_scroll();
-                    }
-                    return;
+            let anchor = self.with_wrapped_logs_cache(width, |cache| {
+                if cache.lines.is_empty() {
+                    return None;
                 }
+                let max_prev_scroll = cache
+                    .lines
+                    .len()
+                    .saturating_sub(self.log_viewport_height.max(1));
+                let effective_prev_scroll = self.log_scroll_from_bottom.min(max_prev_scroll);
+                let prev_end_idx = cache.lines.len().saturating_sub(effective_prev_scroll);
+                if prev_end_idx > 0 {
+                    cache
+                        .lines
+                        .get(prev_end_idx - 1)
+                        .map(|&(id, sub, _)| (id, sub))
+                } else {
+                    None
+                }
+            });
+
+            self.logs = deque;
+            *self.wrapped_logs_cache.borrow_mut() = None;
+
+            if let Some((anchor_id, anchor_sub)) = anchor {
+                let (found_pos, new_len) = self.with_wrapped_logs_cache(width, |cache| {
+                    let pos = cache
+                        .lines
+                        .iter()
+                        .position(|(id, sub, _)| *id == anchor_id && *sub == anchor_sub);
+                    (pos, cache.lines.len())
+                });
+                let max_scroll = new_len.saturating_sub(self.log_viewport_height.max(1));
+                if let Some(pos) = found_pos {
+                    let new_scroll = new_len.saturating_sub(pos + 1);
+                    self.log_scroll_from_bottom = new_scroll.min(max_scroll);
+                } else {
+                    self.log_scroll_from_bottom = max_scroll;
+                }
+                return;
             }
+        } else {
+            self.logs = deque;
+            *self.wrapped_logs_cache.borrow_mut() = None;
         }
-        self.logs = new_logs;
+
         let max_scroll = self.max_log_scroll();
         if self.log_scroll_from_bottom > max_scroll {
             self.log_scroll_from_bottom = max_scroll;
         }
+    }
+
+    /// Incrementally appends newly received log entries, updating the wrapped-line cache in O(k)
+    /// and preserving the viewport scroll anchor when paused.
+    pub fn append_logs(&mut self, new_entries: Vec<LogEntry>) {
+        if new_entries.is_empty() {
+            return;
+        }
+
+        // When paused, warm the cache before mutating so we can shift the scroll offset in O(1).
+        let prev_scroll = if self.log_scroll_from_bottom > 0 {
+            let width = self.log_viewport_width;
+            let old_max = self.with_wrapped_logs_cache(width, |cache| {
+                cache
+                    .lines
+                    .len()
+                    .saturating_sub(self.log_viewport_height.max(1))
+            });
+            Some(self.log_scroll_from_bottom.min(old_max))
+        } else {
+            None
+        };
+
+        let old_first_id = self.logs.front().map(|l| l.id);
+        let old_last_id = self.logs.back().map(|l| l.id);
+        let old_count = self.logs.len();
+
+        let mut added_count = 0usize;
+        for entry in new_entries {
+            if self.logs.back().is_some_and(|last| entry.id <= last.id) {
+                continue;
+            }
+            self.logs.push_back(entry);
+            added_count += 1;
+        }
+
+        if added_count == 0 {
+            return;
+        }
+
+        let mut max_evicted_id: Option<u64> = None;
+        let mut evicted_old_count = 0usize;
+        let mut evicted_visible_entries = 0usize;
+        while self.logs.len() > MAX_LOG_ENTRIES {
+            if let Some(evicted) = self.logs.pop_front() {
+                max_evicted_id = Some(evicted.id);
+                if evicted_old_count < old_count {
+                    evicted_old_count += 1;
+                    if Self::matches_session(&evicted, self.selected_session.as_deref()) {
+                        evicted_visible_entries += 1;
+                    }
+                }
+            }
+        }
+
+        let new_first_id = self.logs.front().map(|l| l.id);
+        let new_last_id = self.logs.back().map(|l| l.id);
+        let new_count = self.logs.len();
+
+        let mut added_visual_lines = 0usize;
+        let mut cache_updated = false;
+        if let Some(ref mut cache) = *self.wrapped_logs_cache.borrow_mut()
+            && cache.selected_session == self.selected_session
+            && cache.log_count == old_count
+            && cache.first_log_id == old_first_id
+            && cache.last_log_id == old_last_id
+        {
+            if let Some(evicted_id) = max_evicted_id {
+                while let Some(&(id, _, _)) = cache.lines.front() {
+                    if id <= evicted_id {
+                        cache.lines.pop_front();
+                    } else {
+                        break;
+                    }
+                }
+                cache.visible_entry_count = cache
+                    .visible_entry_count
+                    .saturating_sub(evicted_visible_entries);
+            }
+
+            let tail_start = self.logs.len().saturating_sub(added_count);
+            for entry in self.logs.range(tail_start..) {
+                if Self::matches_session(entry, self.selected_session.as_deref()) {
+                    cache.visible_entry_count += 1;
+                    for (sub_idx, line) in format_wrapped_log_entry(entry, cache.inner_width)
+                        .into_iter()
+                        .enumerate()
+                    {
+                        cache.lines.push_back((entry.id, sub_idx, line));
+                        added_visual_lines += 1;
+                    }
+                }
+            }
+
+            cache.log_count = new_count;
+            cache.first_log_id = new_first_id;
+            cache.last_log_id = new_last_id;
+            cache_updated = true;
+        }
+
+        if !cache_updated {
+            *self.wrapped_logs_cache.borrow_mut() = None;
+        }
+
+        if let Some(effective_prev_scroll) = prev_scroll {
+            let max_scroll = self.max_log_scroll();
+            self.log_scroll_from_bottom = effective_prev_scroll
+                .saturating_add(added_visual_lines)
+                .min(max_scroll);
+        }
+    }
+
+    fn clear_logs_for_session(&mut self, session_id: Option<&str>) {
+        if let Some(sid) = session_id {
+            self.logs.retain(|l| l.session_id.as_deref() != Some(sid));
+        } else {
+            self.logs.clear();
+        }
+        *self.wrapped_logs_cache.borrow_mut() = None;
     }
 }
 
@@ -1033,27 +1232,31 @@ fn format_wrapped_log_entry(entry: &LogEntry, inner_width: usize) -> Vec<Line<'s
 }
 
 fn render_logs_panel(frame: &mut Frame, area: Rect, state: &DashboardState) {
-    let total_entries = state.visible_logs().len();
     let inner_width = area.width.saturating_sub(2) as usize;
     let visible_rows = area.height.saturating_sub(2) as usize;
-    let visual_lines = state.cached_visual_log_lines(inner_width);
-    let total_visual = visual_lines.len();
-    let max_scroll = total_visual.saturating_sub(visible_rows);
-    let effective_scroll = state.log_scroll_from_bottom.min(max_scroll);
-    let end_idx = total_visual.saturating_sub(effective_scroll);
-    let start_idx = end_idx.saturating_sub(visible_rows);
+    let (total_entries, effective_scroll, lines) =
+        state.with_wrapped_logs_cache(inner_width, |cache| {
+            let total_entries = cache.visible_entry_count;
+            let total_visual = cache.lines.len();
+            let max_scroll = total_visual.saturating_sub(visible_rows);
+            let effective_scroll = state.log_scroll_from_bottom.min(max_scroll);
+            let end_idx = total_visual.saturating_sub(effective_scroll);
+            let start_idx = end_idx.saturating_sub(visible_rows);
 
-    let lines: Vec<Line> = if visual_lines.is_empty() {
-        vec![Line::from(Span::styled(
-            "Waiting for gateway logs...",
-            Style::default().fg(Color::DarkGray),
-        ))]
-    } else {
-        visual_lines[start_idx..end_idx]
-            .iter()
-            .map(|(_, _, line)| line.clone())
-            .collect()
-    };
+            let lines: Vec<Line> = if cache.lines.is_empty() {
+                vec![Line::from(Span::styled(
+                    "Waiting for gateway logs...",
+                    Style::default().fg(Color::DarkGray),
+                ))]
+            } else {
+                cache
+                    .lines
+                    .range(start_idx..end_idx)
+                    .map(|(_, _, line)| line.clone())
+                    .collect()
+            };
+            (total_entries, effective_scroll, lines)
+        });
 
     let title = if effective_scroll > 0 {
         format!(
@@ -1156,7 +1359,7 @@ fn render_footer(frame: &mut Frame, area: Rect, state: &DashboardState) {
 
 enum SseUpdate {
     Snapshot(Box<UsageSnapshot>),
-    Logs(Vec<LogEntry>),
+    LogEvent(LogStreamEvent),
     Disconnected(String),
 }
 
@@ -1253,12 +1456,12 @@ fn spawn_logs_sse_listener(
     logs_url: String,
     tx: tokio::sync::mpsc::UnboundedSender<SseUpdate>,
 ) -> tokio::task::JoinHandle<()> {
-    spawn_sse_listener::<Vec<LogEntry>, _>(
+    spawn_sse_listener::<WireLogEvent, _>(
         client,
         logs_url,
         Duration::from_secs(30),
         false,
-        SseUpdate::Logs,
+        |wire| SseUpdate::LogEvent(wire.into()),
         tx,
     )
 }
@@ -1325,8 +1528,8 @@ async fn run_monitor_loop(
                     state.connected = true;
                     state.last_error = None;
                 }
-                SseUpdate::Logs(logs) => {
-                    state.set_logs(logs);
+                SseUpdate::LogEvent(event) => {
+                    state.apply_log_event(event);
                 }
                 SseUpdate::Disconnected(error) => {
                     state.connected = false;
@@ -1380,13 +1583,7 @@ async fn run_monitor_loop(
                             {
                                 state.selected_session = None;
                             }
-                            if let Some(ref sid) = target_session {
-                                state
-                                    .logs
-                                    .retain(|l| l.session_id.as_deref() != Some(sid.as_str()));
-                            } else {
-                                state.logs.clear();
-                            }
+                            state.clear_logs_for_session(target_session.as_deref());
                             state.snapshot = Some(snap);
                             state.connected = true;
                             state.last_error = None;
@@ -1503,14 +1700,14 @@ mod tests {
                 stats: scope_stats,
             }],
         });
-        state.logs = vec![LogEntry {
+        state.logs = VecDeque::from(vec![LogEntry {
             id: 1,
             timestamp_secs: 90,
             level: "INFO".to_string(),
             target: "agy_gyro::proxy".to_string(),
             message: "Request #5 [gemini-4-argon] status=200".to_string(),
             session_id: Some("1".to_string()),
-        }];
+        }]);
 
         let backend = TestBackend::new(140, 38);
         let mut terminal = Terminal::new(backend).unwrap();
@@ -1599,7 +1796,7 @@ mod tests {
         state.scroll_logs_down(1);
         assert_eq!(state.log_scroll_from_bottom, 6);
 
-        // Paused viewport stays anchored on the same lines when new logs arrive
+        // Paused viewport stays anchored on the same lines when new logs arrive via Snapshot
         let new_logs: Vec<LogEntry> = (1..=15)
             .map(|id| LogEntry {
                 id,
@@ -1612,6 +1809,167 @@ mod tests {
             .collect();
         state.set_logs(new_logs);
         assert_eq!(state.log_scroll_from_bottom, 9);
+
+        // Paused viewport also stays anchored when new logs arrive incrementally via Append
+        state.apply_log_event(LogStreamEvent::Append {
+            entries: (16..=18)
+                .map(|id| LogEntry {
+                    id,
+                    timestamp_secs: id,
+                    level: "INFO".to_string(),
+                    target: "agy_gyro".to_string(),
+                    message: format!("Log {}", id),
+                    session_id: None,
+                })
+                .collect(),
+        });
+        assert_eq!(state.logs.len(), 18);
+        assert_eq!(state.log_scroll_from_bottom, 12);
+    }
+
+    #[test]
+    fn test_incremental_append_cache_eviction_and_wire_compat() {
+        // WireLogEvent supports both tagged LogStreamEvent and legacy bare Vec<LogEntry>
+        let snapshot_json = serde_json::to_string(&LogStreamEvent::Snapshot {
+            entries: vec![LogEntry {
+                id: 1,
+                timestamp_secs: 1,
+                level: "INFO".to_string(),
+                target: "agy_gyro".to_string(),
+                message: "hello".to_string(),
+                session_id: None,
+            }],
+        })
+        .unwrap();
+        let parsed_snap: LogStreamEvent = serde_json::from_str::<WireLogEvent>(&snapshot_json)
+            .unwrap()
+            .into();
+        assert!(matches!(parsed_snap, LogStreamEvent::Snapshot { entries } if entries.len() == 1));
+
+        let append_json = serde_json::to_string(&LogStreamEvent::Append {
+            entries: vec![LogEntry {
+                id: 2,
+                timestamp_secs: 2,
+                level: "WARN".to_string(),
+                target: "agy_gyro".to_string(),
+                message: "world".to_string(),
+                session_id: Some("s1".to_string()),
+            }],
+        })
+        .unwrap();
+        let parsed_append: LogStreamEvent = serde_json::from_str::<WireLogEvent>(&append_json)
+            .unwrap()
+            .into();
+        assert!(matches!(parsed_append, LogStreamEvent::Append { entries } if entries.len() == 1));
+
+        let legacy_json = serde_json::to_string(&vec![LogEntry {
+            id: 9,
+            timestamp_secs: 9,
+            level: "INFO".to_string(),
+            target: "agy_gyro".to_string(),
+            message: "legacy".to_string(),
+            session_id: None,
+        }])
+        .unwrap();
+        let parsed_legacy: LogStreamEvent = serde_json::from_str::<WireLogEvent>(&legacy_json)
+            .unwrap()
+            .into();
+        assert!(
+            matches!(parsed_legacy, LogStreamEvent::Snapshot { entries } if entries[0].id == 9)
+        );
+
+        // Verify incremental cache matches a fresh rebuild across session filter + overflow eviction
+        let mut state = DashboardState::new(&Config::default());
+        state.log_viewport_height = 5;
+        state.log_viewport_width = 80;
+        state.selected_session = Some("s1".to_string());
+
+        let initial: Vec<LogEntry> = (1..=(MAX_LOG_ENTRIES as u64))
+            .map(|id| LogEntry {
+                id,
+                timestamp_secs: id,
+                level: "INFO".to_string(),
+                target: "agy_gyro".to_string(),
+                message: format!("Entry {}", id),
+                session_id: Some(if id % 2 == 0 { "s1" } else { "s2" }.to_string()),
+            })
+            .collect();
+        state.apply_log_event(LogStreamEvent::Snapshot { entries: initial });
+        assert_eq!(state.logs.len(), MAX_LOG_ENTRIES);
+
+        // Warm cache, then pause 10 lines up from bottom
+        state.scroll_logs_up(10);
+        assert_eq!(state.log_scroll_from_bottom, 10);
+
+        // Append 4 entries (2 for s1, 2 for s2) + 1 duplicate ID that should be ignored
+        let extra = vec![
+            LogEntry {
+                id: MAX_LOG_ENTRIES as u64,
+                timestamp_secs: 0,
+                level: "INFO".to_string(),
+                target: "agy_gyro".to_string(),
+                message: "duplicate".to_string(),
+                session_id: Some("s1".to_string()),
+            },
+            LogEntry {
+                id: MAX_LOG_ENTRIES as u64 + 1,
+                timestamp_secs: 1,
+                level: "INFO".to_string(),
+                target: "agy_gyro".to_string(),
+                message: "Extra 1".to_string(),
+                session_id: Some("s2".to_string()),
+            },
+            LogEntry {
+                id: MAX_LOG_ENTRIES as u64 + 2,
+                timestamp_secs: 2,
+                level: "INFO".to_string(),
+                target: "agy_gyro".to_string(),
+                message: "Extra 2".to_string(),
+                session_id: Some("s1".to_string()),
+            },
+            LogEntry {
+                id: MAX_LOG_ENTRIES as u64 + 3,
+                timestamp_secs: 3,
+                level: "INFO".to_string(),
+                target: "agy_gyro".to_string(),
+                message: "Extra 3".to_string(),
+                session_id: Some("s2".to_string()),
+            },
+            LogEntry {
+                id: MAX_LOG_ENTRIES as u64 + 4,
+                timestamp_secs: 4,
+                level: "INFO".to_string(),
+                target: "agy_gyro".to_string(),
+                message: "Extra 4".to_string(),
+                session_id: Some("s1".to_string()),
+            },
+        ];
+        state.apply_log_event(LogStreamEvent::Append { entries: extra });
+
+        assert_eq!(state.logs.len(), MAX_LOG_ENTRIES);
+        assert_eq!(state.logs.front().unwrap().id, 5);
+        assert_eq!(state.logs.back().unwrap().id, MAX_LOG_ENTRIES as u64 + 4);
+        // 2 new s1 entries were added at bottom -> paused scroll shifts from 10 to 12
+        assert_eq!(state.log_scroll_from_bottom, 12);
+
+        // Incremental cache must match a cold rebuild identically
+        let cached_lines = state.visual_log_lines(80);
+        let cached_visible_count = state.with_wrapped_logs_cache(80, |c| c.visible_entry_count);
+        *state.wrapped_logs_cache.borrow_mut() = None;
+        let rebuilt_lines = state.visual_log_lines(80);
+        let rebuilt_visible_count = state.with_wrapped_logs_cache(80, |c| c.visible_entry_count);
+
+        assert_eq!(cached_visible_count, rebuilt_visible_count);
+        assert_eq!(cached_visible_count, MAX_LOG_ENTRIES / 2);
+        assert_eq!(cached_lines.len(), rebuilt_lines.len());
+        assert_eq!(
+            cached_lines.first().unwrap().0,
+            rebuilt_lines.first().unwrap().0
+        );
+        assert_eq!(
+            cached_lines.last().unwrap().0,
+            rebuilt_lines.last().unwrap().0
+        );
     }
 
     #[test]

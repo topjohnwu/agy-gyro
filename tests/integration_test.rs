@@ -2176,3 +2176,172 @@ async fn test_runtime_buffer_toggle_switches_buffering_in_real_time() {
             .any(|l| l.message.contains("Full SSE buffering disabled"))
     );
 }
+
+#[tokio::test]
+async fn test_logs_sse_streams_incremental_appends_and_resyncs_on_reset() {
+    use agy_gyro::usage::LogStreamEvent;
+    use futures_util::StreamExt;
+
+    let config = Config {
+        host: "127.0.0.1".to_string(),
+        port: 0,
+        upstream: "http://127.0.0.1:1".to_string(),
+        max_retries: 0,
+        api_key: "test-key-123".to_string(),
+        ..Config::default()
+    };
+    let http_client = build_http_client(&config).unwrap();
+    let state = Arc::new(ProxyState::new(config, http_client));
+    let app = create_router(Arc::clone(&state));
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let proxy_url = format!("http://{}", listener.local_addr().unwrap());
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+
+    let client = Client::new();
+
+    let s1 = state.usage.register_session(None, "sess-one");
+    let s2 = state.usage.register_session(None, "sess-two");
+    state
+        .usage
+        .record_log_with_session("INFO", "agy_gyro", Some(s1.id.clone()), "initial-log-1");
+    state
+        .usage
+        .record_log_with_session("INFO", "agy_gyro", Some(s2.id.clone()), "initial-log-2");
+
+    // Open persistent SSE connection to GET /logs
+    let res = client
+        .get(format!("{}/logs", proxy_url))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 200);
+    let mut stream = res.bytes_stream();
+    let mut buf = Vec::new();
+
+    async fn next_log_event<S, E>(stream: &mut S, buf: &mut Vec<u8>) -> LogStreamEvent
+    where
+        S: futures_util::Stream<Item = Result<axum::body::Bytes, E>> + Unpin,
+        E: std::fmt::Debug,
+    {
+        loop {
+            while let Some(pos) = buf.iter().position(|&b| b == b'\n') {
+                let line = String::from_utf8_lossy(&buf[..pos]).trim().to_string();
+                buf.drain(..=pos);
+                if let Some(json_str) = line.strip_prefix("data:").map(str::trim)
+                    && !json_str.is_empty()
+                {
+                    return serde_json::from_str::<LogStreamEvent>(json_str)
+                        .expect("valid LogStreamEvent JSON");
+                }
+            }
+            let chunk = tokio::time::timeout(Duration::from_secs(3), stream.next())
+                .await
+                .expect("timed out waiting for SSE event")
+                .expect("stream ended unexpectedly")
+                .expect("stream read error");
+            buf.extend_from_slice(&chunk);
+        }
+    }
+
+    // 1. First event must be Snapshot containing the pre-existing logs
+    match next_log_event(&mut stream, &mut buf).await {
+        LogStreamEvent::Snapshot { entries } => {
+            assert!(entries.iter().any(|e| e.message == "initial-log-1"));
+            assert!(entries.iter().any(|e| e.message == "initial-log-2"));
+        }
+        other => panic!("expected initial Snapshot event, got {:?}", other),
+    }
+
+    // 2. Recording a new log emits an incremental Append (never re-sending initial logs)
+    //    Note: parallel integration tests may emit unrelated global tracing events into this tracker.
+    state
+        .usage
+        .record_log_with_session("WARN", "agy_gyro", Some(s1.id.clone()), "live-append-1");
+    loop {
+        match next_log_event(&mut stream, &mut buf).await {
+            LogStreamEvent::Append { entries } => {
+                assert!(
+                    !entries
+                        .iter()
+                        .any(|e| e.message == "initial-log-1" || e.message == "initial-log-2"),
+                    "incremental Append must not resend pre-existing logs"
+                );
+                if let Some(found) = entries.iter().find(|e| e.message == "live-append-1") {
+                    assert_eq!(found.session_id.as_deref(), Some(s1.id.as_str()));
+                    break;
+                }
+            }
+            other => panic!("expected incremental Append event, got {:?}", other),
+        }
+    }
+
+    // 3. Per-session reset resyncs via Snapshot without s2's logs
+    let reset_s2 = client
+        .delete(format!("{}/usage?session={}", proxy_url, s2.id))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(reset_s2.status(), 200);
+    loop {
+        match next_log_event(&mut stream, &mut buf).await {
+            LogStreamEvent::Snapshot { entries } => {
+                assert!(entries.iter().any(|e| e.message == "initial-log-1"));
+                assert!(entries.iter().any(|e| e.message == "live-append-1"));
+                assert!(!entries.iter().any(|e| e.message == "initial-log-2"));
+                break;
+            }
+            LogStreamEvent::Append { .. } => {
+                // Ignore any concurrent global tracing appends emitted before the DELETE landed
+            }
+        }
+    }
+
+    // 4. Subsequent log still arrives incrementally as Append
+    state
+        .usage
+        .record_log("INFO", "agy_gyro", "live-append-after-session-reset");
+    loop {
+        match next_log_event(&mut stream, &mut buf).await {
+            LogStreamEvent::Append { entries } => {
+                assert!(
+                    !entries
+                        .iter()
+                        .any(|e| e.message == "initial-log-1" || e.message == "live-append-1"),
+                    "incremental Append must not resend snapshot entries"
+                );
+                if entries
+                    .iter()
+                    .any(|e| e.message == "live-append-after-session-reset")
+                {
+                    break;
+                }
+            }
+            other => panic!("expected Append after session reset, got {:?}", other),
+        }
+    }
+
+    // 5. Global reset resyncs via Snapshot clearing all prior logs
+    let reset_all = client
+        .delete(format!("{}/usage", proxy_url))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(reset_all.status(), 200);
+    loop {
+        match next_log_event(&mut stream, &mut buf).await {
+            LogStreamEvent::Snapshot { entries } => {
+                assert!(!entries.iter().any(|e| {
+                    e.message == "initial-log-1"
+                        || e.message == "live-append-1"
+                        || e.message == "live-append-after-session-reset"
+                }));
+                break;
+            }
+            LogStreamEvent::Append { .. } => {
+                // Ignore any concurrent global tracing appends emitted before the DELETE landed
+            }
+        }
+    }
+}
