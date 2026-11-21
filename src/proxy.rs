@@ -4,8 +4,8 @@ use crate::config::Config;
 pub use crate::models::{
     DEFAULT_GATEWAY_MODELS, GatewayModelEntry, GatewayModelsResponse, GeminiModelInfo,
     GeminiModelsResponse, MODEL_EFFORT_LEVELS, NON_CORE_KEYWORDS, default_gateway_models,
-    expand_gateway_models, extract_model_from_request, fetch_gateway_models,
-    filter_core_gemini_models, inject_thinking_level_if_missing, resolve_gateway_models,
+    expand_gateway_models, fetch_gateway_models, filter_core_gemini_models,
+    inject_thinking_level_if_missing, resolve_gateway_models,
     rewrite_request_path_and_extract_effort,
 };
 use crate::retry::{
@@ -16,7 +16,7 @@ use crate::usage::{
     ActiveRequestGuard, DEFAULT_PRICING_URL, PricingTable, RawUsageMetadata, SessionMeta,
     StreamUsageExtractor, UsageLogLayer, UsageSnapshot, UsageTracker, extract_model_from_path,
     extract_session_from_headers, extract_usage_from_chunks, format_session_api_key,
-    strip_session_prefix, try_fetch_model_pricing,
+    try_fetch_model_pricing,
 };
 use axum::{
     Json, Router,
@@ -38,9 +38,6 @@ use tracing::{Instrument, debug, error, info, info_span, warn};
 /// Default interval before committing early 200 OK headers and between keep-alive heartbeats.
 /// Set to 15 seconds to stay well below agy's 60-second ResponseHeaderTimeout.
 pub const DEFAULT_KEEP_ALIVE_INTERVAL: Duration = Duration::from_secs(15);
-
-pub const DEFAULT_GENAI_UPSTREAM: &str = "https://generativelanguage.googleapis.com";
-pub const DEFAULT_OAUTH_UPSTREAM: &str = "https://daily-cloudcode-pa.googleapis.com";
 
 pub struct ProxyState {
     pub config: Config,
@@ -85,11 +82,6 @@ impl ProxyState {
         let usage = Arc::new(UsageTracker::default());
         usage.register_global_logger();
         usage.spawn_process_monitor();
-        let default_models = if config.has_api_key() {
-            default_gateway_models()
-        } else {
-            Vec::new()
-        };
         let (shutdown_tx, _) = tokio::sync::watch::channel(false);
         Self {
             config,
@@ -98,7 +90,7 @@ impl ProxyState {
             pricing_url: DEFAULT_PRICING_URL.to_string(),
             keep_alive_interval: DEFAULT_KEEP_ALIVE_INTERVAL,
             usage,
-            gateway_models: RwLock::new(default_models),
+            gateway_models: RwLock::new(default_gateway_models()),
             refresh_in_flight: Mutex::new(None),
             shutdown_tx,
         }
@@ -133,19 +125,14 @@ impl ProxyState {
     }
 
     async fn perform_catalog_and_pricing_refresh(&self) {
-        if self.config.has_api_key() {
-            let (models_opt, pricing_opt) = tokio::join!(
-                fetch_gateway_models(&self.client, &self.config),
-                try_fetch_model_pricing(&self.client, &self.pricing_url),
-            );
-            if let Some(models) = models_opt {
-                self.set_gateway_models(models);
-            }
-            if let Some(pricing) = pricing_opt {
-                self.usage.set_pricing(pricing);
-            }
-        } else if let Some(pricing) = try_fetch_model_pricing(&self.client, &self.pricing_url).await
-        {
+        let (models_opt, pricing_opt) = tokio::join!(
+            fetch_gateway_models(&self.client, &self.config),
+            try_fetch_model_pricing(&self.client, &self.pricing_url),
+        );
+        if let Some(models) = models_opt {
+            self.set_gateway_models(models);
+        }
+        if let Some(pricing) = pricing_opt {
             self.usage.set_pricing(pricing);
         }
     }
@@ -294,7 +281,6 @@ pub struct RegisterSessionRequest {
 pub struct RegisterSessionResponse {
     pub session_id: String,
     pub api_key: String,
-    pub gateway_enabled: bool,
 }
 
 /// Response payload from `GET /sessions` for checking daemon liveness and active model list.
@@ -341,7 +327,6 @@ async fn register_session_handler(
     Json(RegisterSessionResponse {
         session_id: meta.id,
         api_key,
-        gateway_enabled: state.config.has_api_key(),
     })
 }
 
@@ -619,21 +604,6 @@ fn format_endpoint(url: &reqwest::Url) -> String {
     }
 }
 
-/// Returns `true` if `path_and_query` targets a Cloud Code `/v1internal` endpoint.
-fn is_oauth_endpoint_path(path_and_query: &str) -> bool {
-    path_and_query.starts_with("/v1internal:") || path_and_query.starts_with("/v1internal/")
-}
-
-/// Resolves the upstream base URL for an OAuth passthrough request.
-pub fn resolve_oauth_upstream_base(state: &ProxyState) -> &str {
-    // If a custom upstream was explicitly configured (e.g. for local testing/mocking), honor it.
-    if state.upstream_base != DEFAULT_GENAI_UPSTREAM {
-        &state.upstream_base
-    } else {
-        DEFAULT_OAUTH_UPSTREAM
-    }
-}
-
 struct RequestContext {
     state: Arc<ProxyState>,
     method: Method,
@@ -644,7 +614,6 @@ struct RequestContext {
     session: Option<SessionMeta>,
     session_prefix: String,
     model_from_path: Option<String>,
-    is_oauth: bool,
     req_start: Instant,
     active_guard: Option<ActiveRequestGuard>,
 }
@@ -662,7 +631,6 @@ impl RequestContext {
         headers: HeaderMap,
         body: Bytes,
         session: Option<SessionMeta>,
-        is_oauth: bool,
     ) -> Self {
         let req_start = Instant::now();
         let endpoint = format_endpoint(&target_url);
@@ -670,11 +638,7 @@ impl RequestContext {
             .as_ref()
             .map(SessionMeta::log_prefix)
             .unwrap_or_default();
-        let model_from_path = if is_oauth {
-            extract_model_from_request(target_url.path(), &body)
-        } else {
-            extract_model_from_path(target_url.path())
-        };
+        let model_from_path = extract_model_from_path(target_url.path());
         let active_guard = model_from_path
             .as_ref()
             .map(|_| state.usage.begin_session_request(session.as_ref()));
@@ -689,7 +653,6 @@ impl RequestContext {
             session,
             session_prefix,
             model_from_path,
-            is_oauth,
             req_start,
             active_guard,
         }
@@ -721,31 +684,20 @@ impl RequestContext {
             .client
             .request(self.method.clone(), self.target_url.clone());
 
-        if self.is_oauth {
-            // In OAuth passthrough mode, forward client headers (including Authorization: Bearer ...) untouched.
-            for (header_name, header_val) in &self.headers {
-                if !is_hop_by_hop(header_name) && header_name != axum::http::header::ACCEPT_ENCODING
-                {
-                    req_builder = req_builder.header(header_name, header_val);
-                }
+        // Forward headers, stripping hop-by-hop, accept-encoding (handled by reqwest gzip), and gateway Authorization header
+        for (header_name, header_val) in &self.headers {
+            if !is_hop_by_hop(header_name)
+                && header_name != axum::http::header::ACCEPT_ENCODING
+                && header_name != axum::http::header::AUTHORIZATION
+                && header_name.as_str() != "x-goog-api-key"
+            {
+                req_builder = req_builder.header(header_name, header_val);
             }
-            req_builder.body(self.body.clone())
-        } else {
-            // Forward headers, stripping hop-by-hop, accept-encoding (handled by reqwest gzip), and gateway Authorization header
-            for (header_name, header_val) in &self.headers {
-                if !is_hop_by_hop(header_name)
-                    && header_name != axum::http::header::ACCEPT_ENCODING
-                    && header_name != axum::http::header::AUTHORIZATION
-                    && header_name.as_str() != "x-goog-api-key"
-                {
-                    req_builder = req_builder.header(header_name, header_val);
-                }
-            }
-
-            req_builder
-                .header("x-goog-api-key", self.state.config.api_key.trim())
-                .body(self.body.clone())
         }
+
+        req_builder
+            .header("x-goog-api-key", self.state.config.api_key.trim())
+            .body(self.body.clone())
     }
 
     fn finish_completed(
@@ -1110,72 +1062,6 @@ async fn prepare_passthrough_response(
     }
 }
 
-/// Executes an OAuth passthrough request with zero retries, zero buffering, no initial-chunk
-/// peeking, and no synthetic keep-alive framing, while extracting token and price metrics on the fly.
-async fn execute_oauth_passthrough(
-    state: Arc<ProxyState>,
-    method: Method,
-    target_url: reqwest::Url,
-    headers: HeaderMap,
-    body: Bytes,
-    session: Option<SessionMeta>,
-    is_sse_req: bool,
-) -> Response {
-    let mut ctx = RequestContext::new(state, method, target_url, headers, body, session, true);
-    debug!(
-        "{}Passthrough OAuth request {} {} -> {}",
-        ctx.session_prefix,
-        ctx.method,
-        ctx.endpoint,
-        ctx.target_url.host_str().unwrap_or("")
-    );
-
-    let outcome = match ctx.build_upstream_request().send().await {
-        Ok(upstream_res) => {
-            let status = upstream_res.status();
-            if !status.is_success() {
-                warn!(
-                    "{}OAuth request {} {} returned status {}",
-                    ctx.session_prefix, ctx.method, ctx.endpoint, status
-                );
-            }
-            let res_headers = copy_forwarded_response_headers(upstream_res.headers());
-            let is_sse = is_sse_req
-                || res_headers
-                    .get(axum::http::header::CONTENT_TYPE)
-                    .and_then(|v| v.to_str().ok())
-                    .is_some_and(|v| v.contains("text/event-stream"));
-
-            let raw_stream: BoxByteStream = Box::pin(
-                upstream_res
-                    .bytes_stream()
-                    .map(|res| res.map_err(std::io::Error::other)),
-            );
-
-            let passthrough_stream = if ctx.model_from_path.is_some() {
-                wrap_usage_passthrough_stream(&mut ctx, raw_stream, status, is_sse, 0)
-            } else {
-                raw_stream
-            };
-
-            UpstreamOutcome {
-                status,
-                headers: res_headers,
-                body: UpstreamBody::Passthrough(passthrough_stream),
-            }
-        }
-        Err(err) => {
-            error!(
-                "{}Upstream error for OAuth request {} {}: {}",
-                ctx.session_prefix, ctx.method, ctx.endpoint, err
-            );
-            ctx.fail_bad_gateway(0, format!("Bad Gateway: upstream request failed: {}", err))
-        }
-    };
-
-    outcome.into_fast_response(&ctx.session_prefix)
-}
-
 async fn execute_single_attempt(ctx: &mut RequestContext, attempt: u32) -> AttemptOutcome {
     let max_retries = ctx.max_retries();
     debug!(
@@ -1290,7 +1176,7 @@ async fn execute_proxy_request(
     body: Bytes,
     session: Option<SessionMeta>,
 ) -> UpstreamOutcome {
-    let mut ctx = RequestContext::new(state, method, target_url, headers, body, session, false);
+    let mut ctx = RequestContext::new(state, method, target_url, headers, body, session);
     let mut attempt = 0;
 
     loop {
@@ -1340,9 +1226,7 @@ pub async fn proxy_handler(
         .path_and_query()
         .map(|pq| pq.as_str())
         .unwrap_or("/");
-    let (session_id_from_path, stripped_path_and_query) = strip_session_prefix(raw_path_and_query);
-    let session = extract_session_from_headers(&headers)
-        .or_else(|| session_id_from_path.map(|id| state.usage.resolve_session_by_id(id)));
+    let session = extract_session_from_headers(&headers);
     let session_prefix = session
         .as_ref()
         .map(SessionMeta::log_prefix)
@@ -1351,38 +1235,8 @@ pub async fn proxy_handler(
     let req_span = info_span!("proxy_request", session_id = %session_id_str);
     let _enter = req_span.enter();
 
-    let is_oauth = !state.config.has_api_key()
-        || session_id_from_path.is_some()
-        || is_oauth_endpoint_path(stripped_path_and_query);
-
-    if is_oauth {
-        let upstream_base = resolve_oauth_upstream_base(&state);
-        let target_url_str = format!("{}{}", upstream_base, stripped_path_and_query);
-        let target_url = match reqwest::Url::parse(&target_url_str) {
-            Ok(url) => url,
-            Err(err) => {
-                error!(
-                    "{}Failed to parse target URL {}: {}",
-                    session_prefix, target_url_str, err
-                );
-                return (
-                    StatusCode::BAD_REQUEST,
-                    format!("Invalid target URL: {}", err),
-                )
-                    .into_response();
-            }
-        };
-        let is_sse = is_sse_request(stripped_path_and_query, &headers);
-        drop(_enter);
-        return execute_oauth_passthrough(
-            state, method, target_url, headers, body, session, is_sse,
-        )
-        .instrument(req_span)
-        .await;
-    }
-
     let (rewritten_path_and_query, effort_from_path) =
-        rewrite_request_path_and_extract_effort(stripped_path_and_query);
+        rewrite_request_path_and_extract_effort(raw_path_and_query);
     let body = match effort_from_path {
         Some(effort) => inject_thinking_level_if_missing(body, effort),
         None => body,

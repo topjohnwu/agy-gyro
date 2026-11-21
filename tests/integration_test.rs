@@ -64,17 +64,6 @@ async fn spawn_test_proxy_with_keep_alive(
                         }
                     }
                 }
-            },
-            "anthropic": {
-                "models": {
-                    "claude-sonnet-4-5": {
-                        "cost": {
-                            "input": 3.0,
-                            "output": 15.0,
-                            "cache_read": 0.3
-                        }
-                    }
-                }
             }
         }"#,
     )
@@ -916,15 +905,9 @@ fn test_cli_parse_toml_config() {
     let temp_path = std::env::temp_dir().join(format!("agy-gyro-test-{}.toml", std::process::id()));
     let _ = std::fs::remove_file(&temp_path);
 
-    // Missing config file uses defaults; succeeds in OAuth passthrough mode when api_key is absent
-    let cli_no_key = Cli::try_parse_with_config_from(["agy-gyro"], Some(&temp_path)).unwrap();
-    assert!(cli_no_key.config.api_key.is_empty());
-    assert!(!cli_no_key.config.oauth);
-    assert!(!cli_no_key.config.is_gateway_enabled());
-
-    let cli_server_no_key =
-        Cli::try_parse_with_config_from(["agy-gyro", "server"], Some(&temp_path)).unwrap();
-    assert!(!cli_server_no_key.config.is_gateway_enabled());
+    // Missing config file and missing API key returns an error for wrapper and server commands
+    assert!(Cli::try_parse_with_config_from(["agy-gyro"], Some(&temp_path)).is_err());
+    assert!(Cli::try_parse_with_config_from(["agy-gyro", "server"], Some(&temp_path)).is_err());
 
     // Create temporary agy-gyro.toml
     std::fs::write(
@@ -992,7 +975,6 @@ request_timeout_secs = 120
     assert_eq!(cli_env.config.host, "10.0.0.1");
     assert_eq!(cli_env.config.agy_path, "/custom/agy");
     assert_eq!(cli_env.config.api_key, "env-gemini-key-123");
-    assert!(cli_env.config.is_gateway_enabled());
     // Daemon-only settings remain as configured in TOML (not overridden by env)
     assert_eq!(cli_env.config.max_retries, 25);
     assert!(cli_env.config.no_buffer);
@@ -1000,15 +982,6 @@ request_timeout_secs = 120
     // TOML still applies for fields not set via Env
     assert_eq!(cli_env.config.port, 7070);
     assert_eq!(cli_env.config.initial_delay_ms, 500);
-
-    // 3b. Explicit `AGY_GYRO_OAUTH=1` or `oauth = true` locks to OAuth passthrough even with api_key set
-    unsafe {
-        std::env::set_var("AGY_GYRO_OAUTH", "1");
-    }
-    let cli_oauth_env = Cli::try_parse_with_config_from(["agy-gyro"], Some(&temp_path)).unwrap();
-    clear_test_env_vars();
-    assert!(cli_oauth_env.config.oauth);
-    assert!(!cli_oauth_env.config.is_gateway_enabled());
 
     // 4. Unknown TOML keys are ignored
     std::fs::write(
@@ -1673,7 +1646,10 @@ async fn test_server_and_stop_subcommands_spawn_and_stop_background_daemon() {
     std::fs::create_dir_all(&config_dir).unwrap();
     std::fs::write(
         config_dir.join("agy-gyro.toml"),
-        format!("host = \"127.0.0.1\"\nport = {}\n", free_port),
+        format!(
+            "host = \"127.0.0.1\"\nport = {}\napi_key = \"test-daemon-key\"\n",
+            free_port
+        ),
     )
     .unwrap();
 
@@ -1713,246 +1689,6 @@ async fn test_server_and_stop_subcommands_spawn_and_stop_background_daemon() {
     assert!(out_stop.status.success());
     let stdout_stop = String::from_utf8_lossy(&out_stop.stdout);
     assert!(stdout_stop.contains("Stopped agy-gyro daemon"));
-}
-
-#[tokio::test]
-async fn test_oauth_passthrough_tracks_tokens_and_cost_with_zero_retries_and_no_buffering() {
-    use agy_gyro::proxy::{RegisterSessionRequest, RegisterSessionResponse};
-    use agy_gyro::tui::fetch_usage_snapshot;
-
-    let mock_server = MockServer::start().await;
-
-    // 1. Non-generation metadata RPC (:loadCodeAssist) preserves Bearer token and is not counted in /usage
-    Mock::given(method("POST"))
-        .and(path("/v1internal:loadCodeAssist"))
-        .and(header("authorization", "Bearer test-oauth-token"))
-        .respond_with(
-            ResponseTemplate::new(200)
-                .insert_header("content-type", "application/json")
-                .set_body_json(serde_json::json!({
-                    "currentTier": { "id": "g1-pro-tier" },
-                    "paidTier": { "id": "g1-pro-tier", "usesGcpTos": false }
-                })),
-        )
-        .expect(1)
-        .mount(&mock_server)
-        .await;
-
-    // 2. Generation RPC (:streamGenerateContent) with nested CCPA response envelope and Claude model
-    Mock::given(method("POST"))
-        .and(path("/v1internal:streamGenerateContent"))
-        .and(query_param("alt", "sse"))
-        .and(header("authorization", "Bearer test-oauth-token"))
-        .respond_with(
-            ResponseTemplate::new(200)
-                .insert_header("content-type", "text/event-stream")
-                .set_body_string(
-                    "data: {\"response\": {\"candidates\": [{\"content\": {\"parts\": [{\"text\": \"Hello from Claude\"}]}}], \"usageMetadata\": {\"promptTokenCount\": 100000, \"cachedContentTokenCount\": 40000, \"candidatesTokenCount\": 2000, \"thoughtsTokenCount\": 3000, \"totalTokenCount\": 105000}, \"modelVersion\": \"claude-sonnet-4-5@20250929\"}}\n\n",
-                ),
-        )
-        .expect(1)
-        .mount(&mock_server)
-        .await;
-
-    // 3. Non-streaming generation RPC (:generateContent) returning 429 must NOT be retried even when max_retries = 5
-    Mock::given(method("POST"))
-        .and(path("/v1internal:generateContent"))
-        .and(header("authorization", "Bearer test-oauth-token"))
-        .respond_with(
-            ResponseTemplate::new(429)
-                .insert_header("retry-after", "0")
-                .set_body_string("RESOURCE_EXHAUSTED"),
-        )
-        .expect(1)
-        .mount(&mock_server)
-        .await;
-
-    // Start daemon with API key and max_retries = 5
-    let proxy_url = spawn_test_proxy(mock_server.uri(), 5).await;
-    let client = Client::new();
-
-    let reg: RegisterSessionResponse = client
-        .post(format!("{}/sessions", proxy_url))
-        .json(&RegisterSessionRequest {
-            pid: Some(std::process::id()),
-            label: "oauth-workspace".to_string(),
-        })
-        .send()
-        .await
-        .unwrap()
-        .json()
-        .await
-        .unwrap();
-    assert!(reg.gateway_enabled);
-
-    // Send :loadCodeAssist via /s/<session_id>
-    let load_res = client
-        .post(format!(
-            "{}/s/{}/v1internal:loadCodeAssist",
-            proxy_url, reg.session_id
-        ))
-        .header("Authorization", "Bearer test-oauth-token")
-        .body(r#"{"metadata":{"ideType":"ANTIGRAVITY"}}"#)
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(load_res.status(), 200);
-
-    // Verify :loadCodeAssist did not increment request counters and did not inject x-goog-api-key
-    let snap_after_load = fetch_usage_snapshot(&client, &format!("{}/usage", proxy_url))
-        .await
-        .unwrap();
-    assert_eq!(snap_after_load.total_requests, 0);
-
-    let received = mock_server.received_requests().await.unwrap();
-    let load_reqs: Vec<_> = received
-        .iter()
-        .filter(|r| r.url.path() == "/v1internal:loadCodeAssist")
-        .collect();
-    assert_eq!(load_reqs.len(), 1);
-    assert!(!load_reqs[0].headers.contains_key("x-goog-api-key"));
-
-    // Send :streamGenerateContent via /s/<session_id>
-    let stream_res = client
-        .post(format!(
-            "{}/s/{}/v1internal:streamGenerateContent?alt=sse",
-            proxy_url, reg.session_id
-        ))
-        .header("Authorization", "Bearer test-oauth-token")
-        .body(r#"{"model":"models/claude-sonnet-4-5-thinking","request":{"contents":[]}}"#)
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(stream_res.status(), 200);
-    let body_text = stream_res.text().await.unwrap();
-    assert!(body_text.contains("Hello from Claude"));
-    assert!(!body_text.contains(": keep-alive"));
-
-    let snap = fetch_usage_snapshot(&client, &format!("{}/usage", proxy_url))
-        .await
-        .unwrap();
-    assert_eq!(snap.total_requests, 1);
-    assert_eq!(snap.successful_requests, 1);
-    assert_eq!(snap.total_retries, 0);
-    assert_eq!(snap.totals.input_tokens, 100_000);
-    assert_eq!(snap.totals.uncached_input_tokens, 60_000);
-    assert_eq!(snap.totals.cached_input_tokens, 40_000);
-    assert_eq!(snap.totals.output_tokens, 5_000);
-
-    // claude-sonnet-4-5@20250929 pricing ($3/1M uncached in, $0.30/1M cached in, $15/1M out):
-    // 60k * $3/1M = $0.18 + 40k * $0.30/1M = $0.012 + 5k * $15/1M = $0.075 -> total = $0.267
-    let claude_stats = &snap.models["claude-sonnet-4-5@20250929"];
-    assert_eq!(claude_stats.totals.requests, 1);
-    assert!((claude_stats.totals.total_cost_usd - 0.267).abs() < 1e-9);
-    assert_eq!(snap.sessions.len(), 1);
-    assert_eq!(snap.sessions[0].id, reg.session_id);
-    assert_eq!(snap.sessions[0].totals.input_tokens, 100_000);
-
-    // Send 429 request: must NOT retry in OAuth passthrough mode even though daemon has max_retries = 5
-    let err_res = client
-        .post(format!(
-            "{}/s/{}/v1internal:generateContent",
-            proxy_url, reg.session_id
-        ))
-        .header("Authorization", "Bearer test-oauth-token")
-        .body(r#"{"model":"models/gemini-2.5-pro","request":{"contents":[]}}"#)
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(err_res.status(), 429);
-
-    let snap_after_429 = fetch_usage_snapshot(&client, &format!("{}/usage", proxy_url))
-        .await
-        .unwrap();
-    assert_eq!(snap_after_429.total_requests, 2);
-    assert_eq!(snap_after_429.failed_requests, 1);
-    assert_eq!(snap_after_429.total_retries, 0);
-}
-
-#[tokio::test]
-async fn test_run_wrapper_oauth_mode_sets_endpoint_env_vars() {
-    let mock_server = MockServer::start().await;
-    // Start a daemon that HAS an API key configured
-    let proxy_url = spawn_test_proxy(mock_server.uri(), 3).await;
-    let port = reqwest::Url::parse(&proxy_url)
-        .unwrap()
-        .port()
-        .expect("proxy port");
-
-    let temp_home = std::env::temp_dir().join(format!(
-        "agy-gyro-oauth-wrapper-home-{}",
-        std::process::id()
-    ));
-    let config_dir = temp_home.join(".gemini").join("config");
-    std::fs::create_dir_all(&config_dir).unwrap();
-
-    // Case 1: Client config has NO api_key -> locked to Functionality 2 (OAuth passthrough)
-    // even though the daemon has an API key
-    std::fs::write(
-        config_dir.join("agy-gyro.toml"),
-        format!("host = \"127.0.0.1\"\nport = {}\nagy_path = \"sh\"\n", port),
-    )
-    .unwrap();
-
-    let status1 = tokio::process::Command::new(env!("CARGO_BIN_EXE_agy-gyro"))
-        .env("HOME", &temp_home)
-        .env("USERPROFILE", &temp_home)
-        .env_remove("GEMINI_API_KEY")
-        .env_remove("AGY_GYRO_API_KEY")
-        .args([
-            "-c",
-            r#"
-                case "$CLOUD_CODE_URL" in "http://127.0.0.1:"*"/s/"*) ;; *) exit 1 ;; esac &&
-                test -z "$AGY_LLM_GATEWAY_URL" &&
-                test -z "$AGY_LLM_GATEWAY_WIRE_PROTOCOL" &&
-                test -z "$AGY_LLM_GATEWAY_API_KEY" &&
-                exit 43
-            "#,
-        ])
-        .status()
-        .await
-        .unwrap();
-    assert_eq!(status1.code(), Some(43));
-
-    // Case 2: Client config HAS api_key, but AGY_GYRO_OAUTH=1 is set -> locked to Functionality 2
-    std::fs::write(
-        config_dir.join("agy-gyro.toml"),
-        format!(
-            "host = \"127.0.0.1\"\nport = {}\napi_key = \"client-key\"\nagy_path = \"sh\"\n",
-            port
-        ),
-    )
-    .unwrap();
-
-    let status2 = tokio::process::Command::new(env!("CARGO_BIN_EXE_agy-gyro"))
-        .env("HOME", &temp_home)
-        .env("USERPROFILE", &temp_home)
-        .env("AGY_GYRO_OAUTH", "1")
-        .args([
-            "-c",
-            r#"
-                case "$CLOUD_CODE_URL" in "http://127.0.0.1:"*"/s/"*) ;; *) exit 1 ;; esac &&
-                test -z "$AGY_LLM_GATEWAY_URL" &&
-                exit 44
-            "#,
-        ])
-        .status()
-        .await
-        .unwrap();
-
-    let _ = std::fs::remove_dir_all(&temp_home);
-    assert_eq!(status2.code(), Some(44));
-}
-
-#[test]
-fn test_oauth_upstream_routing() {
-    use agy_gyro::proxy::{DEFAULT_OAUTH_UPSTREAM, resolve_oauth_upstream_base};
-
-    let config = Config::default(); // upstream = DEFAULT_GENAI_UPSTREAM, api_key = ""
-    let client = build_http_client(&config).unwrap();
-    let state = ProxyState::new(config, client);
-    assert!(state.gateway_models().is_empty());
-    assert_eq!(resolve_oauth_upstream_base(&state), DEFAULT_OAUTH_UPSTREAM);
 }
 
 #[tokio::test]
@@ -2309,110 +2045,4 @@ async fn test_new_session_refetches_model_catalog_and_pricing() {
         .await
         .unwrap();
     assert!((snap2.totals.total_cost_usd - 8.5).abs() < 1e-9);
-}
-
-#[tokio::test]
-async fn test_new_session_in_oauth_mode_refetches_pricing_only() {
-    use agy_gyro::proxy::{RegisterSessionRequest, RegisterSessionResponse};
-    use agy_gyro::tui::fetch_usage_snapshot;
-
-    let mock_server = MockServer::start().await;
-
-    // OAuth-only daemon (no api_key) must NOT query /v1beta/models, only pricing_url
-    Mock::given(method("GET"))
-        .and(path("/pricing.json"))
-        .respond_with(
-            ResponseTemplate::new(200)
-                .insert_header("content-type", "application/json")
-                .set_body_json(serde_json::json!({
-                    "anthropic": {
-                        "models": {
-                            "claude-sonnet-4-5": {
-                                "cost": { "input": 5.0, "output": 25.0, "cache_read": 0.5 }
-                            }
-                        }
-                    }
-                })),
-        )
-        .expect(1)
-        .mount(&mock_server)
-        .await;
-
-    Mock::given(method("POST"))
-        .and(path("/v1internal:generateContent"))
-        .respond_with(
-            ResponseTemplate::new(200)
-                .insert_header("content-type", "application/json")
-                .set_body_json(serde_json::json!({
-                    "response": {
-                        "candidates": [{ "content": { "parts": [{ "text": "OAuth OK" }] } }],
-                        "usageMetadata": {
-                            "promptTokenCount": 100_000,
-                            "cachedContentTokenCount": 0,
-                            "candidatesTokenCount": 20_000,
-                            "thoughtsTokenCount": 0,
-                            "totalTokenCount": 120_000
-                        },
-                        "modelVersion": "claude-sonnet-4-5"
-                    }
-                })),
-        )
-        .expect(1)
-        .mount(&mock_server)
-        .await;
-
-    let config = Config {
-        host: "127.0.0.1".to_string(),
-        port: 0,
-        upstream: mock_server.uri(),
-        api_key: String::new(),
-        ..Config::default()
-    };
-    let client = build_http_client(&config).unwrap();
-    let state = Arc::new(
-        ProxyState::new(config, client.clone())
-            .with_pricing_url(format!("{}/pricing.json", mock_server.uri())),
-    );
-    let app = create_router(state);
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let proxy_url = format!("http://{}", listener.local_addr().unwrap());
-    tokio::spawn(async move {
-        axum::serve(listener, app).await.unwrap();
-    });
-
-    let reg: RegisterSessionResponse = client
-        .post(format!("{}/sessions", proxy_url))
-        .json(&RegisterSessionRequest {
-            pid: None,
-            label: "oauth-session".to_string(),
-        })
-        .send()
-        .await
-        .unwrap()
-        .json()
-        .await
-        .unwrap();
-    assert!(!reg.gateway_enabled);
-
-    let res = client
-        .post(format!(
-            "{}/s/{}/v1internal:generateContent",
-            proxy_url, reg.session_id
-        ))
-        .header("Authorization", "Bearer test-oauth-token")
-        .body(r#"{"model":"models/claude-sonnet-4-5","request":{"contents":[]}}"#)
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(res.status(), 200);
-
-    // 100k input * $5/1M = $0.50 + 20k output * $25/1M = $0.50 -> $1.00
-    let snap = fetch_usage_snapshot(&client, &format!("{}/usage", proxy_url))
-        .await
-        .unwrap();
-    assert_eq!(snap.pricing_source, "models.dev (live)");
-    assert!((snap.totals.total_cost_usd - 1.0).abs() < 1e-9);
-
-    let received = mock_server.received_requests().await.unwrap();
-    assert!(received.iter().all(|r| r.url.path() != "/v1beta/models"));
 }

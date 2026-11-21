@@ -142,23 +142,15 @@ impl Default for PricingTable {
 
 impl PricingTable {
     /// Resolves pricing for a model ID from the upstream pricing table, normalizing prefixes
-    /// (`models/`), version suffixes (`@...`), effort suffixes (`-low`, `-medium`, `-high`, `-xhigh`),
-    /// and `-thinking` suffixes. Returns `None` when the model's pricing is unknown upstream.
+    /// (`models/`) and effort suffixes (`-low`, `-medium`, `-high`, `-xhigh`). Returns `None`
+    /// when the model's pricing is unknown upstream.
     pub fn lookup(&self, raw_model: &str) -> Option<ModelPricing> {
         let normalized = normalize_model_id(raw_model);
-        let mut cleaned = normalized.split('@').next().unwrap_or(&normalized);
-        if let Some(p) = self.models.get(cleaned) {
+        if let Some(p) = self.models.get(&normalized) {
             return Some(p.clone());
         }
 
-        if let Some(stripped) = strip_effort_suffix(cleaned) {
-            if let Some(p) = self.models.get(stripped) {
-                return Some(p.clone());
-            }
-            cleaned = stripped;
-        }
-
-        if let Some(stripped) = cleaned.strip_suffix("-thinking")
+        if let Some(stripped) = strip_effort_suffix(&normalized)
             && let Some(p) = self.models.get(stripped)
         {
             return Some(p.clone());
@@ -172,10 +164,6 @@ impl PricingTable {
 struct ModelsDevResponse {
     #[serde(default)]
     google: Option<ModelsDevProvider>,
-    #[serde(default)]
-    anthropic: Option<ModelsDevProvider>,
-    #[serde(default)]
-    openai: Option<ModelsDevProvider>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -207,18 +195,14 @@ struct ModelsDevTierCost {
     cache_read: Option<f64>,
 }
 
-/// Parses a `models.dev/api.json` JSON payload into a [`PricingTable`] for Google, Anthropic,
-/// and OpenAI models.
+/// Parses a `models.dev/api.json` JSON payload into a [`PricingTable`] for Google Gemini models.
 pub fn parse_models_dev_pricing(json_str: &str) -> Result<PricingTable, String> {
     let parsed: ModelsDevResponse =
         serde_json::from_str(json_str).map_err(|e| format!("Invalid pricing JSON: {}", e))?;
 
     let mut table = PricingTable::default();
 
-    for provider in [parsed.google, parsed.anthropic, parsed.openai]
-        .into_iter()
-        .flatten()
-    {
+    if let Some(provider) = parsed.google {
         for (model_id, entry) in provider.models {
             if let Some(cost) = entry.cost
                 && let (Some(input), Some(output)) = (cost.input, cost.output)
@@ -359,7 +343,6 @@ mod tests {
         assert_eq!(default_table.source, "none");
         assert!(default_table.lookup("gemini-2.5-pro").is_none());
         assert!(default_table.lookup("gemini-4-argon").is_none());
-        assert!(default_table.lookup("claude-sonnet-4-5").is_none());
 
         let sample_json = r#"{
             "google": {
@@ -374,28 +357,6 @@ mod tests {
                                 "output": 12.0,
                                 "cache_read": 0.30
                             }
-                        }
-                    }
-                }
-            },
-            "anthropic": {
-                "models": {
-                    "claude-sonnet-4-5": {
-                        "cost": {
-                            "input": 3.0,
-                            "output": 15.0,
-                            "cache_read": 0.3
-                        }
-                    }
-                }
-            },
-            "openai": {
-                "models": {
-                    "gpt-5": {
-                        "cost": {
-                            "input": 1.25,
-                            "output": 10.0,
-                            "cache_read": 0.125
                         }
                     }
                 }
@@ -415,21 +376,8 @@ mod tests {
         let custom_xhigh = table.lookup("gemini-custom-test-xhigh").unwrap();
         assert_eq!(custom_xhigh.input_per_1m, 1.5);
 
-        let claude_thinking = table.lookup("models/claude-sonnet-4-5-thinking").unwrap();
-        assert_eq!(claude_thinking.input_per_1m, 3.0);
-        assert_eq!(claude_thinking.output_per_1m, 15.0);
-
-        let claude_versioned = table.lookup("claude-sonnet-4-5@20250929").unwrap();
-        assert_eq!(claude_versioned.input_per_1m, 3.0);
-        assert_eq!(claude_versioned.output_per_1m, 15.0);
-
-        let gpt = table.lookup("gpt-5").unwrap();
-        assert_eq!(gpt.input_per_1m, 1.25);
-        assert_eq!(gpt.output_per_1m, 10.0);
-
         // Unknown models must return None (zero cost) without falling back to other models
         assert!(table.lookup("gemini-4-argon").is_none());
-        assert!(table.lookup("claude-sonnet-99").is_none());
         assert!(table.lookup("unknown-model").is_none());
     }
 }

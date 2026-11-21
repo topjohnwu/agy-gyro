@@ -205,37 +205,6 @@ pub fn extract_model_from_path(path_and_query: &str) -> Option<String> {
     }
 }
 
-/// Extracts the model name from a generation request path or JSON request body.
-///
-/// - For Gemini API paths (`/v1beta/models/{model}:...`), extracts `{model}` from the URL path.
-/// - For OAuth generation RPCs (`*:streamGenerateContent` or `*:generateContent`), inspects the
-///   request JSON body for `"model"`, falling back to `"unknown"` (which is later refined by
-///   `"modelVersion"` in the response stream).
-/// - Returns `None` for non-generation metadata RPCs (`:loadCodeAssist`, `:fetchAvailableModels`, etc.).
-pub fn extract_model_from_request(path_and_query: &str, body: &[u8]) -> Option<String> {
-    if let Some(model) = extract_model_from_path(path_and_query) {
-        return Some(model);
-    }
-
-    let path = path_and_query.split('?').next().unwrap_or(path_and_query);
-    if !path.ends_with(":streamGenerateContent") && !path.ends_with(":generateContent") {
-        return None;
-    }
-
-    if !body.is_empty()
-        && let Ok(root) = serde_json::from_slice::<serde_json::Value>(body)
-        && let Some(model) = root
-            .get("model")
-            .and_then(|v| v.as_str())
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-    {
-        return Some(normalize_model_id(model));
-    }
-
-    Some("unknown".to_string())
-}
-
 /// Strips a trailing `-<effort>` suffix from the model segment of a Gemini API request path
 /// (e.g. `/v1beta/models/gemini-4-argon-medium:streamGenerateContent?alt=sse` ->
 /// `("/v1beta/models/gemini-4-argon:streamGenerateContent?alt=sse", Some("medium"))`).
@@ -581,37 +550,6 @@ mod tests {
             Some("gemini-4-neon".to_string())
         );
         assert_eq!(extract_model_from_path("/v1beta/models"), None);
-    }
-
-    #[test]
-    fn test_extract_model_from_request_oauth_and_gemini() {
-        // Gemini URL path takes precedence
-        assert_eq!(
-            extract_model_from_request(
-                "/v1beta/models/gemini-4-argon:streamGenerateContent?alt=sse",
-                b"{}"
-            ),
-            Some("gemini-4-argon".to_string())
-        );
-
-        // CCPA request body with top-level "model"
-        assert_eq!(
-            extract_model_from_request(
-                "/v1internal:streamGenerateContent?alt=sse",
-                br#"{"model":"models/claude-sonnet-4-5-thinking","request":{}}"#
-            ),
-            Some("claude-sonnet-4-5-thinking".to_string())
-        );
-
-        // Non-generation metadata RPCs return None
-        assert_eq!(
-            extract_model_from_request("/v1internal:loadCodeAssist", b"{}"),
-            None
-        );
-        assert_eq!(
-            extract_model_from_request("/v1internal:fetchAvailableModels", b"{}"),
-            None
-        );
     }
 
     #[test]

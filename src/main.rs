@@ -89,21 +89,15 @@ async fn run_server(config: Config) -> Result<(), Box<dyn std::error::Error>> {
     let client = agy_gyro::proxy::build_http_client(&config)?;
     let state = Arc::new(ProxyState::new(config.clone(), client));
 
-    if config.has_api_key() {
-        info!("Starting agy-gyro local Antigravity Enterprise Gateway server");
-        info!("Upstream URL: {}", config.upstream);
-        info!(
-            "Retry configuration: max_retries={}, initial_delay_ms={}ms, max_delay_ms={}ms, jitter={}",
-            config.max_retries,
-            config.initial_delay_ms,
-            config.max_delay_ms,
-            config.is_jitter_enabled()
-        );
-    } else {
-        info!(
-            "Starting agy-gyro server in OAuth passthrough mode (token and price tracking only; retries and buffering disabled)"
-        );
-    }
+    info!("Starting agy-gyro local Antigravity Enterprise Gateway server");
+    info!("Upstream URL: {}", config.upstream);
+    info!(
+        "Retry configuration: max_retries={}, initial_delay_ms={}ms, max_delay_ms={}ms, jitter={}",
+        config.max_retries,
+        config.initial_delay_ms,
+        config.max_delay_ms,
+        config.is_jitter_enabled()
+    );
     state.spawn_refresh_catalog_and_pricing();
 
     let shutdown_rx = state.subscribe_shutdown();

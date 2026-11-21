@@ -8,7 +8,6 @@ pub use crate::pricing::{
 pub use crate::session::{
     SessionMeta, extract_session_from_headers, format_session_api_key, generate_session_uuid,
     is_pid_alive, parse_session_api_key, sanitize_session_label, short_session_id,
-    strip_session_prefix,
 };
 
 use axum::body::Bytes;
@@ -105,7 +104,6 @@ impl RawUsageMetadata {
 struct GeminiResponseEnvelope {
     usage_metadata: Option<RawUsageMetadata>,
     model_version: Option<String>,
-    response: Option<Box<GeminiResponseEnvelope>>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -158,9 +156,6 @@ impl StreamUsageExtractor {
         if let Some(u) = env.usage_metadata {
             self.usage.merge_cumulative(&u);
             self.found_usage = true;
-        }
-        if let Some(inner) = env.response {
-            self.apply_envelope(*inner);
         }
     }
 
@@ -749,26 +744,6 @@ impl UsageTracker {
         )
     }
 
-    /// Looks up the [`SessionMeta`] for a registered `session_id` (e.g. from a `/s/<session_id>`
-    /// path prefix), falling back to a default metadata record with that ID if not yet present.
-    pub fn resolve_session_by_id(&self, session_id: &str) -> SessionMeta {
-        let trimmed = session_id.trim();
-        if let Ok(inner) = self.inner.read()
-            && let Some(entry) = inner.sessions.get(trimmed)
-        {
-            return SessionMeta {
-                id: entry.stats.id.clone(),
-                label: entry.stats.label.clone(),
-                pid: entry.stats.pid,
-            };
-        }
-        SessionMeta {
-            id: trimmed.to_string(),
-            label: "agy".to_string(),
-            pid: None,
-        }
-    }
-
     /// Unconditionally marks a session as inactive and removes its stats and logs.
     /// Used to clean up a pre-registered session if launching `agy` fails.
     pub fn remove_session(&self, session_id: &str) {
@@ -1286,34 +1261,6 @@ mod tests {
         assert_eq!(ext.model_version.as_deref(), Some("gemini-2.5-pro"));
         assert_eq!(ml_usage.input_tokens(), 2500);
         assert_eq!(ml_usage.output_tokens(), 500);
-
-        // Nested CCPA SSE response envelope: {"response": {"usageMetadata": ..., "modelVersion": ...}}
-        let ccpa_chunks = vec![
-            Bytes::from_static(
-                b"data: {\"response\": {\"candidates\": [{\"content\": {\"parts\": [{\"text\": \"Hi\"}]}}], \"usageMetadata\": {\"promptTokenCount\": 1500, \"cachedContentTokenCount\": 500, \"candidatesTokenCount\": 200, \"thoughtsTokenCount\": 100, \"totalTokenCount\": 1800}, \"modelVersion\": \"claude-sonnet-4-5@20250929\"}}\n\n",
-            ),
-        ];
-        let (ccpa_usage, ccpa_model) = extract_usage_from_chunks(&ccpa_chunks);
-        let ccpa_usage = ccpa_usage.expect("nested CCPA usageMetadata should be extracted");
-        assert_eq!(ccpa_model.as_deref(), Some("claude-sonnet-4-5@20250929"));
-        assert_eq!(ccpa_usage.input_tokens(), 1500);
-        assert_eq!(ccpa_usage.cached_input_tokens(), 500);
-        assert_eq!(ccpa_usage.uncached_input_tokens(), 1000);
-        assert_eq!(ccpa_usage.output_tokens(), 300);
-
-        // Session path prefix stripping
-        assert_eq!(
-            strip_session_prefix("/s/abc-123/v1internal:streamGenerateContent?alt=sse"),
-            (Some("abc-123"), "/v1internal:streamGenerateContent?alt=sse")
-        );
-        assert_eq!(
-            strip_session_prefix("/s/abc-123//v1internal:streamGenerateContent?alt=sse"),
-            (Some("abc-123"), "/v1internal:streamGenerateContent?alt=sse")
-        );
-        assert_eq!(
-            strip_session_prefix("/v1beta/models/gemini-4-argon:generateContent"),
-            (None, "/v1beta/models/gemini-4-argon:generateContent")
-        );
     }
 
     #[test]

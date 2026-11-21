@@ -121,7 +121,6 @@ Settings are resolved in order of precedence: **Environment variables > `~/.gemi
 | `host`                       | `AGY_GYRO_HOST`      | `127.0.0.1` | Host address to bind or connect to the gateway server    |
 | `port`                       | `AGY_GYRO_PORT`      | `6470`      | Port to listen on or connect to (`0` = OS-assigned port) |
 | `api_key`                    | `AGY_GYRO_API_KEY`   | _None_      | Gemini API key for authenticating upstream requests      |
-| `oauth`                      | `AGY_GYRO_OAUTH`     | `false`     | Explicitly lock to OAuth passthrough mode                |
 | `agy_path`                   | `AGY_GYRO_AGY_PATH`  | `agy`       | Executable path for Antigravity CLI                      |
 | `log_file`                   | _TOML only_          | _None_      | Path to log file for daemon proxy tracing logs           |
 | `max_retries`                | _TOML only_          | `15`        | Maximum number of retry attempts for retriable errors    |

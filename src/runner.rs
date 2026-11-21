@@ -265,26 +265,15 @@ pub fn run_wrapper(
         rt.block_on(ensure_daemon_and_register(&config, pid, &label))?
     };
 
-    let use_gateway = config.is_gateway_enabled() && reg.gateway_enabled;
-
     let mut cmd = std::process::Command::new(&config.agy_path);
     cmd.args(&agy_args)
+        .env("AGY_LLM_GATEWAY_URL", &daemon_url)
+        .env("AGY_LLM_GATEWAY_WIRE_PROTOCOL", "genai")
+        .env("AGY_LLM_GATEWAY_API_KEY", &reg.api_key)
         .env("AGY_ENABLE_HUB", "1")
         .stdin(Stdio::inherit())
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit());
-
-    if use_gateway {
-        cmd.env("AGY_LLM_GATEWAY_URL", &daemon_url)
-            .env("AGY_LLM_GATEWAY_WIRE_PROTOCOL", "genai")
-            .env("AGY_LLM_GATEWAY_API_KEY", &reg.api_key);
-    } else {
-        let session_base_url = format!("{}/s/{}", daemon_url.trim_end_matches('/'), reg.session_id);
-        cmd.env("CLOUD_CODE_URL", &session_base_url)
-            .env_remove("AGY_LLM_GATEWAY_URL")
-            .env_remove("AGY_LLM_GATEWAY_WIRE_PROTOCOL")
-            .env_remove("AGY_LLM_GATEWAY_API_KEY");
-    }
 
     #[cfg(unix)]
     {
