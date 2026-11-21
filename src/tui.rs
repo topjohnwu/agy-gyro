@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: MIT
 
 use crate::config::Config;
+use crate::proxy::SetBufferRequest;
 use crate::usage::{
     LogEntry, ModelUsageStats, ScopeUsageStats, SessionUsageStats, UsageSnapshot, short_session_id,
 };
@@ -126,6 +127,29 @@ pub async fn reset_remote_session_usage(
         .map_err(|e| format!("Invalid JSON response: {}", e))
 }
 
+/// Toggles (`None`) or sets (`Some(enabled)`) full SSE buffering on the running daemon via `POST /buffer`.
+pub async fn toggle_remote_buffer(
+    client: &reqwest::Client,
+    buffer_url: &str,
+    enabled: Option<bool>,
+) -> Result<UsageSnapshot, String> {
+    let res = client
+        .post(buffer_url)
+        .json(&SetBufferRequest { enabled })
+        .timeout(Duration::from_secs(2))
+        .send()
+        .await
+        .map_err(|e| format!("Buffer toggle failed: {}", e))?;
+
+    if !res.status().is_success() {
+        return Err(format!("Buffer toggle returned HTTP {}", res.status()));
+    }
+
+    res.json::<UsageSnapshot>()
+        .await
+        .map_err(|e| format!("Invalid JSON response: {}", e))
+}
+
 #[derive(Clone)]
 struct WrappedLogsCache {
     selected_session: Option<String>,
@@ -139,6 +163,7 @@ struct WrappedLogsCache {
 /// State held by the TUI monitor dashboard.
 pub struct DashboardState {
     pub endpoint_url: String,
+    pub buffer_url: String,
     pub snapshot: Option<UsageSnapshot>,
     pub logs: Vec<LogEntry>,
     pub selected_session: Option<String>,
@@ -155,8 +180,10 @@ pub struct DashboardState {
 impl DashboardState {
     pub fn new(config: &Config) -> Self {
         let endpoint_url = config.usage_url();
+        let buffer_url = config.buffer_url();
         Self {
             endpoint_url,
+            buffer_url,
             snapshot: None,
             logs: Vec::new(),
             selected_session: None,
@@ -451,7 +478,7 @@ fn render_header(frame: &mut Frame, area: Rect, state: &DashboardState) {
 
     let active_in_flight = state.active_stats().map_or(0, |s| s.active_requests);
 
-    let (status_span, uptime_str, pricing_src, active_span) =
+    let (status_span, uptime_str, pricing_src, buffer_span, active_span) =
         match (&state.snapshot, state.connected) {
             (Some(snap), true) => {
                 let active = if active_in_flight > 0 {
@@ -465,6 +492,16 @@ fn render_header(frame: &mut Frame, area: Rect, state: &DashboardState) {
                 } else {
                     Span::styled(" idle ", Style::default().fg(Color::DarkGray))
                 };
+                let buffer = if snap.buffer_enabled {
+                    Span::styled(
+                        "ON",
+                        Style::default()
+                            .fg(Color::Yellow)
+                            .add_modifier(Modifier::BOLD),
+                    )
+                } else {
+                    Span::styled("OFF", Style::default().fg(Color::DarkGray))
+                };
                 (
                     Span::styled(
                         " ● CONNECTED ",
@@ -474,6 +511,7 @@ fn render_header(frame: &mut Frame, area: Rect, state: &DashboardState) {
                     ),
                     format_duration_secs(snap.uptime_secs),
                     snap.pricing_source.as_str(),
+                    buffer,
                     active,
                 )
             }
@@ -486,6 +524,7 @@ fn render_header(frame: &mut Frame, area: Rect, state: &DashboardState) {
                 ),
                 "--:--:--".to_string(),
                 "n/a",
+                Span::styled("n/a", Style::default().fg(Color::DarkGray)),
                 Span::styled(" waiting ", Style::default().fg(Color::DarkGray)),
             ),
         };
@@ -504,6 +543,8 @@ fn render_header(frame: &mut Frame, area: Rect, state: &DashboardState) {
         Span::styled(&state.endpoint_url, Style::default().fg(Color::White)),
         Span::styled(" │ Pricing: ", Style::default().fg(Color::DarkGray)),
         Span::styled(pricing_src, Style::default().fg(Color::Magenta)),
+        Span::styled(" │ Buffer: ", Style::default().fg(Color::DarkGray)),
+        buffer_span,
         Span::styled(" │ Uptime: ", Style::default().fg(Color::DarkGray)),
         Span::styled(uptime_str, Style::default().fg(Color::White)),
         Span::styled(" │ ", Style::default().fg(Color::DarkGray)),
@@ -1042,6 +1083,10 @@ fn render_footer(frame: &mut Frame, area: Rect, state: &DashboardState) {
     } else {
         " Reset All  "
     };
+    let buffer_enabled = state
+        .snapshot
+        .as_ref()
+        .is_some_and(|snap| snap.buffer_enabled);
     let mut spans = vec![
         Span::styled(
             " q / Esc ",
@@ -1067,6 +1112,18 @@ fn render_footer(frame: &mut Frame, area: Rect, state: &DashboardState) {
                 .add_modifier(Modifier::BOLD),
         ),
         Span::raw(reset_label),
+        Span::styled(
+            " b ",
+            Style::default()
+                .fg(Color::Black)
+                .bg(if buffer_enabled {
+                    Color::Yellow
+                } else {
+                    Color::White
+                })
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::raw(" Toggle Buffer  "),
         Span::styled(
             " ↑/↓ / PgUp/PgDn ",
             Style::default()
@@ -1342,6 +1399,31 @@ async fn run_monitor_loop(
                         }
                     }
                 }
+                KeyCode::Char('b') => {
+                    match toggle_remote_buffer(cmd_client, &state.buffer_url, None).await {
+                        Ok(snap) => {
+                            if let Some(ref sid) = state.selected_session
+                                && !snap.sessions.iter().any(|s| &s.id == sid)
+                            {
+                                state.selected_session = None;
+                            }
+                            let enabled = snap.buffer_enabled;
+                            state.snapshot = Some(snap);
+                            state.connected = true;
+                            state.last_error = None;
+                            state.status_message = Some((
+                                format!(
+                                    "Full SSE buffering {}.",
+                                    if enabled { "enabled" } else { "disabled" }
+                                ),
+                                Instant::now(),
+                            ));
+                        }
+                        Err(err) => {
+                            state.last_error = Some(err);
+                        }
+                    }
+                }
                 _ => {}
             }
         }
@@ -1412,6 +1494,7 @@ mod tests {
             uptime_secs: 95,
             stats: scope_stats.clone(),
             pricing_source: "models.dev (live)".to_string(),
+            buffer_enabled: false,
             sessions: vec![SessionUsageStats {
                 id: "1".to_string(),
                 label: "agy-gyro".to_string(),
@@ -1435,16 +1518,23 @@ mod tests {
             .draw(|frame| render_dashboard(frame, &state))
             .unwrap();
 
-        let buffer = terminal.backend().buffer();
-        let mut rendered = String::new();
-        for y in 0..buffer.area.height {
-            for x in 0..buffer.area.width {
-                rendered.push_str(buffer[(x, y)].symbol());
+        let render_to_string = |term: &Terminal<TestBackend>| {
+            let buffer = term.backend().buffer();
+            let mut rendered = String::new();
+            for y in 0..buffer.area.height {
+                for x in 0..buffer.area.width {
+                    rendered.push_str(buffer[(x, y)].symbol());
+                }
+                rendered.push('\n');
             }
-            rendered.push('\n');
-        }
+            rendered
+        };
+
+        let rendered = render_to_string(&terminal);
 
         assert!(rendered.contains("CONNECTED"));
+        assert!(rendered.contains("Buffer: OFF"));
+        assert!(rendered.contains("Toggle Buffer"));
         assert!(rendered.contains("All Sessions (1)"));
         assert!(rendered.contains("#1 agy-gyro (48210)"));
         assert!(rendered.contains("gemini-4-argon"));
@@ -1454,6 +1544,14 @@ mod tests {
         assert!(!rendered.contains("Recent Requests Activity"));
         assert!(rendered.contains("Live Gateway Logs"));
         assert!(rendered.contains("Request #5 [gemini-4-argon] status=200"));
+
+        // Verify Buffer: ON indicator when full buffering is enabled
+        state.snapshot.as_mut().unwrap().buffer_enabled = true;
+        terminal
+            .draw(|frame| render_dashboard(frame, &state))
+            .unwrap();
+        let rendered_buffered = render_to_string(&terminal);
+        assert!(rendered_buffered.contains("Buffer: ON"));
 
         // Verify session tab navigation
         state.select_next_session();

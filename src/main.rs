@@ -92,11 +92,12 @@ async fn run_server(config: Config) -> Result<(), Box<dyn std::error::Error>> {
     info!("Starting agy-gyro local Antigravity Enterprise Gateway server");
     info!("Upstream URL: {}", config.upstream);
     info!(
-        "Retry configuration: max_retries={}, initial_delay_ms={}ms, max_delay_ms={}ms, jitter={}",
+        "Retry configuration: max_retries={}, initial_delay_ms={}ms, max_delay_ms={}ms, jitter={}, buffer={}",
         config.max_retries,
         config.initial_delay_ms,
         config.max_delay_ms,
-        config.is_jitter_enabled()
+        config.is_jitter_enabled(),
+        config.is_buffer_enabled()
     );
     state.spawn_refresh_catalog_and_pricing();
 

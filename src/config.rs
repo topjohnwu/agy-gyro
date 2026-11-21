@@ -76,8 +76,7 @@ pub struct FileConfig {
     pub max_delay_ms: Option<u64>,
     #[serde(alias = "no-jitter")]
     pub no_jitter: Option<bool>,
-    #[serde(alias = "no-buffer")]
-    pub no_buffer: Option<bool>,
+    pub buffer: Option<bool>,
     #[serde(alias = "request-timeout-secs")]
     pub request_timeout_secs: Option<u64>,
 }
@@ -135,8 +134,8 @@ pub struct Config {
     pub max_delay_ms: u64,
     /// Disable jitter in exponential backoff calculation
     pub no_jitter: bool,
-    /// Disable full stream chunk buffering (stream chunks immediately to client after first chunk)
-    pub no_buffer: bool,
+    /// Enable full stream chunk buffering (buffer entire response before streaming to client)
+    pub buffer: bool,
     /// Client request timeout in seconds (for long thinking / generation requests)
     pub request_timeout_secs: u64,
 }
@@ -154,7 +153,7 @@ impl Default for Config {
             initial_delay_ms: 1000,
             max_delay_ms: 60000,
             no_jitter: false,
-            no_buffer: false,
+            buffer: false,
             request_timeout_secs: 600,
         }
     }
@@ -166,7 +165,7 @@ impl Config {
     }
 
     pub fn is_buffer_enabled(&self) -> bool {
-        !self.no_buffer
+        self.buffer
     }
 
     /// Returns the base HTTP URL (`http://<connect_host>:<port>`) for connecting to the local daemon.
@@ -182,6 +181,11 @@ impl Config {
     /// Returns the `/logs` SSE endpoint URL for connecting to the local daemon.
     pub fn logs_url(&self) -> String {
         format!("{}/logs", self.base_url())
+    }
+
+    /// Returns the `/buffer` control endpoint URL for toggling full SSE buffering at runtime.
+    pub fn buffer_url(&self) -> String {
+        format!("{}/buffer", self.base_url())
     }
 
     /// Serializes this [`Config`] into environment variables on a child [`std::process::Command`].
@@ -213,7 +217,7 @@ impl Cli {
     /// 3. Built-in default values
     ///
     /// Note: Daemon-only settings (`max_retries`, `initial_delay_ms`, `max_delay_ms`,
-    /// `no_jitter`, `no_buffer`, `request_timeout_secs`, `log_file`) cannot be configured
+    /// `no_jitter`, `buffer`, `request_timeout_secs`, `log_file`) cannot be configured
     /// via environment variables and must be configured via the TOML configuration file.
     pub fn try_parse_with_config_from<I, T>(
         itr: I,
@@ -244,7 +248,7 @@ impl Cli {
         let initial_delay_ms = file_config.initial_delay_ms.unwrap_or(1000);
         let max_delay_ms = file_config.max_delay_ms.unwrap_or(60000);
         let no_jitter = file_config.no_jitter.unwrap_or(false);
-        let no_buffer = file_config.no_buffer.unwrap_or(false);
+        let buffer = file_config.buffer.unwrap_or(false);
         let request_timeout_secs = file_config.request_timeout_secs.unwrap_or(600);
         let api_key = env_non_empty(ENV_API_KEY)
             .or_else(|| env_non_empty(ENV_GEMINI_API_KEY))
@@ -263,7 +267,7 @@ impl Cli {
             initial_delay_ms,
             max_delay_ms,
             no_jitter,
-            no_buffer,
+            buffer,
             request_timeout_secs,
             api_key,
             agy_path,

@@ -14,7 +14,7 @@ use axum::body::Bytes;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, VecDeque};
 use std::ops::{Deref, DerefMut};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock, RwLock, Weak};
 use std::time::{Duration, Instant};
 use tracing::info;
@@ -454,6 +454,8 @@ pub struct UsageSnapshot {
     pub stats: ScopeUsageStats,
     pub pricing_source: String,
     #[serde(default)]
+    pub buffer_enabled: bool,
+    #[serde(default)]
     pub sessions: Vec<SessionUsageStats>,
 }
 
@@ -491,6 +493,7 @@ pub struct UsageTracker {
     next_request_id: AtomicU64,
     next_session_seq: AtomicU64,
     next_log_id: AtomicU64,
+    buffer_enabled: AtomicBool,
     pricing: RwLock<PricingTable>,
     inner: RwLock<UsageInner>,
     usage_change_tx: tokio::sync::watch::Sender<u64>,
@@ -512,11 +515,45 @@ impl UsageTracker {
             next_request_id: AtomicU64::new(1),
             next_session_seq: AtomicU64::new(1),
             next_log_id: AtomicU64::new(1),
+            buffer_enabled: AtomicBool::new(false),
             pricing: RwLock::new(pricing),
             inner: RwLock::new(UsageInner::default()),
             usage_change_tx,
             log_change_tx,
         }
+    }
+
+    /// Returns whether full SSE response buffering is currently enabled.
+    pub fn is_buffer_enabled(&self) -> bool {
+        self.buffer_enabled.load(Ordering::Relaxed)
+    }
+
+    /// Initializes the full SSE buffering flag without emitting a log entry or SSE notification.
+    pub fn init_buffer_enabled(&self, enabled: bool) {
+        self.buffer_enabled.store(enabled, Ordering::Relaxed);
+    }
+
+    /// Sets full SSE response buffering at runtime, logging the change and notifying `/usage` subscribers.
+    pub fn set_buffer_enabled(&self, enabled: bool) -> bool {
+        self.buffer_enabled.store(enabled, Ordering::Relaxed);
+        info!(
+            "Full SSE buffering {}",
+            if enabled { "enabled" } else { "disabled" }
+        );
+        self.notify_usage_change();
+        enabled
+    }
+
+    /// Toggles full SSE response buffering at runtime and returns the new state.
+    pub fn toggle_buffer_enabled(&self) -> bool {
+        let prev = self.buffer_enabled.fetch_xor(true, Ordering::AcqRel);
+        let next = !prev;
+        info!(
+            "Full SSE buffering {}",
+            if next { "enabled" } else { "disabled" }
+        );
+        self.notify_usage_change();
+        next
     }
 
     fn notify_usage_change(&self) {
@@ -1048,6 +1085,7 @@ impl UsageTracker {
             uptime_secs: self.started_at.elapsed().as_secs(),
             stats,
             pricing_source,
+            buffer_enabled: self.is_buffer_enabled(),
             sessions,
         }
     }

@@ -42,7 +42,7 @@ flowchart LR
     GEMINI["Google Gemini API\n(generativelanguage.googleapis.com)"]
 
     AGY -- "1. Prompt / stream request\ngenai Gateway Wire Protocol" --> GYRO
-    GYRO -- "2. Buffers & forwards request\nGemini REST API" --> GEMINI
+    GYRO -- "2. Forwards request\nGemini REST API" --> GEMINI
     GEMINI -. "3. 429 / 503 / 500 / 504\nBackoff + retry" .-> GYRO
     GEMINI -- "4. 200 OK" --> GYRO
     GYRO -- "5. Streams response\n(200 OK)" --> AGY
@@ -78,7 +78,7 @@ agy-gyro --dangerously-skip-permissions
 
 ### Live Usage & Cost TUI Dashboard (`agy-gyro monitor`)
 
-`agy-gyro monitor` provides an interactive TUI frontend for real-time token usage, request statistics, estimated USD costs, and gateway logs (use `Tab` or `←`/`→` to switch between `[All Sessions]` and individual `agy` sessions):
+`agy-gyro monitor` provides an interactive TUI frontend for real-time token usage, request statistics, estimated USD costs, and gateway logs (use `Tab` or `←`/`→` to switch between `[All Sessions]` and individual `agy` sessions, `r` to reset stats, and `b` to toggle full SSE buffering at runtime):
 
 ```bash
 agy-gyro monitor
@@ -127,7 +127,7 @@ Settings are resolved in order of precedence: **Environment variables > `~/.gemi
 | `initial_delay_ms`           | _TOML only_          | `1000`      | Initial retry backoff delay in milliseconds              |
 | `max_delay_ms`               | _TOML only_          | `60000`     | Maximum backoff delay cap in milliseconds                |
 | `no_jitter`                  | _TOML only_          | `false`     | Disable randomized jitter in backoff calculation         |
-| `no_buffer`                  | _TOML only_          | `false`     | Disable full stream buffering (stream chunks immediately)|
+| `buffer`                     | _TOML only_          | `false`     | Enable full stream chunk buffering (toggleable in `monitor`) |
 | `request_timeout_secs`       | _TOML only_          | `600`       | Timeout per attempt in seconds                           |
 
 ### Configuration File (`~/.gemini/config/agy-gyro.toml`)
@@ -142,19 +142,20 @@ log_file = "/tmp/gyro.log"
 
 ## Streaming & Error Recovery Behavior
 
-### Default Mode: Full Stream Buffering
+### Default Mode: Streaming Passthrough (`buffer = false`)
 
-In default mode, `agy-gyro` buffers all incoming stream chunks before delivering them to `agy`:
+In default mode, `agy-gyro` verifies Chunk 1 and immediately streams subsequent tokens to minimize time-to-first-token latency:
+- **Chunk 1 Error**: Retried seamlessly before sending headers to `agy`.
+- **Automatic Keep-Alive Heartbeats**: If waiting on Chunk 1 or retry backoff exceeds 15 seconds, `agy-gyro` commits `200 OK` headers and streams periodic keep-alive heartbeats (`: keep-alive\n\n` for SSE) to satisfy `agy`'s 60-second `ResponseHeaderTimeout`.
+- **Mid-Stream Error (Chunk $N > 1$)**: Forwarded downstream to prevent duplicated tokens.
+
+### Full Stream Buffering Mode (`buffer = true`)
+
+When `buffer = true` in `~/.gemini/config/agy-gyro.toml` (or toggled live by pressing `b` in `agy-gyro monitor`), `agy-gyro` buffers all incoming stream chunks before delivering them to `agy`:
 1. **Full Verification**: Ensures every chunk in the response is error-free and that the upstream stream completes cleanly.
 2. **Zero-Byte Leakage**: If an error (e.g. `503 UNAVAILABLE`, `429 RESOURCE_EXHAUSTED`, or network disconnect) occurs at chunk 1 or mid-stream, `agy-gyro` discards the buffered chunks and replays the request from scratch.
-3. **Automatic Keep-Alive Heartbeats**: If buffering or retry backoff exceeds 15 seconds, `agy-gyro` commits `200 OK` headers and streams periodic keep-alive heartbeats (`: keep-alive\n\n` for SSE) to satisfy `agy`'s 60-second `ResponseHeaderTimeout` while continuing to buffer and retry in the background.
+3. **Automatic Keep-Alive Heartbeats**: If buffering or retry backoff exceeds 15 seconds, `agy-gyro` commits `200 OK` headers and streams periodic keep-alive heartbeats (`: keep-alive\n\n` for SSE) while continuing to buffer and retry in the background.
 4. **Flawless Delivery**: `agy` only receives verified, complete streams without partial output or syntax errors.
-
-### Passthrough Mode (`no_buffer = true`)
-
-When `no_buffer = true` in `~/.gemini/config/agy-gyro.toml`, `agy-gyro` verifies Chunk 1 and immediately streams subsequent tokens to minimize time-to-first-token latency:
-- **Chunk 1 Error**: Retried seamlessly before sending headers to `agy`.
-- **Mid-Stream Error (Chunk $N > 1$)**: Forwarded downstream to prevent duplicated tokens.
 
 ## License
 

@@ -80,6 +80,7 @@ impl ProxyState {
 
         let upstream_base = config.upstream.trim_end_matches('/').to_string();
         let usage = Arc::new(UsageTracker::default());
+        usage.init_buffer_enabled(config.is_buffer_enabled());
         usage.register_global_logger();
         usage.spawn_process_monitor();
         let (shutdown_tx, _) = tokio::sync::watch::channel(false);
@@ -109,6 +110,10 @@ impl ProxyState {
     pub fn with_pricing_url(mut self, pricing_url: impl Into<String>) -> Self {
         self.pricing_url = pricing_url.into();
         self
+    }
+
+    pub fn is_buffer_enabled(&self) -> bool {
+        self.usage.is_buffer_enabled()
     }
 
     pub fn set_gateway_models(&self, models: Vec<GatewayModelEntry>) {
@@ -269,6 +274,36 @@ async fn reset_usage_handler(
     Json(state.usage.snapshot())
 }
 
+/// Optional request payload for `POST /buffer` to explicitly enable/disable or toggle buffering.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct SetBufferRequest {
+    pub enabled: Option<bool>,
+}
+
+async fn toggle_buffer_handler(
+    State(state): State<Arc<ProxyState>>,
+    body: Bytes,
+) -> Result<Json<UsageSnapshot>, (StatusCode, String)> {
+    let desired = if body.is_empty() {
+        None
+    } else {
+        let req = serde_json::from_slice::<SetBufferRequest>(&body)
+            .map_err(|e| (StatusCode::BAD_REQUEST, format!("Invalid JSON body: {}", e)))?;
+        req.enabled
+    };
+
+    match desired {
+        Some(enabled) => {
+            state.usage.set_buffer_enabled(enabled);
+        }
+        None => {
+            state.usage.toggle_buffer_enabled();
+        }
+    }
+
+    Ok(Json(state.usage.snapshot()))
+}
+
 /// Request payload for `POST /sessions` when a wrapper registers an `agy` instance.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RegisterSessionRequest {
@@ -399,6 +434,7 @@ async fn logs_handler(
 pub fn create_router(state: Arc<ProxyState>) -> Router {
     Router::new()
         .route("/usage", get(usage_handler).delete(reset_usage_handler))
+        .route("/buffer", post(toggle_buffer_handler))
         .route("/logs", get(logs_handler))
         .route(
             "/sessions",
@@ -1126,7 +1162,7 @@ async fn execute_single_attempt(ctx: &mut RequestContext, attempt: u32) -> Attem
                     .and_then(|v| v.to_str().ok())
                     .is_some_and(|v| v.contains("text/event-stream"));
 
-            if ctx.state.config.is_buffer_enabled() {
+            if ctx.state.is_buffer_enabled() {
                 collect_buffered_response(ctx, status, res_headers, upstream_res, is_sse, attempt)
                     .await
             } else {

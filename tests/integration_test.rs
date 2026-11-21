@@ -15,11 +15,11 @@ async fn spawn_test_proxy(upstream_url: String, max_retries: u32) -> String {
 }
 
 /// Helper function to start a test proxy with configurable buffering
-async fn spawn_test_proxy_opts(upstream_url: String, max_retries: u32, no_buffer: bool) -> String {
+async fn spawn_test_proxy_opts(upstream_url: String, max_retries: u32, buffer: bool) -> String {
     spawn_test_proxy_with_keep_alive(
         upstream_url,
         max_retries,
-        no_buffer,
+        buffer,
         DEFAULT_KEEP_ALIVE_INTERVAL,
     )
     .await
@@ -29,7 +29,7 @@ async fn spawn_test_proxy_opts(upstream_url: String, max_retries: u32, no_buffer
 async fn spawn_test_proxy_with_keep_alive(
     upstream_url: String,
     max_retries: u32,
-    no_buffer: bool,
+    buffer: bool,
     keep_alive_interval: Duration,
 ) -> String {
     let config = Config {
@@ -40,7 +40,7 @@ async fn spawn_test_proxy_with_keep_alive(
         initial_delay_ms: 10, // fast retries in tests
         max_delay_ms: 100,
         no_jitter: true,
-        no_buffer,
+        buffer,
         request_timeout_secs: 10,
         api_key: "test-key-123".to_string(),
         ..Config::default()
@@ -293,7 +293,7 @@ fn clear_test_env_vars() {
         "AGY_GYRO_INITIAL_DELAY_MS",
         "AGY_GYRO_MAX_DELAY_MS",
         "AGY_GYRO_NO_JITTER",
-        "AGY_GYRO_NO_BUFFER",
+        "AGY_GYRO_BUFFER",
         "AGY_GYRO_REQUEST_TIMEOUT_SECS",
         "AGY_GYRO_LOG_FILE",
     ] {
@@ -405,8 +405,8 @@ async fn test_buffered_mode_recovers_from_midstream_error() {
 
     let mock_upstream = format!("http://{}", addr);
 
-    // Default mode is buffered (no_buffer = false)
-    let proxy_url = spawn_test_proxy(mock_upstream, 5).await;
+    // Start proxy with full buffering enabled (buffer = true)
+    let proxy_url = spawn_test_proxy_opts(mock_upstream, 5, true).await;
     let client = Client::new();
 
     let response = client
@@ -471,7 +471,7 @@ async fn test_buffered_mode_recovers_from_midstream_connection_drop() {
 
     let mock_upstream = format!("http://{}", addr);
 
-    let proxy_url = spawn_test_proxy(mock_upstream, 5).await;
+    let proxy_url = spawn_test_proxy_opts(mock_upstream, 5, true).await;
     let client = Client::new();
 
     let response = client
@@ -490,7 +490,7 @@ async fn test_buffered_mode_recovers_from_midstream_connection_drop() {
 }
 
 #[tokio::test]
-async fn test_no_buffer_mode_passes_through_midstream_error() {
+async fn test_default_streaming_mode_passes_through_midstream_error() {
     use axum::response::sse::{Event, Sse};
     use axum::routing::post;
     use futures_util::stream;
@@ -526,8 +526,8 @@ async fn test_no_buffer_mode_passes_through_midstream_error() {
 
     let mock_upstream = format!("http://{}", addr);
 
-    // Start proxy with no_buffer = true
-    let proxy_url = spawn_test_proxy_opts(mock_upstream, 5, true).await;
+    // Default mode has full buffering disabled (buffer = false)
+    let proxy_url = spawn_test_proxy(mock_upstream, 5).await;
     let client = Client::new();
 
     let response = client
@@ -691,7 +691,7 @@ async fn test_resolve_gateway_models_fetches_and_expands_models() {
         initial_delay_ms: 10,
         max_delay_ms: 100,
         no_jitter: true,
-        no_buffer: false,
+        buffer: false,
         request_timeout_secs: 10,
         api_key: "my-gemini-api-key".to_string(),
         ..Config::default()
@@ -922,7 +922,7 @@ max_retries = 25
 initial_delay_ms = 500
 max_delay_ms = 30000
 no_jitter = true
-no_buffer = true
+buffer = true
 request_timeout_secs = 120
 "#,
     )
@@ -947,8 +947,8 @@ request_timeout_secs = 120
     assert_eq!(cli.config.initial_delay_ms, 500);
     assert_eq!(cli.config.max_delay_ms, 30000);
     assert!(cli.config.no_jitter);
-    assert!(cli.config.no_buffer);
-    assert!(!cli.config.is_buffer_enabled());
+    assert!(cli.config.buffer);
+    assert!(cli.config.is_buffer_enabled());
     assert_eq!(cli.config.request_timeout_secs, 120);
 
     // 2. Config loaded from TOML file in server mode
@@ -965,7 +965,7 @@ request_timeout_secs = 120
         std::env::set_var("AGY_GYRO_MAX_RETRIES", "42");
         std::env::set_var("AGY_GYRO_HOST", "10.0.0.1");
         std::env::set_var("AGY_GYRO_AGY_PATH", "/custom/agy");
-        std::env::set_var("AGY_GYRO_NO_BUFFER", "false");
+        std::env::set_var("AGY_GYRO_BUFFER", "false");
         std::env::set_var("GEMINI_API_KEY", "env-gemini-key-123");
     }
 
@@ -977,13 +977,13 @@ request_timeout_secs = 120
     assert_eq!(cli_env.config.api_key, "env-gemini-key-123");
     // Daemon-only settings remain as configured in TOML (not overridden by env)
     assert_eq!(cli_env.config.max_retries, 25);
-    assert!(cli_env.config.no_buffer);
-    assert!(!cli_env.config.is_buffer_enabled());
+    assert!(cli_env.config.buffer);
+    assert!(cli_env.config.is_buffer_enabled());
     // TOML still applies for fields not set via Env
     assert_eq!(cli_env.config.port, 7070);
     assert_eq!(cli_env.config.initial_delay_ms, 500);
 
-    // 4. Unknown TOML keys are ignored
+    // 4. Unknown TOML keys are ignored; `buffer` defaults to false when omitted
     std::fs::write(
         &temp_path,
         "api_key = \"toml-gemini-key\"\nunknown_option = 123\n",
@@ -992,6 +992,8 @@ request_timeout_secs = 120
     let cli = Cli::try_parse_with_config_from(["agy-gyro"], Some(&temp_path)).unwrap();
     assert_eq!(cli.command, Commands::Run(Vec::new()));
     assert_eq!(cli.config.api_key, "toml-gemini-key");
+    assert!(!cli.config.buffer);
+    assert!(!cli.config.is_buffer_enabled());
 
     // 5. Invalid TOML syntax returns an error
     std::fs::write(&temp_path, "invalid = [\n").unwrap();
@@ -1059,7 +1061,7 @@ async fn test_buffered_mode_sends_keep_alive_during_long_generation_and_retries(
     let proxy_url = spawn_test_proxy_with_keep_alive(
         format!("http://{}", addr),
         3,
-        false,
+        true,
         Duration::from_millis(25),
     )
     .await;
@@ -1180,7 +1182,7 @@ async fn test_buffered_mode_json_keep_alive_on_slow_generate_content() {
         .await;
 
     let proxy_url =
-        spawn_test_proxy_with_keep_alive(mock_server.uri(), 2, false, Duration::from_millis(20))
+        spawn_test_proxy_with_keep_alive(mock_server.uri(), 2, true, Duration::from_millis(20))
             .await;
 
     let req_client = Client::new();
@@ -1405,7 +1407,7 @@ async fn test_live_usage_endpoint_tracks_tokens_retries_and_cost() {
 }
 
 #[tokio::test]
-async fn test_no_buffer_passthrough_mode_records_usage_on_stream_completion() {
+async fn test_default_passthrough_mode_records_usage_on_stream_completion() {
     use agy_gyro::tui::fetch_usage_snapshot;
 
     let mock_server = MockServer::start().await;
@@ -1423,7 +1425,7 @@ async fn test_no_buffer_passthrough_mode_records_usage_on_stream_completion() {
         .mount(&mock_server)
         .await;
 
-    let proxy_url = spawn_test_proxy_opts(mock_server.uri(), 3, true).await;
+    let proxy_url = spawn_test_proxy(mock_server.uri(), 3).await;
     let client = Client::new();
 
     let res = client
@@ -1853,7 +1855,7 @@ async fn test_new_session_refetches_model_catalog_and_pricing() {
         initial_delay_ms: 10,
         max_delay_ms: 100,
         no_jitter: true,
-        no_buffer: false,
+        buffer: false,
         request_timeout_secs: 10,
         api_key: "test-key-123".to_string(),
         ..Config::default()
@@ -2045,4 +2047,132 @@ async fn test_new_session_refetches_model_catalog_and_pricing() {
         .await
         .unwrap();
     assert!((snap2.totals.total_cost_usd - 8.5).abs() < 1e-9);
+}
+
+#[tokio::test]
+async fn test_runtime_buffer_toggle_switches_buffering_in_real_time() {
+    use agy_gyro::tui::{fetch_logs_snapshot, fetch_usage_snapshot, toggle_remote_buffer};
+    use axum::response::sse::{Event, Sse};
+    use axum::routing::post;
+    use futures_util::stream;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let call_count = Arc::new(AtomicUsize::new(0));
+    let count_clone = call_count.clone();
+
+    // Attempts 0, 1, 3 emit chunk 1 + mid-stream 503; attempt 2 emits a clean recovered stream
+    let app = axum::Router::new().route(
+        "/v1beta/models/gemini-2.5-pro:streamGenerateContent",
+        post(move || {
+            let count = count_clone.clone();
+            async move {
+                let attempt = count.fetch_add(1, Ordering::SeqCst);
+                if attempt == 2 {
+                    let s = stream::iter(vec![Ok::<_, std::convert::Infallible>(
+                        Event::default().data(
+                            "{\"candidates\": [{\"content\": {\"parts\": [{\"text\": \"Recovered cleanly\"}]}}]}",
+                        ),
+                    )]);
+                    Sse::new(s)
+                } else {
+                    let s = stream::iter(vec![
+                        Ok::<_, std::convert::Infallible>(Event::default().data(
+                            "{\"candidates\": [{\"content\": {\"parts\": [{\"text\": \"Partial...\"}]}}]}",
+                        )),
+                        Ok::<_, std::convert::Infallible>(Event::default().data(
+                            "{\"error\": {\"code\": 503, \"message\": \"Mid-stream overload\", \"status\": \"UNAVAILABLE\"}}",
+                        )),
+                    ]);
+                    Sse::new(s)
+                }
+            }
+        }),
+    );
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let upstream_url = format!("http://{}", listener.local_addr().unwrap());
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+
+    // Default mode: full buffering disabled (buffer = false)
+    let proxy_url = spawn_test_proxy(upstream_url, 3).await;
+    let client = Client::new();
+    let usage_url = format!("{}/usage", proxy_url);
+    let buffer_url = format!("{}/buffer", proxy_url);
+    let logs_url = format!("{}/logs", proxy_url);
+
+    let initial_snap = fetch_usage_snapshot(&client, &usage_url).await.unwrap();
+    assert!(!initial_snap.buffer_enabled);
+
+    // 1. With buffering OFF, mid-stream 503 passes through without retry (attempt 0)
+    let res1 = client
+        .post(format!(
+            "{}/v1beta/models/gemini-2.5-pro:streamGenerateContent?alt=sse",
+            proxy_url
+        ))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res1.status(), 200);
+    let text1 = res1.text().await.unwrap();
+    assert!(text1.contains("Partial..."));
+    assert!(text1.contains("Mid-stream overload"));
+    assert_eq!(call_count.load(Ordering::SeqCst), 1);
+
+    // 2. Toggle buffering ON at runtime via POST /buffer (simulating pressing `b` in monitor TUI)
+    let toggled_on = toggle_remote_buffer(&client, &buffer_url, None)
+        .await
+        .unwrap();
+    assert!(toggled_on.buffer_enabled);
+    let snap_on = fetch_usage_snapshot(&client, &usage_url).await.unwrap();
+    assert!(snap_on.buffer_enabled);
+
+    // With buffering ON, mid-stream 503 (attempt 1) is discarded and retried cleanly (attempt 2)
+    let res2 = client
+        .post(format!(
+            "{}/v1beta/models/gemini-2.5-pro:streamGenerateContent?alt=sse",
+            proxy_url
+        ))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res2.status(), 200);
+    let text2 = res2.text().await.unwrap();
+    assert!(!text2.contains("Mid-stream overload"));
+    assert!(text2.contains("Recovered cleanly"));
+    assert_eq!(call_count.load(Ordering::SeqCst), 3);
+
+    // 3. Explicitly disable buffering at runtime via POST /buffer {"enabled": false}
+    let toggled_off = toggle_remote_buffer(&client, &buffer_url, Some(false))
+        .await
+        .unwrap();
+    assert!(!toggled_off.buffer_enabled);
+    let snap_off = fetch_usage_snapshot(&client, &usage_url).await.unwrap();
+    assert!(!snap_off.buffer_enabled);
+
+    // With buffering OFF again, mid-stream 503 passes through without retry (attempt 3)
+    let res3 = client
+        .post(format!(
+            "{}/v1beta/models/gemini-2.5-pro:streamGenerateContent?alt=sse",
+            proxy_url
+        ))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res3.status(), 200);
+    let text3 = res3.text().await.unwrap();
+    assert!(text3.contains("Mid-stream overload"));
+    assert_eq!(call_count.load(Ordering::SeqCst), 4);
+
+    // Verify runtime toggle events are recorded in gateway logs
+    let logs = fetch_logs_snapshot(&client, &logs_url).await.unwrap();
+    assert!(
+        logs.iter()
+            .any(|l| l.message.contains("Full SSE buffering enabled"))
+    );
+    assert!(
+        logs.iter()
+            .any(|l| l.message.contains("Full SSE buffering disabled"))
+    );
 }
