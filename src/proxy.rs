@@ -45,6 +45,7 @@ pub struct ProxyState {
     pub upstream_base: String,
     pub pricing_url: String,
     pub keep_alive_interval: Duration,
+    pub build_id: String,
     pub usage: Arc<UsageTracker>,
     pub gateway_models: RwLock<Vec<GatewayModelEntry>>,
     refresh_in_flight: Mutex<Option<tokio::sync::watch::Receiver<bool>>>,
@@ -90,6 +91,7 @@ impl ProxyState {
             upstream_base,
             pricing_url: DEFAULT_PRICING_URL.to_string(),
             keep_alive_interval: DEFAULT_KEEP_ALIVE_INTERVAL,
+            build_id: crate::BUILD_ID.to_string(),
             usage,
             gateway_models: RwLock::new(default_gateway_models()),
             refresh_in_flight: Mutex::new(None),
@@ -99,6 +101,11 @@ impl ProxyState {
 
     pub fn with_keep_alive_interval(mut self, interval: Duration) -> Self {
         self.keep_alive_interval = interval;
+        self
+    }
+
+    pub fn with_build_id(mut self, build_id: impl Into<String>) -> Self {
+        self.build_id = build_id.into();
         self
     }
 
@@ -318,10 +325,12 @@ pub struct RegisterSessionResponse {
     pub api_key: String,
 }
 
-/// Response payload from `GET /sessions` for checking daemon liveness and active model list.
+/// Response payload from `GET /sessions` for checking daemon liveness, build ID, and active model list.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DaemonStatusResponse {
     pub pid: u32,
+    #[serde(default)]
+    pub build_id: Option<String>,
     pub gateway_models: Vec<String>,
 }
 
@@ -334,6 +343,7 @@ async fn daemon_status_handler(State(state): State<Arc<ProxyState>>) -> Json<Dae
         .collect();
     Json(DaemonStatusResponse {
         pid: std::process::id(),
+        build_id: Some(state.build_id.clone()),
         gateway_models,
     })
 }

@@ -14,6 +14,7 @@ categories = [
     "network-programming",
 ]
 include = [
+    "build.rs",
     "src/**/*",
     "tests/**/*",
     "assets/*",

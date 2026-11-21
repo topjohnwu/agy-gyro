@@ -89,7 +89,10 @@ async fn run_server(config: Config) -> Result<(), Box<dyn std::error::Error>> {
     let client = agy_gyro::proxy::build_http_client(&config)?;
     let state = Arc::new(ProxyState::new(config.clone(), client));
 
-    info!("Starting agy-gyro local Antigravity Enterprise Gateway server");
+    info!(
+        "Starting agy-gyro local Antigravity Enterprise Gateway server (build={})",
+        agy_gyro::short_build_id(agy_gyro::BUILD_ID)
+    );
     info!("Upstream URL: {}", config.upstream);
     info!(
         "Retry configuration: max_retries={}, initial_delay_ms={}ms, max_delay_ms={}ms, jitter={}, buffer={}",

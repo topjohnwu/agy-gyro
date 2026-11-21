@@ -1477,6 +1477,8 @@ impl Drop for TerminalRestoreGuard {
 
 /// Runs the interactive live TUI usage and cost monitor dashboard over SSE.
 pub async fn run_monitor(config: Config) -> Result<(), Box<dyn std::error::Error>> {
+    let _ = crate::runner::restart_daemon_if_build_mismatch(&config).await;
+
     let sse_client = reqwest::Client::builder()
         .connect_timeout(Duration::from_secs(2))
         .tcp_keepalive(Duration::from_secs(15))

@@ -5,7 +5,6 @@ use crate::proxy::{
     DaemonStatusResponse, RegisterSessionRequest, RegisterSessionResponse, ShutdownResponse,
 };
 use crate::usage::{is_pid_alive, sanitize_session_label};
-use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::{Duration, Instant};
@@ -144,17 +143,115 @@ fn spawn_background_daemon(cfg: &Config, port: u16) -> Result<(), Box<dyn std::e
     Ok(())
 }
 
-/// Probes the configured daemon address; if unreachable, spawns the background daemon
-/// and polls `probe` until it succeeds or times out after 15 seconds.
-/// Returns `(daemon_url, probe_result, was_already_running)`.
-async fn ensure_daemon_ready<T, F, Fut>(
+fn build_id_matches(server_id: Option<&str>, client_id: &str) -> bool {
+    server_id == Some(client_id)
+}
+
+async fn wait_for_daemon_stopped(
+    client: &reqwest::Client,
+    base_url: &str,
+    pid: Option<u32>,
+    timeout: Duration,
+) -> bool {
+    let probe_url = format!("{}/sessions", base_url.trim_end_matches('/'));
+    let start = Instant::now();
+    while start.elapsed() < timeout {
+        let pid_done = pid.is_none_or(|p| p == std::process::id() || !is_pid_alive(p));
+        let port_closed = client
+            .get(&probe_url)
+            .timeout(Duration::from_millis(100))
+            .send()
+            .await
+            .is_err();
+        if pid_done && port_closed {
+            return true;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    false
+}
+
+async fn force_kill_pid(pid: u32) {
+    if pid == 0 || pid == std::process::id() || !is_pid_alive(pid) {
+        return;
+    }
+
+    #[cfg(unix)]
+    {
+        unsafe {
+            let _ = libc::kill(pid as libc::pid_t, libc::SIGTERM);
+        }
+        let start = Instant::now();
+        while start.elapsed() < Duration::from_millis(500) && is_pid_alive(pid) {
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        if is_pid_alive(pid) {
+            unsafe {
+                let _ = libc::kill(pid as libc::pid_t, libc::SIGKILL);
+            }
+        }
+    }
+
+    #[cfg(windows)]
+    {
+        let _ = std::process::Command::new("taskkill")
+            .args(["/PID", &pid.to_string(), "/F"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+    }
+}
+
+async fn shutdown_daemon_for_restart(
+    client: &reqwest::Client,
+    base_url: &str,
+    known_pid: u32,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let shutdown_url = format!("{}/shutdown", base_url.trim_end_matches('/'));
+    let pid = match client
+        .post(&shutdown_url)
+        .timeout(Duration::from_secs(2))
+        .send()
+        .await
+    {
+        Ok(res) if res.status().is_success() => res
+            .json::<ShutdownResponse>()
+            .await
+            .map(|p| p.pid)
+            .unwrap_or(known_pid),
+        _ => known_pid,
+    };
+
+    if wait_for_daemon_stopped(client, base_url, Some(pid), Duration::from_secs(2)).await {
+        return Ok(());
+    }
+
+    force_kill_pid(pid).await;
+
+    if wait_for_daemon_stopped(client, base_url, Some(pid), Duration::from_secs(2)).await {
+        return Ok(());
+    }
+
+    Err(format!(
+        "Timed out stopping mismatched agy-gyro daemon (pid={}) on {}",
+        pid, base_url
+    )
+    .into())
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DaemonLaunchOutcome {
+    AlreadyRunning,
+    Started,
+    Restarted { old_pid: u32 },
+}
+
+/// Probes the configured daemon address; if unreachable, spawns the background daemon.
+/// If a daemon is already running with a mismatched build ID, kills and restarts it automatically.
+async fn ensure_daemon_status(
     config: &Config,
-    mut probe: F,
-) -> Result<(String, T, bool), Box<dyn std::error::Error>>
-where
-    F: FnMut(reqwest::Client, String) -> Fut,
-    Fut: Future<Output = Result<T, String>>,
-{
+) -> Result<(String, DaemonStatusResponse, DaemonLaunchOutcome), Box<dyn std::error::Error>> {
     let client = build_registration_client()?;
 
     let port = if config.port != 0 {
@@ -165,18 +262,41 @@ where
     };
 
     let daemon_url = format!("http://{}:{}", connect_host(&config.host), port);
+    let expected_build_id = crate::BUILD_ID;
 
-    if let Ok(res) = probe(client.clone(), daemon_url.clone()).await {
-        return Ok((daemon_url, res, true));
-    }
+    let outcome = match try_fetch_daemon_status(&client, &daemon_url).await {
+        Ok(status) if build_id_matches(status.build_id.as_deref(), expected_build_id) => {
+            return Ok((daemon_url, status, DaemonLaunchOutcome::AlreadyRunning));
+        }
+        Ok(status) => {
+            let server_id = status
+                .build_id
+                .as_deref()
+                .map(crate::short_build_id)
+                .unwrap_or("unknown");
+            eprintln!(
+                "agy-gyro: server build id mismatch (server={}, client={}); restarting daemon (pid={})...",
+                server_id,
+                crate::short_build_id(expected_build_id),
+                status.pid
+            );
+            shutdown_daemon_for_restart(&client, &daemon_url, status.pid).await?;
+            DaemonLaunchOutcome::Restarted {
+                old_pid: status.pid,
+            }
+        }
+        Err(_) => DaemonLaunchOutcome::Started,
+    };
 
     spawn_background_daemon(config, port)?;
 
     let start = Instant::now();
     while start.elapsed() < Duration::from_secs(15) {
         tokio::time::sleep(Duration::from_millis(40)).await;
-        if let Ok(res) = probe(client.clone(), daemon_url.clone()).await {
-            return Ok((daemon_url, res, false));
+        if let Ok(status) = try_fetch_daemon_status(&client, &daemon_url).await
+            && build_id_matches(status.build_id.as_deref(), expected_build_id)
+        {
+            return Ok((daemon_url, status, outcome));
         }
     }
 
@@ -188,26 +308,55 @@ where
 }
 
 /// Ensures the background `agy-gyro` daemon is running on the configured port without blocking.
-/// If a daemon is already running on the configured port, prints its status and returns immediately.
+/// If a daemon is already running with a matching build ID, prints its status and returns immediately.
+/// If a running daemon has a different build ID, kills and restarts it automatically.
 pub async fn start_daemon(config: Config) -> Result<(), Box<dyn std::error::Error>> {
-    let (daemon_url, status, already_running) =
-        ensure_daemon_ready(&config, |client, url| async move {
-            try_fetch_daemon_status(&client, &url).await
-        })
-        .await?;
+    let (daemon_url, status, outcome) = ensure_daemon_status(&config).await?;
 
-    if already_running {
-        println!(
-            "agy-gyro daemon (pid={}) is already running on {}",
-            status.pid, daemon_url
-        );
-    } else {
-        println!(
-            "Started agy-gyro daemon (pid={}) on {}",
-            status.pid, daemon_url
-        );
+    match outcome {
+        DaemonLaunchOutcome::AlreadyRunning => {
+            println!(
+                "agy-gyro daemon (pid={}) is already running on {}",
+                status.pid, daemon_url
+            );
+        }
+        DaemonLaunchOutcome::Started => {
+            println!(
+                "Started agy-gyro daemon (pid={}) on {}",
+                status.pid, daemon_url
+            );
+        }
+        DaemonLaunchOutcome::Restarted { old_pid } => {
+            println!(
+                "Restarted agy-gyro daemon (old pid={}, new pid={}) on {}",
+                old_pid, status.pid, daemon_url
+            );
+        }
     }
     Ok(())
+}
+
+/// If a daemon is already running on `config`'s port with a mismatched build ID and an API key
+/// is configured, kills and restarts it so clients connect to the matching server build.
+pub async fn restart_daemon_if_build_mismatch(
+    config: &Config,
+) -> Result<bool, Box<dyn std::error::Error>> {
+    if config.port == 0 || config.api_key.trim().is_empty() {
+        return Ok(false);
+    }
+
+    let client = build_registration_client()?;
+    let daemon_url = config.base_url();
+    let Ok(status) = try_fetch_daemon_status(&client, &daemon_url).await else {
+        return Ok(false);
+    };
+
+    if build_id_matches(status.build_id.as_deref(), crate::BUILD_ID) {
+        return Ok(false);
+    }
+
+    let (_, _, outcome) = ensure_daemon_status(config).await?;
+    Ok(matches!(outcome, DaemonLaunchOutcome::Restarted { .. }))
 }
 
 async fn ensure_daemon_and_register(
@@ -215,12 +364,11 @@ async fn ensure_daemon_and_register(
     pid: Option<u32>,
     label: &str,
 ) -> Result<(String, RegisterSessionResponse), Box<dyn std::error::Error>> {
-    let label_owned = label.to_string();
-    let (daemon_url, reg, _) = ensure_daemon_ready(config, move |client, url| {
-        let lbl = label_owned.clone();
-        async move { try_register_session(&client, &url, pid, &lbl).await }
-    })
-    .await?;
+    let (daemon_url, _, _) = ensure_daemon_status(config).await?;
+    let client = build_registration_client()?;
+    let reg = try_register_session(&client, &daemon_url, pid, label)
+        .await
+        .map_err(|e| format!("Failed to register session on {}: {}", daemon_url, e))?;
 
     Ok((daemon_url, reg))
 }
@@ -333,20 +481,7 @@ pub async fn stop_daemon(config: Config) -> Result<(), Box<dyn std::error::Error
     let payload = res.json::<ShutdownResponse>().await.ok();
     let pid = payload.as_ref().map(|p| p.pid);
 
-    let start = Instant::now();
-    while start.elapsed() < Duration::from_secs(3) {
-        let pid_done = pid.is_none_or(|p| p == std::process::id() || !is_pid_alive(p));
-        let port_closed = client
-            .get(config.usage_url())
-            .timeout(Duration::from_millis(100))
-            .send()
-            .await
-            .is_err();
-        if pid_done && port_closed {
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(25)).await;
-    }
+    let _ = wait_for_daemon_stopped(&client, &base_url, pid, Duration::from_secs(3)).await;
 
     if let Some(p) = pid {
         println!("Stopped agy-gyro daemon (pid={}) at {}", p, base_url);

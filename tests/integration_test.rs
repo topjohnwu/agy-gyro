@@ -1667,6 +1667,19 @@ async fn test_server_and_stop_subcommands_spawn_and_stop_background_daemon() {
     let stdout1 = String::from_utf8_lossy(&out1.stdout);
     assert!(stdout1.contains("Started agy-gyro daemon"));
 
+    // Verify daemon exposes the embedded deterministic SHA-256 build ID on GET /sessions
+    assert_eq!(agy_gyro::BUILD_ID.len(), 64);
+    assert!(agy_gyro::BUILD_ID.chars().all(|c| c.is_ascii_hexdigit()));
+    let status: agy_gyro::proxy::DaemonStatusResponse = Client::new()
+        .get(format!("http://127.0.0.1:{}/sessions", free_port))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(status.build_id.as_deref(), Some(agy_gyro::BUILD_ID));
+
     // 2. Second `agy-gyro server` on the same port detects existing daemon and returns immediately
     let out2 = tokio::process::Command::new(env!("CARGO_BIN_EXE_agy-gyro"))
         .arg("server")
@@ -2344,4 +2357,205 @@ async fn test_logs_sse_streams_incremental_appends_and_resyncs_on_reset() {
             }
         }
     }
+}
+
+async fn spawn_mock_old_daemon(
+    build_id: Option<&'static str>,
+) -> (u16, tokio::task::JoinHandle<()>) {
+    use axum::{Json, Router, routing::get, routing::post};
+
+    let (shutdown_tx, mut shutdown_rx) = tokio::sync::watch::channel(false);
+    let tx_clone = shutdown_tx.clone();
+
+    let app = Router::new()
+        .route(
+            "/sessions",
+            get(move || async move {
+                let mut payload = serde_json::json!({
+                    "pid": 0,
+                    "gateway_models": [],
+                });
+                if let Some(id) = build_id {
+                    payload["build_id"] = serde_json::Value::String(id.to_string());
+                }
+                Json(payload)
+            }),
+        )
+        .route(
+            "/shutdown",
+            post(move || {
+                let tx = tx_clone.clone();
+                async move {
+                    let _ = tx.send(true);
+                    Json(serde_json::json!({
+                        "status": "stopping",
+                        "pid": 0,
+                    }))
+                }
+            }),
+        );
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let handle = tokio::spawn(async move {
+        let _ = axum::serve(listener, app)
+            .with_graceful_shutdown(async move {
+                let _ = shutdown_rx.wait_for(|&v| v).await;
+            })
+            .await;
+    });
+    (port, handle)
+}
+
+#[tokio::test]
+async fn test_server_restarts_automatically_on_build_id_mismatch_and_legacy_daemon() {
+    for (case_idx, old_build_id) in [
+        (
+            0,
+            Some("0000000000000000000000000000000000000000000000000000000000000000"),
+        ),
+        (1, None),
+    ] {
+        let (port, old_handle) = spawn_mock_old_daemon(old_build_id).await;
+
+        let temp_home = std::env::temp_dir().join(format!(
+            "agy-gyro-build-restart-home-{}-{}",
+            std::process::id(),
+            case_idx
+        ));
+        let config_dir = temp_home.join(".gemini").join("config");
+        std::fs::create_dir_all(&config_dir).unwrap();
+        std::fs::write(
+            config_dir.join("agy-gyro.toml"),
+            format!(
+                "host = \"127.0.0.1\"\nport = {}\napi_key = \"test-daemon-key\"\n",
+                port
+            ),
+        )
+        .unwrap();
+
+        let out = tokio::process::Command::new(env!("CARGO_BIN_EXE_agy-gyro"))
+            .arg("server")
+            .env("HOME", &temp_home)
+            .env("USERPROFILE", &temp_home)
+            .output()
+            .await
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "case {} failed: stderr={}",
+            case_idx,
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            stdout.contains("Restarted agy-gyro daemon"),
+            "expected restart message, got stdout={}",
+            stdout
+        );
+        assert!(
+            stderr.contains("server build id mismatch"),
+            "expected mismatch diagnostic, got stderr={}",
+            stderr
+        );
+
+        // Old server must have exited cleanly
+        tokio::time::timeout(Duration::from_secs(2), old_handle)
+            .await
+            .expect("old mock daemon should have shut down")
+            .unwrap();
+
+        // New daemon on the same port must advertise the current executable's BUILD_ID
+        let status: agy_gyro::proxy::DaemonStatusResponse = Client::new()
+            .get(format!("http://127.0.0.1:{}/sessions", port))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(status.build_id.as_deref(), Some(agy_gyro::BUILD_ID));
+        assert!(status.pid > 0);
+
+        // Clean up background daemon
+        let out_stop = tokio::process::Command::new(env!("CARGO_BIN_EXE_agy-gyro"))
+            .arg("stop")
+            .env("HOME", &temp_home)
+            .env("USERPROFILE", &temp_home)
+            .output()
+            .await
+            .unwrap();
+        let _ = std::fs::remove_dir_all(&temp_home);
+        assert!(out_stop.status.success());
+    }
+}
+
+#[tokio::test]
+async fn test_wrapper_restarts_mismatched_daemon_before_running_child() {
+    let (port, old_handle) = spawn_mock_old_daemon(Some(
+        "deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef",
+    ))
+    .await;
+
+    let temp_home = std::env::temp_dir().join(format!(
+        "agy-gyro-wrapper-build-restart-{}",
+        std::process::id()
+    ));
+    let config_dir = temp_home.join(".gemini").join("config");
+    std::fs::create_dir_all(&config_dir).unwrap();
+
+    let (agy_path, arg) = if cfg!(windows) {
+        ("cmd", "/C echo ok")
+    } else {
+        ("/bin/echo", "ok")
+    };
+    std::fs::write(
+        config_dir.join("agy-gyro.toml"),
+        format!(
+            "host = \"127.0.0.1\"\nport = {}\napi_key = \"test-daemon-key\"\nagy_path = \"{}\"\n",
+            port, agy_path
+        ),
+    )
+    .unwrap();
+
+    let out = tokio::process::Command::new(env!("CARGO_BIN_EXE_agy-gyro"))
+        .arg(arg)
+        .env("HOME", &temp_home)
+        .env("USERPROFILE", &temp_home)
+        .output()
+        .await
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "wrapper failed: stderr={}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(String::from_utf8_lossy(&out.stderr).contains("server build id mismatch"));
+
+    tokio::time::timeout(Duration::from_secs(2), old_handle)
+        .await
+        .expect("old mock daemon should have shut down")
+        .unwrap();
+
+    let status: agy_gyro::proxy::DaemonStatusResponse = Client::new()
+        .get(format!("http://127.0.0.1:{}/sessions", port))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(status.build_id.as_deref(), Some(agy_gyro::BUILD_ID));
+
+    // Clean up background daemon
+    let out_stop = tokio::process::Command::new(env!("CARGO_BIN_EXE_agy-gyro"))
+        .arg("stop")
+        .env("HOME", &temp_home)
+        .env("USERPROFILE", &temp_home)
+        .output()
+        .await
+        .unwrap();
+    let _ = std::fs::remove_dir_all(&temp_home);
+    assert!(out_stop.status.success());
 }
