@@ -5,6 +5,22 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.2] - 2026-11-21
+
+### Added
+- **Automatic Daemon Restart on Build Mismatch**: Computes a deterministic SHA-256 `BUILD_ID` at compile time and exposes `build_id` via `GET /sessions`. Launching `agy-gyro`, `agy-gyro server`, or `agy-gyro monitor` now automatically shuts down (with force-kill fallback) and restarts any running daemon whose build ID differs from the current binary (including older daemons without a build ID).
+- **Runtime Stream Buffering Toggle (`b` / `POST /buffer`)**: Added a `POST /buffer` endpoint, live `Buffer: ON/OFF` status indicator, and `b` keybinding in `agy-gyro monitor` to toggle full SSE stream buffering at runtime without restarting the daemon.
+- **Per-Session Model & Pricing Refresh**: Automatically refetches `/v1beta/models` and live `models.dev` pricing on every new `POST /sessions` connection, coalescing concurrent in-flight refreshes while preserving the existing catalog and pricing on transient errors.
+- **`xhigh` Effort Support for Gemini 4 Hydrogen & Neon**: Expanded `gemini-4-hydrogen` and `gemini-4-neon` models in `/v1beta/models` with `-xhigh` (`XHigh` / `thinkingLevel: "XHIGH"`) effort variants (ordered `high`, `xhigh`, `medium`, `low` so `-high` remains the default) and added both models to the fallback gateway catalog.
+
+### Changed
+- **Streaming Passthrough by Default (`buffer` Config Option)**: Renamed `no_buffer` in `~/.gemini/config/agy-gyro.toml` to `buffer` and disabled full SSE stream buffering by default (`buffer = false`), verifying Chunk 1 and streaming subsequent tokens immediately for lower time-to-first-token latency.
+- **Incremental SSE Log Streaming & Higher Log Cap**: Raised the in-memory log buffer cap from 200 to 10,000 entries and switched `GET /logs` to stream incremental `snapshot` / `append` SSE events with per-client cursors and automatic resync on reset or lag, updating `agy-gyro monitor` for fast incremental log appends and smooth paused scrolling.
+- **Gemini API Key Requirement & Pricing Scope**: Restored requiring a Gemini API key (`api_key`, `AGY_GYRO_API_KEY`, or `GEMINI_API_KEY`) for wrapper and `server` modes and scoped live `models.dev` pricing lookups back to Google Gemini models.
+
+### Removed
+- **OAuth Passthrough Mode (`oauth` / `AGY_GYRO_OAUTH`)**: Removed personal OAuth passthrough support (`oauth` config option, `AGY_GYRO_OAUTH`, `CLOUD_CODE_URL` routing, `/s/<session_id>/...` path handling, `/v1internal` passthrough, and Anthropic/OpenAI pricing entries).
+
 ## [0.2.1] - 2026-11-10
 
 ### Added
