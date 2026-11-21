@@ -8,6 +8,7 @@ use tracing::{info, warn};
 
 /// Fallback list of Gemini models if dynamic discovery fails.
 pub const DEFAULT_GATEWAY_MODELS: &[&str] = &[
+    "gemini-4-neon",
     "gemini-4-hydrogen",
     "gemini-4-argon",
     "gemini-3.8-flash",
@@ -22,8 +23,9 @@ pub const MODEL_EFFORT_LEVELS: &[&str] = &["medium", "high", "low"];
 /// Effort ordering for Flash models (`high -> medium -> low`).
 const FLASH_EFFORT_LEVELS: &[&str] = &["high", "medium", "low"];
 
-/// Effort ordering for Hydrogen models (`medium -> high -> xhigh -> low`), matching normal `agy`.
-const HYDROGEN_EFFORT_LEVELS: &[&str] = &["medium", "high", "xhigh", "low"];
+/// Effort ordering for models that support `xhigh` (`high -> xhigh -> medium -> low` so `-high`
+/// is the default), matching normal `agy`.
+const XHIGH_EFFORT_LEVELS: &[&str] = &["high", "xhigh", "medium", "low"];
 
 /// Keywords identifying preview, lite, rolling-alias, or non-text/specialized Gemini variants
 /// that should be excluded when discovering core reasoning models from `/v1beta/models`.
@@ -137,8 +139,8 @@ fn format_effort_label(effort: &str) -> String {
 }
 
 fn effort_levels_for_model(base_id: &str) -> &'static [&'static str] {
-    if base_id.contains("hydrogen") {
-        HYDROGEN_EFFORT_LEVELS
+    if base_id.contains("hydrogen") || base_id.contains("neon") {
+        XHIGH_EFFORT_LEVELS
     } else if base_id.contains("flash") {
         FLASH_EFFORT_LEVELS
     } else {
@@ -161,7 +163,7 @@ pub fn humanize_model_id(base_id: &str) -> String {
 /// Splits a trailing `-<effort>` suffix (where `<effort>` is a recognized effort level such as
 /// `low`, `medium`, `high`, or `xhigh`) from a model identifier, returning `(base_model, effort)`.
 pub fn split_effort_suffix(model_id: &str) -> Option<(&str, &'static str)> {
-    for &effort in HYDROGEN_EFFORT_LEVELS {
+    for &effort in XHIGH_EFFORT_LEVELS {
         if let Some(prefix) = model_id.strip_suffix(effort)
             && let Some(base) = prefix.strip_suffix('-')
             && !base.is_empty()
@@ -562,6 +564,10 @@ mod tests {
             extract_model_from_path("/v1beta/models/gemini-4-hydrogen-xhigh:streamGenerateContent"),
             Some("gemini-4-hydrogen".to_string())
         );
+        assert_eq!(
+            extract_model_from_path("/v1beta/models/gemini-4-neon-xhigh:streamGenerateContent"),
+            Some("gemini-4-neon".to_string())
+        );
         assert_eq!(extract_model_from_path("/v1beta/models"), None);
     }
 
@@ -603,9 +609,13 @@ mod tests {
         assert_eq!(
             ids,
             vec![
-                "gemini-4-hydrogen-medium",
+                "gemini-4-neon-high",
+                "gemini-4-neon-xhigh",
+                "gemini-4-neon-medium",
+                "gemini-4-neon-low",
                 "gemini-4-hydrogen-high",
                 "gemini-4-hydrogen-xhigh",
+                "gemini-4-hydrogen-medium",
                 "gemini-4-hydrogen-low",
                 "gemini-4-argon-medium",
                 "gemini-4-argon-high",
@@ -618,7 +628,11 @@ mod tests {
             ]
         );
         assert_eq!(
-            expanded[2].display_name.as_deref(),
+            expanded[1].display_name.as_deref(),
+            Some("Gemini 4 Neon (XHigh)")
+        );
+        assert_eq!(
+            expanded[5].display_name.as_deref(),
             Some("Gemini 4 Hydrogen (XHigh)")
         );
 
@@ -648,6 +662,18 @@ mod tests {
                 thinking: Some(true),
             },
             GeminiModelInfo {
+                name: "models/gemini-4-neon".to_string(),
+                display_name: Some("Gemini 4 Neon".to_string()),
+                description: Some("Flagship reasoning model".to_string()),
+                input_token_limit: Some(1_048_576),
+                output_token_limit: Some(65_536),
+                supported_generation_methods: vec![
+                    "generateContent".to_string(),
+                    "countTokens".to_string(),
+                ],
+                thinking: Some(true),
+            },
+            GeminiModelInfo {
                 name: "models/gemini-3.1-flash-image".to_string(),
                 display_name: Some("Nano Banana 2".to_string()),
                 description: Some("Gemini 3.1 Flash Image".to_string()),
@@ -659,7 +685,7 @@ mod tests {
         ];
 
         let rich_expanded = expand_gateway_models(&upstream);
-        assert_eq!(rich_expanded.len(), 8);
+        assert_eq!(rich_expanded.len(), 12);
         assert_eq!(rich_expanded[0].name, "models/gemini-4-argon-medium");
         assert_eq!(
             rich_expanded[0].display_name.as_deref(),
@@ -673,13 +699,19 @@ mod tests {
         assert_eq!(rich_expanded[0].output_token_limit, Some(32_768));
         assert_eq!(rich_expanded[0].thinking, Some(true));
 
-        assert_eq!(rich_expanded[5].name, "models/gemini-4-hydrogen-xhigh");
+        assert_eq!(rich_expanded[4].name, "models/gemini-4-hydrogen-xhigh");
         assert_eq!(
-            rich_expanded[5].display_name.as_deref(),
+            rich_expanded[4].display_name.as_deref(),
             Some("Gemini 4 Hydrogen (XHigh)")
         );
 
-        let image = &rich_expanded[7];
+        assert_eq!(rich_expanded[8].name, "models/gemini-4-neon-xhigh");
+        assert_eq!(
+            rich_expanded[8].display_name.as_deref(),
+            Some("Gemini 4 Neon (XHigh)")
+        );
+
+        let image = &rich_expanded[11];
         assert_eq!(image.name, "models/gemini-3.1-flash-image");
         assert_eq!(image.display_name.as_deref(), Some("Nano Banana 2"));
         assert_eq!(image.input_token_limit, Some(65_536));
@@ -704,6 +736,15 @@ mod tests {
             ),
             (
                 "/v1beta/models/gemini-4-hydrogen:streamGenerateContent?alt=sse".to_string(),
+                Some("xhigh")
+            )
+        );
+        assert_eq!(
+            rewrite_request_path_and_extract_effort(
+                "/v1beta/models/gemini-4-neon-xhigh:streamGenerateContent?alt=sse"
+            ),
+            (
+                "/v1beta/models/gemini-4-neon:streamGenerateContent?alt=sse".to_string(),
                 Some("xhigh")
             )
         );

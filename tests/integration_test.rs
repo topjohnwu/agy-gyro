@@ -662,6 +662,12 @@ async fn test_resolve_gateway_models_fetches_and_expands_models() {
                             "thinking": true
                         },
                         {
+                            "name": "models/gemini-4-neon",
+                            "displayName": "Gemini 4 Neon",
+                            "supportedGenerationMethods": ["generateContent", "countTokens"],
+                            "thinking": true
+                        },
+                        {
                             "name": "models/gemini-99-flash-image",
                             "displayName": "Nano Banana 99",
                             "description": "Gemini 99 Flash Image",
@@ -706,9 +712,13 @@ async fn test_resolve_gateway_models_fetches_and_expands_models() {
     assert_eq!(
         model_ids,
         vec![
-            "gemini-4-hydrogen-medium",
+            "gemini-4-neon-high",
+            "gemini-4-neon-xhigh",
+            "gemini-4-neon-medium",
+            "gemini-4-neon-low",
             "gemini-4-hydrogen-high",
             "gemini-4-hydrogen-xhigh",
+            "gemini-4-hydrogen-medium",
             "gemini-4-hydrogen-low",
             "gemini-99-pro-medium",
             "gemini-99-pro-high",
@@ -745,9 +755,13 @@ async fn test_resolve_gateway_models_fetches_and_expands_models() {
     assert_eq!(
         model_names,
         vec![
-            "models/gemini-4-hydrogen-medium",
+            "models/gemini-4-neon-high",
+            "models/gemini-4-neon-xhigh",
+            "models/gemini-4-neon-medium",
+            "models/gemini-4-neon-low",
             "models/gemini-4-hydrogen-high",
             "models/gemini-4-hydrogen-xhigh",
+            "models/gemini-4-hydrogen-medium",
             "models/gemini-4-hydrogen-low",
             "models/gemini-99-pro-medium",
             "models/gemini-99-pro-high",
@@ -760,10 +774,14 @@ async fn test_resolve_gateway_models_fetches_and_expands_models() {
         ]
     );
     assert_eq!(
-        gateway_res.models[2].display_name.as_deref(),
+        gateway_res.models[1].display_name.as_deref(),
+        Some("Gemini 4 Neon (XHigh)")
+    );
+    assert_eq!(
+        gateway_res.models[5].display_name.as_deref(),
         Some("Gemini 4 Hydrogen (XHigh)")
     );
-    let first_entry = &gateway_res.models[4];
+    let first_entry = &gateway_res.models[8];
     assert_eq!(
         first_entry.display_name.as_deref(),
         Some("Gemini 99 Pro (Medium)")
@@ -776,7 +794,7 @@ async fn test_resolve_gateway_models_fetches_and_expands_models() {
     assert_eq!(first_entry.output_token_limit, Some(32_768));
     assert_eq!(first_entry.thinking, Some(true));
 
-    let image_entry = &gateway_res.models[10];
+    let image_entry = &gateway_res.models[14];
     assert_eq!(image_entry.name, "models/gemini-99-flash-image");
     assert_eq!(image_entry.display_name.as_deref(), Some("Nano Banana 99"));
     assert_eq!(image_entry.input_token_limit, Some(65_536));
