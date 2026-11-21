@@ -473,12 +473,12 @@ pub fn default_gateway_models() -> Vec<GatewayModelEntry> {
 }
 
 /// Queries `GET {upstream}/v1beta/models` and returns the list of active Gemini models
-/// expanded with effort suffixes and upstream metadata (falling back to [`default_gateway_models`]
-/// if the request fails).
-pub async fn resolve_gateway_models(
+/// expanded with effort suffixes and upstream metadata, or `None` if the request fails
+/// or yields no matching core models.
+pub async fn fetch_gateway_models(
     client: &reqwest::Client,
     config: &Config,
-) -> Vec<GatewayModelEntry> {
+) -> Option<Vec<GatewayModelEntry>> {
     let api_key = config.api_key.trim();
     let upstream_base = config.upstream.trim_end_matches('/');
     let mut all_models = Vec::new();
@@ -501,18 +501,18 @@ pub async fn resolve_gateway_models(
             Ok(res) if res.status().is_success() => res,
             Ok(res) => {
                 warn!(
-                    "Failed to fetch models from {} (status {}); falling back to default model list",
+                    "Failed to fetch models from {} (status {}); keeping current model list",
                     url,
                     res.status()
                 );
-                return default_gateway_models();
+                return None;
             }
             Err(err) => {
                 warn!(
-                    "Error fetching models from {}: {}; falling back to default model list",
+                    "Error fetching models from {}: {}; keeping current model list",
                     url, err
                 );
-                return default_gateway_models();
+                return None;
             }
         };
 
@@ -527,23 +527,35 @@ pub async fn resolve_gateway_models(
             }
             Err(err) => {
                 warn!(
-                    "Failed to parse /v1beta/models JSON response: {}; falling back to default model list",
+                    "Failed to parse /v1beta/models JSON response: {}; keeping current model list",
                     err
                 );
-                return default_gateway_models();
+                return None;
             }
         }
     }
 
     let models = filter_core_gemini_models(&all_models);
     if models.is_empty() {
-        warn!("No core Gemini models matched filter; falling back to default model list");
-        default_gateway_models()
+        warn!("No core Gemini models matched filter; keeping current model list");
+        None
     } else {
         let ids: Vec<&str> = models.iter().map(GeminiModelInfo::id).collect();
         info!("Discovered available Gemini models: {}", ids.join(","));
-        expand_gateway_models(&models)
+        Some(expand_gateway_models(&models))
     }
+}
+
+/// Queries `GET {upstream}/v1beta/models` and returns the list of active Gemini models
+/// expanded with effort suffixes and upstream metadata (falling back to [`default_gateway_models`]
+/// if the request fails).
+pub async fn resolve_gateway_models(
+    client: &reqwest::Client,
+    config: &Config,
+) -> Vec<GatewayModelEntry> {
+    fetch_gateway_models(client, config)
+        .await
+        .unwrap_or_else(default_gateway_models)
 }
 
 #[cfg(test)]

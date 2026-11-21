@@ -254,8 +254,11 @@ pub fn parse_models_dev_pricing(json_str: &str) -> Result<PricingTable, String> 
 }
 
 /// Fetches live model pricing from `pricing_url` (usually `https://models.dev/api.json`),
-/// falling back to an empty [`PricingTable`] (zero cost) on network or parse error.
-pub async fn fetch_model_pricing(client: &reqwest::Client, pricing_url: &str) -> PricingTable {
+/// returning `None` on network, HTTP, or parse error, or when no model pricing entries are found.
+pub async fn try_fetch_model_pricing(
+    client: &reqwest::Client,
+    pricing_url: &str,
+) -> Option<PricingTable> {
     match client
         .get(pricing_url)
         .timeout(Duration::from_secs(5))
@@ -264,46 +267,61 @@ pub async fn fetch_model_pricing(client: &reqwest::Client, pricing_url: &str) ->
     {
         Ok(res) if res.status().is_success() => match res.text().await {
             Ok(text) => match parse_models_dev_pricing(&text) {
-                Ok(table) => {
+                Ok(table) if !table.models.is_empty() => {
                     info!(
                         "Loaded live pricing for {} models from {}",
                         table.models.len(),
                         pricing_url
                     );
-                    table
+                    Some(table)
+                }
+                Ok(_) => {
+                    warn!(
+                        "Live pricing payload from {} contained no model entries; keeping current pricing",
+                        pricing_url
+                    );
+                    None
                 }
                 Err(err) => {
                     warn!(
-                        "Failed to parse live pricing from {}: {}; ignoring model pricing",
+                        "Failed to parse live pricing from {}: {}; keeping current pricing",
                         pricing_url, err
                     );
-                    PricingTable::default()
+                    None
                 }
             },
             Err(err) => {
                 warn!(
-                    "Failed to read live pricing response from {}: {}; ignoring model pricing",
+                    "Failed to read live pricing response from {}: {}; keeping current pricing",
                     pricing_url, err
                 );
-                PricingTable::default()
+                None
             }
         },
         Ok(res) => {
             warn!(
-                "Live pricing endpoint {} returned status {}; ignoring model pricing",
+                "Live pricing endpoint {} returned status {}; keeping current pricing",
                 pricing_url,
                 res.status()
             );
-            PricingTable::default()
+            None
         }
         Err(err) => {
             debug!(
-                "Could not fetch live pricing from {}: {}; ignoring model pricing",
+                "Could not fetch live pricing from {}: {}; keeping current pricing",
                 pricing_url, err
             );
-            PricingTable::default()
+            None
         }
     }
+}
+
+/// Fetches live model pricing from `pricing_url` (usually `https://models.dev/api.json`),
+/// falling back to an empty [`PricingTable`] (zero cost) on network or parse error.
+pub async fn fetch_model_pricing(client: &reqwest::Client, pricing_url: &str) -> PricingTable {
+    try_fetch_model_pricing(client, pricing_url)
+        .await
+        .unwrap_or_default()
 }
 
 #[cfg(test)]

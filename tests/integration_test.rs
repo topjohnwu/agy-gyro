@@ -80,10 +80,12 @@ async fn spawn_test_proxy_with_keep_alive(
     )
     .unwrap();
 
+    let pricing_url = format!("{}/pricing.json", config.upstream.trim_end_matches('/'));
     let state = Arc::new(
         ProxyState::new(config, client)
             .with_keep_alive_interval(keep_alive_interval)
-            .with_pricing(pricing),
+            .with_pricing(pricing)
+            .with_pricing_url(pricing_url),
     );
 
     let app = create_router(state);
@@ -1803,8 +1805,12 @@ async fn test_oauth_passthrough_tracks_tokens_and_cost_with_zero_retries_and_no_
     assert_eq!(snap_after_load.total_requests, 0);
 
     let received = mock_server.received_requests().await.unwrap();
-    assert_eq!(received.len(), 1);
-    assert!(!received[0].headers.contains_key("x-goog-api-key"));
+    let load_reqs: Vec<_> = received
+        .iter()
+        .filter(|r| r.url.path() == "/v1internal:loadCodeAssist")
+        .collect();
+    assert_eq!(load_reqs.len(), 1);
+    assert!(!load_reqs[0].headers.contains_key("x-goog-api-key"));
 
     // Send :streamGenerateContent via /s/<session_id>
     let stream_res = client
@@ -1947,4 +1953,466 @@ fn test_oauth_upstream_routing() {
     let state = ProxyState::new(config, client);
     assert!(state.gateway_models().is_empty());
     assert_eq!(resolve_oauth_upstream_base(&state), DEFAULT_OAUTH_UPSTREAM);
+}
+
+#[tokio::test]
+async fn test_new_session_refetches_model_catalog_and_pricing() {
+    use agy_gyro::proxy::{GatewayModelsResponse, RegisterSessionRequest, RegisterSessionResponse};
+    use agy_gyro::tui::fetch_usage_snapshot;
+
+    let mock_server = MockServer::start().await;
+
+    // Fetch #1 (startup): serves gemini-4-argon and initial pricing ($2/1M in, $10/1M out)
+    Mock::given(method("GET"))
+        .and(path("/v1beta/models"))
+        .and(header("x-goog-api-key", "test-key-123"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "application/json")
+                .set_body_json(serde_json::json!({
+                    "models": [
+                        {
+                            "name": "models/gemini-4-argon",
+                            "displayName": "Gemini 4 Argon",
+                            "supportedGenerationMethods": ["generateContent"],
+                            "thinking": true
+                        }
+                    ]
+                })),
+        )
+        .up_to_n_times(1)
+        .expect(1)
+        .mount(&mock_server)
+        .await;
+
+    Mock::given(method("GET"))
+        .and(path("/pricing.json"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "application/json")
+                .set_body_json(serde_json::json!({
+                    "google": {
+                        "models": {
+                            "gemini-4-argon": {
+                                "cost": { "input": 2.0, "output": 10.0, "cache_read": 0.2 }
+                            }
+                        }
+                    }
+                })),
+        )
+        .up_to_n_times(1)
+        .expect(1)
+        .mount(&mock_server)
+        .await;
+
+    // Fetch #2 (new session #1): serves gemini-4-neon + updated pricing ($4/1M in, $20/1M out)
+    Mock::given(method("GET"))
+        .and(path("/v1beta/models"))
+        .and(header("x-goog-api-key", "test-key-123"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "application/json")
+                .set_body_json(serde_json::json!({
+                    "models": [
+                        {
+                            "name": "models/gemini-4-neon",
+                            "displayName": "Gemini 4 Neon",
+                            "supportedGenerationMethods": ["generateContent"],
+                            "thinking": true
+                        }
+                    ]
+                })),
+        )
+        .up_to_n_times(1)
+        .expect(1)
+        .mount(&mock_server)
+        .await;
+
+    Mock::given(method("GET"))
+        .and(path("/pricing.json"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "application/json")
+                .set_body_json(serde_json::json!({
+                    "google": {
+                        "models": {
+                            "gemini-4-argon": {
+                                "cost": { "input": 3.0, "output": 15.0, "cache_read": 0.3 }
+                            },
+                            "gemini-4-neon": {
+                                "cost": { "input": 4.0, "output": 20.0, "cache_read": 0.4 }
+                            }
+                        }
+                    }
+                })),
+        )
+        .up_to_n_times(1)
+        .expect(1)
+        .mount(&mock_server)
+        .await;
+
+    // Fetch #3 (new session #2): upstream returns 503 -> must preserve last good catalog & pricing
+    Mock::given(method("GET"))
+        .and(path("/v1beta/models"))
+        .and(header("x-goog-api-key", "test-key-123"))
+        .respond_with(ResponseTemplate::new(503))
+        .expect(1)
+        .mount(&mock_server)
+        .await;
+
+    Mock::given(method("GET"))
+        .and(path("/pricing.json"))
+        .respond_with(ResponseTemplate::new(503))
+        .expect(1)
+        .mount(&mock_server)
+        .await;
+
+    Mock::given(method("POST"))
+        .and(path("/v1beta/models/gemini-4-argon:generateContent"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "application/json")
+                .set_body_json(serde_json::json!({
+                    "candidates": [{ "content": { "parts": [{ "text": "Argon OK" }] } }],
+                    "usageMetadata": {
+                        "promptTokenCount": 500_000,
+                        "cachedContentTokenCount": 0,
+                        "candidatesTokenCount": 0,
+                        "thoughtsTokenCount": 0,
+                        "totalTokenCount": 500_000
+                    },
+                    "modelVersion": "gemini-4-argon"
+                })),
+        )
+        .expect(2)
+        .mount(&mock_server)
+        .await;
+
+    Mock::given(method("POST"))
+        .and(path("/v1beta/models/gemini-4-neon:generateContent"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "application/json")
+                .set_body_json(serde_json::json!({
+                    "candidates": [{ "content": { "parts": [{ "text": "Neon OK" }] } }],
+                    "usageMetadata": {
+                        "promptTokenCount": 500_000,
+                        "cachedContentTokenCount": 0,
+                        "candidatesTokenCount": 50_000,
+                        "thoughtsTokenCount": 0,
+                        "totalTokenCount": 550_000
+                    },
+                    "modelVersion": "gemini-4-neon"
+                })),
+        )
+        .expect(2)
+        .mount(&mock_server)
+        .await;
+
+    let config = Config {
+        host: "127.0.0.1".to_string(),
+        port: 0,
+        upstream: mock_server.uri(),
+        max_retries: 1,
+        initial_delay_ms: 10,
+        max_delay_ms: 100,
+        no_jitter: true,
+        no_buffer: false,
+        request_timeout_secs: 10,
+        api_key: "test-key-123".to_string(),
+        ..Config::default()
+    };
+    let client = build_http_client(&config).unwrap();
+    let state = Arc::new(
+        ProxyState::new(config, client.clone())
+            .with_pricing_url(format!("{}/pricing.json", mock_server.uri())),
+    );
+    state.refresh_catalog_and_pricing().await;
+
+    let app = create_router(state);
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let proxy_url = format!("http://{}", listener.local_addr().unwrap());
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+
+    // Initially, /v1beta/models serves Fetch #1 (gemini-4-argon) and pricing is $2/1M input
+    let initial_models: GatewayModelsResponse = client
+        .get(format!("{}/v1beta/models", proxy_url))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let initial_ids: Vec<&str> = initial_models.models.iter().map(|m| m.id()).collect();
+    assert_eq!(
+        initial_ids,
+        vec![
+            "gemini-4-argon-medium",
+            "gemini-4-argon-high",
+            "gemini-4-argon-low",
+        ]
+    );
+
+    let initial_argon = client
+        .post(format!(
+            "{}/v1beta/models/gemini-4-argon:generateContent",
+            proxy_url
+        ))
+        .body(r#"{"contents":[]}"#)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(initial_argon.status(), 200);
+    let snap0 = fetch_usage_snapshot(&client, &format!("{}/usage", proxy_url))
+        .await
+        .unwrap();
+    assert_eq!(
+        snap0.models["gemini-4-argon"]
+            .pricing
+            .as_ref()
+            .unwrap()
+            .input_per_1m,
+        2.0
+    );
+    assert!((snap0.totals.total_cost_usd - 1.0).abs() < 1e-9);
+
+    // Connect new session #1 -> triggers Fetch #2 (gemini-4-neon + updated pricing)
+    let reg1: RegisterSessionResponse = client
+        .post(format!("{}/sessions", proxy_url))
+        .json(&RegisterSessionRequest {
+            pid: Some(std::process::id()),
+            label: "session-one".to_string(),
+        })
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+
+    // Idempotent re-registration of the same active PID must NOT trigger another refetch
+    let reg1_dup: RegisterSessionResponse = client
+        .post(format!("{}/sessions", proxy_url))
+        .json(&RegisterSessionRequest {
+            pid: Some(std::process::id()),
+            label: "session-one".to_string(),
+        })
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(reg1_dup.session_id, reg1.session_id);
+
+    let refreshed_models: GatewayModelsResponse = client
+        .get(format!("{}/v1beta/models", proxy_url))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let refreshed_ids: Vec<&str> = refreshed_models.models.iter().map(|m| m.id()).collect();
+    assert_eq!(
+        refreshed_ids,
+        vec![
+            "gemini-4-neon-high",
+            "gemini-4-neon-xhigh",
+            "gemini-4-neon-medium",
+            "gemini-4-neon-low",
+        ]
+    );
+
+    // Existing model (gemini-4-argon) picks up refreshed pricing ($3/1M in -> +$1.50) and updates stored metadata
+    let refreshed_argon = client
+        .post(format!(
+            "{}/v1beta/models/gemini-4-argon:generateContent",
+            proxy_url
+        ))
+        .header("Authorization", format!("Bearer {}", reg1.api_key))
+        .body(r#"{"contents":[]}"#)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(refreshed_argon.status(), 200);
+
+    // Generation request on session #1 uses newly refetched pricing:
+    // 500k input * $4/1M = $2.00 + 50k output * $20/1M = $1.00 -> +$3.00 (cumulative = $1.00 + $1.50 + $3.00 = $5.50)
+    let gen1 = client
+        .post(format!(
+            "{}/v1beta/models/gemini-4-neon-xhigh:generateContent",
+            proxy_url
+        ))
+        .header("Authorization", format!("Bearer {}", reg1.api_key))
+        .body(r#"{"contents":[]}"#)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(gen1.status(), 200);
+
+    let snap1 = fetch_usage_snapshot(&client, &format!("{}/usage", proxy_url))
+        .await
+        .unwrap();
+    assert_eq!(snap1.pricing_source, "models.dev (live)");
+    assert_eq!(
+        snap1.models["gemini-4-argon"]
+            .pricing
+            .as_ref()
+            .unwrap()
+            .input_per_1m,
+        3.0
+    );
+    assert!((snap1.totals.total_cost_usd - 5.5).abs() < 1e-9);
+
+    // Connect new session #2 -> Fetch #3 returns 503, so last known catalog & pricing must be preserved
+    let reg2: RegisterSessionResponse = client
+        .post(format!("{}/sessions", proxy_url))
+        .json(&RegisterSessionRequest {
+            pid: None,
+            label: "session-two".to_string(),
+        })
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_ne!(reg2.session_id, reg1.session_id);
+
+    let preserved_models: GatewayModelsResponse = client
+        .get(format!("{}/v1beta/models", proxy_url))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let preserved_ids: Vec<&str> = preserved_models.models.iter().map(|m| m.id()).collect();
+    assert_eq!(preserved_ids, refreshed_ids);
+
+    let gen2 = client
+        .post(format!(
+            "{}/v1beta/models/gemini-4-neon-high:generateContent",
+            proxy_url
+        ))
+        .header("Authorization", format!("Bearer {}", reg2.api_key))
+        .body(r#"{"contents":[]}"#)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(gen2.status(), 200);
+
+    let snap2 = fetch_usage_snapshot(&client, &format!("{}/usage", proxy_url))
+        .await
+        .unwrap();
+    assert!((snap2.totals.total_cost_usd - 8.5).abs() < 1e-9);
+}
+
+#[tokio::test]
+async fn test_new_session_in_oauth_mode_refetches_pricing_only() {
+    use agy_gyro::proxy::{RegisterSessionRequest, RegisterSessionResponse};
+    use agy_gyro::tui::fetch_usage_snapshot;
+
+    let mock_server = MockServer::start().await;
+
+    // OAuth-only daemon (no api_key) must NOT query /v1beta/models, only pricing_url
+    Mock::given(method("GET"))
+        .and(path("/pricing.json"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "application/json")
+                .set_body_json(serde_json::json!({
+                    "anthropic": {
+                        "models": {
+                            "claude-sonnet-4-5": {
+                                "cost": { "input": 5.0, "output": 25.0, "cache_read": 0.5 }
+                            }
+                        }
+                    }
+                })),
+        )
+        .expect(1)
+        .mount(&mock_server)
+        .await;
+
+    Mock::given(method("POST"))
+        .and(path("/v1internal:generateContent"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "application/json")
+                .set_body_json(serde_json::json!({
+                    "response": {
+                        "candidates": [{ "content": { "parts": [{ "text": "OAuth OK" }] } }],
+                        "usageMetadata": {
+                            "promptTokenCount": 100_000,
+                            "cachedContentTokenCount": 0,
+                            "candidatesTokenCount": 20_000,
+                            "thoughtsTokenCount": 0,
+                            "totalTokenCount": 120_000
+                        },
+                        "modelVersion": "claude-sonnet-4-5"
+                    }
+                })),
+        )
+        .expect(1)
+        .mount(&mock_server)
+        .await;
+
+    let config = Config {
+        host: "127.0.0.1".to_string(),
+        port: 0,
+        upstream: mock_server.uri(),
+        api_key: String::new(),
+        ..Config::default()
+    };
+    let client = build_http_client(&config).unwrap();
+    let state = Arc::new(
+        ProxyState::new(config, client.clone())
+            .with_pricing_url(format!("{}/pricing.json", mock_server.uri())),
+    );
+    let app = create_router(state);
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let proxy_url = format!("http://{}", listener.local_addr().unwrap());
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+
+    let reg: RegisterSessionResponse = client
+        .post(format!("{}/sessions", proxy_url))
+        .json(&RegisterSessionRequest {
+            pid: None,
+            label: "oauth-session".to_string(),
+        })
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(!reg.gateway_enabled);
+
+    let res = client
+        .post(format!(
+            "{}/s/{}/v1internal:generateContent",
+            proxy_url, reg.session_id
+        ))
+        .header("Authorization", "Bearer test-oauth-token")
+        .body(r#"{"model":"models/claude-sonnet-4-5","request":{"contents":[]}}"#)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 200);
+
+    // 100k input * $5/1M = $0.50 + 20k output * $25/1M = $0.50 -> $1.00
+    let snap = fetch_usage_snapshot(&client, &format!("{}/usage", proxy_url))
+        .await
+        .unwrap();
+    assert_eq!(snap.pricing_source, "models.dev (live)");
+    assert!((snap.totals.total_cost_usd - 1.0).abs() < 1e-9);
+
+    let received = mock_server.received_requests().await.unwrap();
+    assert!(received.iter().all(|r| r.url.path() != "/v1beta/models"));
 }

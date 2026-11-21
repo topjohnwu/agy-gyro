@@ -3,7 +3,7 @@
 pub use crate::models::{extract_model_from_path, normalize_model_id, strip_effort_suffix};
 pub use crate::pricing::{
     CostBreakdown, DEFAULT_PRICING_URL, ModelPricing, PricingTable, fetch_model_pricing,
-    parse_models_dev_pricing,
+    parse_models_dev_pricing, try_fetch_model_pricing,
 };
 pub use crate::session::{
     SessionMeta, extract_session_from_headers, format_session_api_key, generate_session_uuid,
@@ -373,7 +373,7 @@ impl ScopeUsageStats {
                 totals: TokenUsageTotals::default(),
                 pricing: pricing.clone(),
             });
-        if model_entry.pricing.is_none() && pricing.is_some() {
+        if pricing.is_some() {
             model_entry.pricing = pricing;
         }
         model_entry.totals.record(usage, cost, retries);
@@ -677,29 +677,42 @@ impl UsageTracker {
     /// If an active session with the same positive `pid` is already registered, returns
     /// that existing session's metadata (idempotent per active OS process).
     pub fn register_session(&self, pid: Option<u32>, label: &str) -> SessionMeta {
+        self.register_session_with_status(pid, label).0
+    }
+
+    /// Registers a new `agy` wrapper session and returns `(meta, is_new)`, where `is_new` is
+    /// `true` when a new session was created and `false` when an active session with the same
+    /// positive `pid` was reused.
+    pub fn register_session_with_status(
+        &self,
+        pid: Option<u32>,
+        label: &str,
+    ) -> (SessionMeta, bool) {
         let clean_label = sanitize_session_label(label);
         let track_pid_liveness = pid.is_some_and(is_pid_alive);
 
-        if let Ok(mut inner) = self.inner.write()
-            && let Some(p) = pid.filter(|&p| p > 0)
-            && let Some(existing) = inner
-                .sessions
-                .values_mut()
-                .find(|e| e.stats.active && e.stats.pid == Some(p))
-        {
-            existing.stats.label = clean_label.clone();
-            existing.track_pid_liveness = track_pid_liveness;
-            return SessionMeta {
-                id: existing.stats.id.clone(),
-                label: clean_label,
-                pid,
-            };
-        }
+        let id = {
+            let mut inner = self.inner.write().unwrap_or_else(|e| e.into_inner());
+            if let Some(p) = pid.filter(|&p| p > 0)
+                && let Some(existing) = inner
+                    .sessions
+                    .values_mut()
+                    .find(|e| e.stats.active && e.stats.pid == Some(p))
+            {
+                existing.stats.label = clean_label.clone();
+                existing.track_pid_liveness = track_pid_liveness;
+                return (
+                    SessionMeta {
+                        id: existing.stats.id.clone(),
+                        label: clean_label,
+                        pid,
+                    },
+                    false,
+                );
+            }
 
-        let id = generate_session_uuid();
-        let seq = self.next_session_seq.fetch_add(1, Ordering::Relaxed);
-
-        if let Ok(mut inner) = self.inner.write() {
+            let id = generate_session_uuid();
+            let seq = self.next_session_seq.fetch_add(1, Ordering::Relaxed);
             inner.sessions.insert(
                 id.clone(),
                 SessionEntry {
@@ -714,7 +727,8 @@ impl UsageTracker {
                     track_pid_liveness,
                 },
             );
-        }
+            id
+        };
 
         info!(
             session_id = %id,
@@ -725,11 +739,14 @@ impl UsageTracker {
         );
         self.notify_usage_change();
 
-        SessionMeta {
-            id,
-            label: clean_label,
-            pid,
-        }
+        (
+            SessionMeta {
+                id,
+                label: clean_label,
+                pid,
+            },
+            true,
+        )
     }
 
     /// Looks up the [`SessionMeta`] for a registered `session_id` (e.g. from a `/s/<session_id>`

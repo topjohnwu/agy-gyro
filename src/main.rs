@@ -4,7 +4,7 @@ use agy_gyro::config::{Cli, Commands, Config};
 use agy_gyro::proxy::{ProxyState, create_router};
 use agy_gyro::runner::{run_wrapper, start_daemon, stop_daemon};
 use agy_gyro::tui::run_monitor;
-use agy_gyro::usage::{DEFAULT_PRICING_URL, UsageLogLayer, fetch_model_pricing};
+use agy_gyro::usage::UsageLogLayer;
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
@@ -87,7 +87,7 @@ async fn run_server(config: Config) -> Result<(), Box<dyn std::error::Error>> {
     let bound_addr = listener.local_addr()?;
 
     let client = agy_gyro::proxy::build_http_client(&config)?;
-    let state = Arc::new(ProxyState::new(config.clone(), client.clone()));
+    let state = Arc::new(ProxyState::new(config.clone(), client));
 
     if config.has_api_key() {
         info!("Starting agy-gyro local Antigravity Enterprise Gateway server");
@@ -99,20 +99,12 @@ async fn run_server(config: Config) -> Result<(), Box<dyn std::error::Error>> {
             config.max_delay_ms,
             config.is_jitter_enabled()
         );
-
-        let (gateway_models, pricing) = tokio::join!(
-            agy_gyro::proxy::resolve_gateway_models(&client, &config),
-            fetch_model_pricing(&client, DEFAULT_PRICING_URL)
-        );
-        state.set_gateway_models(gateway_models);
-        state.usage.set_pricing(pricing);
     } else {
         info!(
             "Starting agy-gyro server in OAuth passthrough mode (token and price tracking only; retries and buffering disabled)"
         );
-        let pricing = fetch_model_pricing(&client, DEFAULT_PRICING_URL).await;
-        state.usage.set_pricing(pricing);
     }
+    state.spawn_refresh_catalog_and_pricing();
 
     let shutdown_rx = state.subscribe_shutdown();
     let app = create_router(state.clone());

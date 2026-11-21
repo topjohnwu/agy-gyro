@@ -4,8 +4,8 @@ use crate::config::Config;
 pub use crate::models::{
     DEFAULT_GATEWAY_MODELS, GatewayModelEntry, GatewayModelsResponse, GeminiModelInfo,
     GeminiModelsResponse, MODEL_EFFORT_LEVELS, NON_CORE_KEYWORDS, default_gateway_models,
-    expand_gateway_models, extract_model_from_request, filter_core_gemini_models,
-    inject_thinking_level_if_missing, resolve_gateway_models,
+    expand_gateway_models, extract_model_from_request, fetch_gateway_models,
+    filter_core_gemini_models, inject_thinking_level_if_missing, resolve_gateway_models,
     rewrite_request_path_and_extract_effort,
 };
 use crate::retry::{
@@ -13,10 +13,10 @@ use crate::retry::{
     parse_retry_after,
 };
 use crate::usage::{
-    ActiveRequestGuard, PricingTable, RawUsageMetadata, SessionMeta, StreamUsageExtractor,
-    UsageLogLayer, UsageSnapshot, UsageTracker, extract_model_from_path,
+    ActiveRequestGuard, DEFAULT_PRICING_URL, PricingTable, RawUsageMetadata, SessionMeta,
+    StreamUsageExtractor, UsageLogLayer, UsageSnapshot, UsageTracker, extract_model_from_path,
     extract_session_from_headers, extract_usage_from_chunks, format_session_api_key,
-    strip_session_prefix,
+    strip_session_prefix, try_fetch_model_pricing,
 };
 use axum::{
     Json, Router,
@@ -31,7 +31,7 @@ use axum::{
 };
 use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 use tracing::{Instrument, debug, error, info, info_span, warn};
 
@@ -46,10 +46,30 @@ pub struct ProxyState {
     pub config: Config,
     pub client: reqwest::Client,
     pub upstream_base: String,
+    pub pricing_url: String,
     pub keep_alive_interval: Duration,
     pub usage: Arc<UsageTracker>,
     pub gateway_models: RwLock<Vec<GatewayModelEntry>>,
+    refresh_in_flight: Mutex<Option<tokio::sync::watch::Receiver<bool>>>,
     shutdown_tx: tokio::sync::watch::Sender<bool>,
+}
+
+struct RefreshInFlightGuard {
+    state: Arc<ProxyState>,
+    tx: tokio::sync::watch::Sender<bool>,
+}
+
+impl Drop for RefreshInFlightGuard {
+    fn drop(&mut self) {
+        let mut guard = self
+            .state
+            .refresh_in_flight
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        *guard = None;
+        drop(guard);
+        let _ = self.tx.send(true);
+    }
 }
 
 impl ProxyState {
@@ -75,9 +95,11 @@ impl ProxyState {
             config,
             client,
             upstream_base,
+            pricing_url: DEFAULT_PRICING_URL.to_string(),
             keep_alive_interval: DEFAULT_KEEP_ALIVE_INTERVAL,
             usage,
             gateway_models: RwLock::new(default_models),
+            refresh_in_flight: Mutex::new(None),
             shutdown_tx,
         }
     }
@@ -92,6 +114,11 @@ impl ProxyState {
         self
     }
 
+    pub fn with_pricing_url(mut self, pricing_url: impl Into<String>) -> Self {
+        self.pricing_url = pricing_url.into();
+        self
+    }
+
     pub fn set_gateway_models(&self, models: Vec<GatewayModelEntry>) {
         if let Ok(mut guard) = self.gateway_models.write() {
             *guard = models;
@@ -103,6 +130,72 @@ impl ProxyState {
             .read()
             .map(|g| g.clone())
             .unwrap_or_default()
+    }
+
+    async fn perform_catalog_and_pricing_refresh(&self) {
+        if self.config.has_api_key() {
+            let (models_opt, pricing_opt) = tokio::join!(
+                fetch_gateway_models(&self.client, &self.config),
+                try_fetch_model_pricing(&self.client, &self.pricing_url),
+            );
+            if let Some(models) = models_opt {
+                self.set_gateway_models(models);
+            }
+            if let Some(pricing) = pricing_opt {
+                self.usage.set_pricing(pricing);
+            }
+        } else if let Some(pricing) = try_fetch_model_pricing(&self.client, &self.pricing_url).await
+        {
+            self.usage.set_pricing(pricing);
+        }
+    }
+
+    fn start_or_join_refresh(self: &Arc<Self>) -> tokio::sync::watch::Receiver<bool> {
+        let mut guard = self
+            .refresh_in_flight
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if let Some(existing_rx) = guard.as_ref() {
+            return existing_rx.clone();
+        }
+
+        let (tx, rx) = tokio::sync::watch::channel(false);
+        *guard = Some(rx.clone());
+        let state = Arc::clone(self);
+        tokio::spawn(async move {
+            let _guard = RefreshInFlightGuard {
+                state: Arc::clone(&state),
+                tx,
+            };
+            state.perform_catalog_and_pricing_refresh().await;
+        });
+        rx
+    }
+
+    /// Starts a background refresh of the model catalog and live pricing table if one is not
+    /// already in flight.
+    pub fn spawn_refresh_catalog_and_pricing(self: &Arc<Self>) {
+        let _ = self.start_or_join_refresh();
+    }
+
+    /// Refreshes the upstream model catalog (when an API key is configured) and live pricing table.
+    /// If a refresh is already in flight, awaits that in-flight refresh instead of issuing
+    /// duplicate concurrent upstream requests.
+    pub async fn refresh_catalog_and_pricing(self: &Arc<Self>) {
+        let mut rx = self.start_or_join_refresh();
+        let _ = rx.wait_for(|&done| done).await;
+    }
+
+    /// Awaits any currently in-flight model catalog and pricing refresh without starting a new one.
+    pub async fn wait_for_in_flight_refresh(&self) {
+        let maybe_rx = self
+            .refresh_in_flight
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        if let Some(mut rx) = maybe_rx {
+            let _ = rx.wait_for(|&done| done).await;
+        }
     }
 
     pub fn subscribe_shutdown(&self) -> tokio::sync::watch::Receiver<bool> {
@@ -212,6 +305,7 @@ pub struct DaemonStatusResponse {
 }
 
 async fn daemon_status_handler(State(state): State<Arc<ProxyState>>) -> Json<DaemonStatusResponse> {
+    state.wait_for_in_flight_refresh().await;
     let gateway_models = state
         .gateway_models()
         .into_iter()
@@ -224,6 +318,7 @@ async fn daemon_status_handler(State(state): State<Arc<ProxyState>>) -> Json<Dae
 }
 
 async fn models_handler(State(state): State<Arc<ProxyState>>) -> Json<GatewayModelsResponse> {
+    state.wait_for_in_flight_refresh().await;
     Json(GatewayModelsResponse {
         models: state.gateway_models(),
         next_page_token: None,
@@ -234,7 +329,14 @@ async fn register_session_handler(
     State(state): State<Arc<ProxyState>>,
     Json(req): Json<RegisterSessionRequest>,
 ) -> Json<RegisterSessionResponse> {
-    let meta = state.usage.register_session(req.pid, &req.label);
+    let (meta, is_new) = state
+        .usage
+        .register_session_with_status(req.pid, &req.label);
+    if is_new {
+        state.refresh_catalog_and_pricing().await;
+    } else {
+        state.wait_for_in_flight_refresh().await;
+    }
     let api_key = format_session_api_key(&meta.id, meta.pid, &meta.label);
     Json(RegisterSessionResponse {
         session_id: meta.id,
