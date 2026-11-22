@@ -16,18 +16,18 @@ use crate::usage::{
     ActiveRequestGuard, DEFAULT_PRICING_URL, LogStreamCursor, PricingTable, RawUsageMetadata,
     SessionMeta, StreamUsageExtractor, UsageLogLayer, UsageSnapshot, UsageTracker,
     extract_model_from_path, extract_session_from_headers, extract_usage_from_chunks,
-    format_session_api_key, try_fetch_model_pricing,
+    try_fetch_model_pricing,
 };
 use axum::{
     Json, Router,
     body::{Body, Bytes},
-    extract::{DefaultBodyLimit, OriginalUri, Path, Query, State},
+    extract::{DefaultBodyLimit, OriginalUri, Query, State},
     http::{HeaderMap, HeaderName, Method, StatusCode},
     response::{
         IntoResponse, Response,
         sse::{Event, Sse},
     },
-    routing::{any, delete, get, post},
+    routing::{any, get, post},
 };
 use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
@@ -311,18 +311,18 @@ async fn toggle_buffer_handler(
     Ok(Json(state.usage.snapshot()))
 }
 
-/// Request payload for `POST /sessions` when a wrapper registers an `agy` instance.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct RegisterSessionRequest {
-    pub pid: Option<u32>,
-    pub label: String,
+/// Optional query parameters for `GET /sessions`.
+#[derive(Debug, Default, Deserialize)]
+struct DaemonStatusQuery {
+    refresh: Option<String>,
 }
 
-/// Response payload from `POST /sessions`.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct RegisterSessionResponse {
-    pub session_id: String,
-    pub api_key: String,
+impl DaemonStatusQuery {
+    fn should_refresh(&self) -> bool {
+        self.refresh
+            .as_deref()
+            .is_some_and(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes"))
+    }
 }
 
 /// Response payload from `GET /sessions` for checking daemon liveness, build ID, and active model list.
@@ -334,8 +334,15 @@ pub struct DaemonStatusResponse {
     pub gateway_models: Vec<String>,
 }
 
-async fn daemon_status_handler(State(state): State<Arc<ProxyState>>) -> Json<DaemonStatusResponse> {
-    state.wait_for_in_flight_refresh().await;
+async fn daemon_status_handler(
+    State(state): State<Arc<ProxyState>>,
+    Query(query): Query<DaemonStatusQuery>,
+) -> Json<DaemonStatusResponse> {
+    if query.should_refresh() {
+        state.refresh_catalog_and_pricing().await;
+    } else {
+        state.wait_for_in_flight_refresh().await;
+    }
     let gateway_models = state
         .gateway_models()
         .into_iter()
@@ -354,33 +361,6 @@ async fn models_handler(State(state): State<Arc<ProxyState>>) -> Json<GatewayMod
         models: state.gateway_models(),
         next_page_token: None,
     })
-}
-
-async fn register_session_handler(
-    State(state): State<Arc<ProxyState>>,
-    Json(req): Json<RegisterSessionRequest>,
-) -> Json<RegisterSessionResponse> {
-    let (meta, is_new) = state
-        .usage
-        .register_session_with_status(req.pid, &req.label);
-    if is_new {
-        state.refresh_catalog_and_pricing().await;
-    } else {
-        state.wait_for_in_flight_refresh().await;
-    }
-    let api_key = format_session_api_key(&meta.id, meta.pid, &meta.label);
-    Json(RegisterSessionResponse {
-        session_id: meta.id,
-        api_key,
-    })
-}
-
-async fn remove_session_handler(
-    State(state): State<Arc<ProxyState>>,
-    Path(id): Path<String>,
-) -> StatusCode {
-    state.usage.remove_session(&id);
-    StatusCode::NO_CONTENT
 }
 
 /// Response payload from `POST /shutdown`.
@@ -451,11 +431,7 @@ pub fn create_router(state: Arc<ProxyState>) -> Router {
         .route("/usage", get(usage_handler).delete(reset_usage_handler))
         .route("/buffer", post(toggle_buffer_handler))
         .route("/logs", get(logs_handler))
-        .route(
-            "/sessions",
-            get(daemon_status_handler).post(register_session_handler),
-        )
-        .route("/sessions/{id}", delete(remove_session_handler))
+        .route("/sessions", get(daemon_status_handler))
         .route("/shutdown", post(shutdown_handler))
         .route("/v1beta/models", get(models_handler))
         .route("/", any(proxy_handler))

@@ -8,6 +8,7 @@ pub fn short_build_id(id: &str) -> &str {
     &id[..id.len().min(8)]
 }
 
+pub mod app;
 pub mod config;
 pub mod models;
 pub mod pricing;

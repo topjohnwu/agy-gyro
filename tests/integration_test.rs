@@ -593,14 +593,12 @@ async fn test_run_wrapper_executes_child_and_propagates_exit_code() {
     let _ = std::fs::remove_dir_all(&temp_home);
     assert_eq!(status.code(), Some(42));
 
-    // OS-level process monitor detects that the replaced `sh` process ($$) has exited
+    // Lazy session mechanism: child exited without sending any LLM request, so no stale session is created
     let client = Client::new();
     let snap = fetch_usage_snapshot(&client, &format!("{}/usage", proxy_url))
         .await
         .unwrap();
-    assert_eq!(snap.sessions.len(), 1);
-    assert_eq!(snap.sessions[0].id.len(), 36);
-    assert!(!snap.sessions[0].active);
+    assert!(snap.sessions.is_empty());
 }
 
 #[tokio::test]
@@ -905,9 +903,10 @@ fn test_cli_parse_toml_config() {
     let temp_path = std::env::temp_dir().join(format!("agy-gyro-test-{}.toml", std::process::id()));
     let _ = std::fs::remove_file(&temp_path);
 
-    // Missing config file and missing API key returns an error for wrapper and server commands
+    // Missing config file and missing API key returns an error for wrapper, app, and server commands
     assert!(Cli::try_parse_with_config_from(["agy-gyro"], Some(&temp_path)).is_err());
     assert!(Cli::try_parse_with_config_from(["agy-gyro", "server"], Some(&temp_path)).is_err());
+    assert!(Cli::try_parse_with_config_from(["agy-gyro", "app"], Some(&temp_path)).is_err());
 
     // Create temporary agy-gyro.toml
     std::fs::write(
@@ -917,6 +916,7 @@ host = "192.168.1.10"
 port = 7070
 api_key = "toml-gemini-key"
 agy_path = "/toml/agy"
+app_path = "/Applications/CustomAntigravity.app"
 log_file = "/tmp/toml.log"
 max_retries = 25
 initial_delay_ms = 500
@@ -940,6 +940,10 @@ request_timeout_secs = 120
     assert_eq!(cli.config.api_key, "toml-gemini-key");
     assert_eq!(cli.config.agy_path, "/toml/agy");
     assert_eq!(
+        cli.config.app_path.as_deref(),
+        Some("/Applications/CustomAntigravity.app")
+    );
+    assert_eq!(
         cli.config.log_file.as_deref().unwrap().to_str().unwrap(),
         "/tmp/toml.log"
     );
@@ -959,12 +963,36 @@ request_timeout_secs = 120
     assert_eq!(cli_server.config.port, 7070);
     assert_eq!(cli_server.config.max_retries, 25);
 
+    // 2b. App subcommand parsing & passthrough (with and without leading `--`)
+    let cli_app = Cli::try_parse_with_config_from(
+        ["agy-gyro", "app", "--headless", "--ssh-host=dev"],
+        Some(&temp_path),
+    )
+    .unwrap();
+    assert_eq!(
+        cli_app.command,
+        Commands::App(vec!["--headless".to_string(), "--ssh-host=dev".to_string()])
+    );
+    assert_eq!(
+        cli_app.config.app_path.as_deref(),
+        Some("/Applications/CustomAntigravity.app")
+    );
+
+    let cli_app_sep =
+        Cli::try_parse_with_config_from(["agy-gyro", "app", "--", "--headless"], Some(&temp_path))
+            .unwrap();
+    assert_eq!(
+        cli_app_sep.command,
+        Commands::App(vec!["--headless".to_string()])
+    );
+
     // 3. Precedence: Environment variables override TOML for wrapper/network settings,
     // but daemon-only settings cannot be overridden via environment variables.
     unsafe {
         std::env::set_var("AGY_GYRO_MAX_RETRIES", "42");
         std::env::set_var("AGY_GYRO_HOST", "10.0.0.1");
         std::env::set_var("AGY_GYRO_AGY_PATH", "/custom/agy");
+        std::env::set_var("AGY_GYRO_APP_PATH", "/custom/Antigravity.app");
         std::env::set_var("AGY_GYRO_BUFFER", "false");
         std::env::set_var("GEMINI_API_KEY", "env-gemini-key-123");
     }
@@ -974,6 +1002,10 @@ request_timeout_secs = 120
 
     assert_eq!(cli_env.config.host, "10.0.0.1");
     assert_eq!(cli_env.config.agy_path, "/custom/agy");
+    assert_eq!(
+        cli_env.config.app_path.as_deref(),
+        Some("/custom/Antigravity.app")
+    );
     assert_eq!(cli_env.config.api_key, "env-gemini-key-123");
     // Daemon-only settings remain as configured in TOML (not overridden by env)
     assert_eq!(cli_env.config.max_retries, 25);
@@ -1483,8 +1515,8 @@ fn test_cli_parse_monitor_subcommand_without_api_key() {
 
 #[tokio::test]
 async fn test_multi_session_registration_attribution_and_exit() {
-    use agy_gyro::proxy::{RegisterSessionRequest, RegisterSessionResponse};
     use agy_gyro::tui::{fetch_usage_snapshot, reset_remote_session_usage};
+    use agy_gyro::usage::{format_session_api_key, generate_session_uuid};
 
     let mock_server = MockServer::start().await;
 
@@ -1519,57 +1551,26 @@ async fn test_multi_session_registration_attribution_and_exit() {
         .unwrap();
     let session2_pid = dummy_proc.id().expect("dummy process pid");
 
-    // Register Session 1 (current test process PID, stays alive) and Session 2 (dummy process PID)
-    let reg1: RegisterSessionResponse = client
-        .post(format!("{}/sessions", proxy_url))
-        .json(&RegisterSessionRequest {
-            pid: Some(std::process::id()),
-            label: "workspace-one".to_string(),
-        })
-        .send()
-        .await
-        .unwrap()
-        .json()
-        .await
-        .unwrap();
-    assert_eq!(reg1.session_id.len(), 36);
+    // Mint lazy session tokens locally (Session 1 = current test PID, Session 2 = dummy PID)
+    let session1_id = generate_session_uuid();
+    let session2_id = generate_session_uuid();
+    assert_eq!(session1_id.len(), 36);
+    assert_eq!(session2_id.len(), 36);
+    assert_ne!(session1_id, session2_id);
 
-    // Re-registering with the same active PID is idempotent and returns session 1's UUID
-    let reg1_dup: RegisterSessionResponse = client
-        .post(format!("{}/sessions", proxy_url))
-        .json(&RegisterSessionRequest {
-            pid: Some(std::process::id()),
-            label: "workspace-one".to_string(),
-        })
-        .send()
-        .await
-        .unwrap()
-        .json()
-        .await
-        .unwrap();
-    assert_eq!(reg1_dup.session_id, reg1.session_id);
-
-    let reg2: RegisterSessionResponse = client
-        .post(format!("{}/sessions", proxy_url))
-        .json(&RegisterSessionRequest {
-            pid: Some(session2_pid),
-            label: "workspace-two".to_string(),
-        })
-        .send()
-        .await
-        .unwrap()
-        .json()
-        .await
-        .unwrap();
-    assert_eq!(reg2.session_id.len(), 36);
-    assert_ne!(reg2.session_id, reg1.session_id);
+    let api_key1 = format_session_api_key(&session1_id, Some(std::process::id()), "workspace-one");
+    let api_key2 = format_session_api_key(&session2_id, Some(session2_pid), "workspace-two");
     assert_eq!(
-        reg2.api_key,
-        format!("gyro:{}:{}:workspace-two", reg2.session_id, session2_pid)
+        api_key2,
+        format!("gyro:{}:{}:workspace-two", session2_id, session2_pid)
     );
 
-    // Send 1 request for each session
-    for api_key in [&reg1.api_key, &reg2.api_key] {
+    let usage_url = format!("{}/usage", proxy_url);
+    let snap_before = fetch_usage_snapshot(&client, &usage_url).await.unwrap();
+    assert!(snap_before.sessions.is_empty());
+
+    // Send 1 request for each session (lazily creates both sessions with OS PID tracking)
+    for api_key in [&api_key1, &api_key2] {
         let res = client
             .post(format!(
                 "{}/v1beta/models/gemini-4-argon:generateContent",
@@ -1587,40 +1588,36 @@ async fn test_multi_session_registration_attribution_and_exit() {
     dummy_proc.kill().await.unwrap();
     let _ = dummy_proc.wait().await;
 
-    let usage_url = format!("{}/usage", proxy_url);
     let snap = fetch_usage_snapshot(&client, &usage_url).await.unwrap();
     assert_eq!(snap.total_requests, 2);
     assert_eq!(snap.totals.input_tokens, 100_000);
     assert_eq!(snap.sessions.len(), 2);
-    assert_eq!(snap.sessions[0].id, reg1.session_id);
+    assert_eq!(snap.sessions[0].id, session1_id);
     assert_eq!(snap.sessions[0].label, "workspace-one");
     assert!(snap.sessions[0].active);
     assert_eq!(snap.sessions[0].totals.input_tokens, 50_000);
 
-    assert_eq!(snap.sessions[1].id, reg2.session_id);
+    assert_eq!(snap.sessions[1].id, session2_id);
     assert_eq!(snap.sessions[1].label, "workspace-two");
     assert!(!snap.sessions[1].active);
     assert_eq!(snap.sessions[1].totals.input_tokens, 50_000);
 
     // Selectively resetting exited session 2 removes it and subtracts its tokens from global totals
-    let snap_after = reset_remote_session_usage(&client, &usage_url, Some(&reg2.session_id))
+    let snap_after = reset_remote_session_usage(&client, &usage_url, Some(&session2_id))
         .await
         .unwrap();
     assert_eq!(snap_after.sessions.len(), 1);
-    assert_eq!(snap_after.sessions[0].id, reg1.session_id);
+    assert_eq!(snap_after.sessions[0].id, session1_id);
     assert_eq!(snap_after.total_requests, 1);
     assert_eq!(snap_after.totals.input_tokens, 50_000);
 
-    // Unconditionally removing session 1 via DELETE /sessions/<id> removes it even while active
-    let del_res = client
-        .delete(format!("{}/sessions/{}", proxy_url, reg1.session_id))
-        .send()
+    // Selectively resetting active session 1 zeroes its counters while keeping the active tab
+    let snap_zeroed = reset_remote_session_usage(&client, &usage_url, Some(&session1_id))
         .await
         .unwrap();
-    assert_eq!(del_res.status(), 204);
-    let snap_empty = fetch_usage_snapshot(&client, &usage_url).await.unwrap();
-    assert!(snap_empty.sessions.is_empty());
-    assert_eq!(snap_empty.total_requests, 0);
+    assert_eq!(snap_zeroed.sessions.len(), 1);
+    assert!(snap_zeroed.sessions[0].active);
+    assert_eq!(snap_zeroed.total_requests, 0);
 
     // POST /shutdown triggers daemon shutdown signal
     let shutdown_res: agy_gyro::proxy::ShutdownResponse = client
@@ -1708,8 +1705,9 @@ async fn test_server_and_stop_subcommands_spawn_and_stop_background_daemon() {
 
 #[tokio::test]
 async fn test_new_session_refetches_model_catalog_and_pricing() {
-    use agy_gyro::proxy::{GatewayModelsResponse, RegisterSessionRequest, RegisterSessionResponse};
+    use agy_gyro::proxy::{DaemonStatusResponse, GatewayModelsResponse};
     use agy_gyro::tui::fetch_usage_snapshot;
+    use agy_gyro::usage::{format_session_api_key, generate_session_uuid};
 
     let mock_server = MockServer::start().await;
 
@@ -1929,34 +1927,34 @@ async fn test_new_session_refetches_model_catalog_and_pricing() {
     );
     assert!((snap0.totals.total_cost_usd - 1.0).abs() < 1e-9);
 
-    // Connect new session #1 -> triggers Fetch #2 (gemini-4-neon + updated pricing)
-    let reg1: RegisterSessionResponse = client
-        .post(format!("{}/sessions", proxy_url))
-        .json(&RegisterSessionRequest {
-            pid: Some(std::process::id()),
-            label: "session-one".to_string(),
-        })
+    // Trigger refresh #2 via GET /sessions?refresh=1 (gemini-4-neon + updated pricing)
+    let status1: DaemonStatusResponse = client
+        .get(format!("{}/sessions?refresh=1", proxy_url))
         .send()
         .await
         .unwrap()
         .json()
         .await
         .unwrap();
+    assert!(
+        status1
+            .gateway_models
+            .contains(&"gemini-4-neon-high".to_string())
+    );
 
-    // Idempotent re-registration of the same active PID must NOT trigger another refetch
-    let reg1_dup: RegisterSessionResponse = client
-        .post(format!("{}/sessions", proxy_url))
-        .json(&RegisterSessionRequest {
-            pid: Some(std::process::id()),
-            label: "session-one".to_string(),
-        })
+    // Plain GET /sessions without refresh=1 must NOT trigger another refetch
+    let status1_plain: DaemonStatusResponse = client
+        .get(format!("{}/sessions", proxy_url))
         .send()
         .await
         .unwrap()
         .json()
         .await
         .unwrap();
-    assert_eq!(reg1_dup.session_id, reg1.session_id);
+    assert_eq!(status1_plain.gateway_models, status1.gateway_models);
+
+    let session1_id = generate_session_uuid();
+    let api_key1 = format_session_api_key(&session1_id, Some(std::process::id()), "session-one");
 
     let refreshed_models: GatewayModelsResponse = client
         .get(format!("{}/v1beta/models", proxy_url))
@@ -1983,7 +1981,7 @@ async fn test_new_session_refetches_model_catalog_and_pricing() {
             "{}/v1beta/models/gemini-4-argon:generateContent",
             proxy_url
         ))
-        .header("Authorization", format!("Bearer {}", reg1.api_key))
+        .header("Authorization", format!("Bearer {}", api_key1))
         .body(r#"{"contents":[]}"#)
         .send()
         .await
@@ -1997,7 +1995,7 @@ async fn test_new_session_refetches_model_catalog_and_pricing() {
             "{}/v1beta/models/gemini-4-neon-xhigh:generateContent",
             proxy_url
         ))
-        .header("Authorization", format!("Bearer {}", reg1.api_key))
+        .header("Authorization", format!("Bearer {}", api_key1))
         .body(r#"{"contents":[]}"#)
         .send()
         .await
@@ -2018,20 +2016,20 @@ async fn test_new_session_refetches_model_catalog_and_pricing() {
     );
     assert!((snap1.totals.total_cost_usd - 5.5).abs() < 1e-9);
 
-    // Connect new session #2 -> Fetch #3 returns 503, so last known catalog & pricing must be preserved
-    let reg2: RegisterSessionResponse = client
-        .post(format!("{}/sessions", proxy_url))
-        .json(&RegisterSessionRequest {
-            pid: None,
-            label: "session-two".to_string(),
-        })
+    // Trigger refresh #3 via GET /sessions?refresh=1 -> Fetch #3 returns 503, so last known catalog & pricing must be preserved
+    let status2: DaemonStatusResponse = client
+        .get(format!("{}/sessions?refresh=1", proxy_url))
         .send()
         .await
         .unwrap()
         .json()
         .await
         .unwrap();
-    assert_ne!(reg2.session_id, reg1.session_id);
+    assert_eq!(status2.gateway_models, status1.gateway_models);
+
+    let session2_id = generate_session_uuid();
+    let api_key2 = format_session_api_key(&session2_id, None, "session-two");
+    assert_ne!(session2_id, session1_id);
 
     let preserved_models: GatewayModelsResponse = client
         .get(format!("{}/v1beta/models", proxy_url))
@@ -2049,7 +2047,7 @@ async fn test_new_session_refetches_model_catalog_and_pricing() {
             "{}/v1beta/models/gemini-4-neon-high:generateContent",
             proxy_url
         ))
-        .header("Authorization", format!("Bearer {}", reg2.api_key))
+        .header("Authorization", format!("Bearer {}", api_key2))
         .body(r#"{"contents":[]}"#)
         .send()
         .await
@@ -2214,8 +2212,20 @@ async fn test_logs_sse_streams_incremental_appends_and_resyncs_on_reset() {
 
     let client = Client::new();
 
-    let s1 = state.usage.register_session(None, "sess-one");
-    let s2 = state.usage.register_session(None, "sess-two");
+    let s1 = agy_gyro::usage::SessionMeta {
+        id: agy_gyro::usage::generate_session_uuid(),
+        label: "sess-one".to_string(),
+        pid: None,
+    };
+    let s2 = agy_gyro::usage::SessionMeta {
+        id: agy_gyro::usage::generate_session_uuid(),
+        label: "sess-two".to_string(),
+        pid: None,
+    };
+    let g1 = state.usage.begin_session_request(Some(&s1));
+    let g2 = state.usage.begin_session_request(Some(&s2));
+    drop(g1);
+    drop(g2);
     state
         .usage
         .record_log_with_session("INFO", "agy_gyro", Some(s1.id.clone()), "initial-log-1");
@@ -2558,4 +2568,140 @@ async fn test_wrapper_restarts_mismatched_daemon_before_running_child() {
         .unwrap();
     let _ = std::fs::remove_dir_all(&temp_home);
     assert!(out_stop.status.success());
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn test_run_app_launches_detached_and_tracks_lazy_desktop_session() {
+    use agy_gyro::tui::fetch_usage_snapshot;
+    use std::os::unix::fs::PermissionsExt;
+
+    let mock_server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1beta/models/gemini-4-argon:generateContent"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "application/json")
+                .set_body_json(serde_json::json!({
+                    "candidates": [{ "content": { "parts": [{ "text": "Desktop OK" }] } }],
+                    "usageMetadata": {
+                        "promptTokenCount": 12000,
+                        "cachedContentTokenCount": 0,
+                        "candidatesTokenCount": 500,
+                        "thoughtsTokenCount": 0,
+                        "totalTokenCount": 12500
+                    },
+                    "modelVersion": "gemini-4-argon"
+                })),
+        )
+        .expect(1)
+        .mount(&mock_server)
+        .await;
+
+    let proxy_url = spawn_test_proxy(mock_server.uri(), 3).await;
+    let port = reqwest::Url::parse(&proxy_url)
+        .unwrap()
+        .port()
+        .expect("proxy port");
+
+    let temp_dir = std::env::temp_dir().join(format!(
+        "agy-gyro-app-test-{}-{}",
+        std::process::id(),
+        rand::random::<u32>()
+    ));
+    let config_dir = temp_dir.join(".gemini").join("config");
+    std::fs::create_dir_all(&config_dir).unwrap();
+
+    let env_dump = temp_dir.join("env.txt");
+    let mock_app = temp_dir.join("mock-antigravity");
+    std::fs::write(
+        &mock_app,
+        format!(
+            "#!/bin/sh\n{{\n  printf 'URL=%s\\n' \"$AGY_LLM_GATEWAY_URL\"\n  printf 'PROTO=%s\\n' \"$AGY_LLM_GATEWAY_WIRE_PROTOCOL\"\n  printf 'KEY=%s\\n' \"$AGY_LLM_GATEWAY_API_KEY\"\n  printf 'HUB=%s\\n' \"$AGY_ENABLE_HUB\"\n  printf 'ARGS=%s\\n' \"$*\"\n}} > \"{}\"\n",
+            env_dump.display()
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&mock_app, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    std::fs::write(
+        config_dir.join("agy-gyro.toml"),
+        format!(
+            "host = \"127.0.0.1\"\nport = {}\napi_key = \"test-gemini-key\"\napp_path = \"{}\"\n",
+            port,
+            mock_app.display()
+        ),
+    )
+    .unwrap();
+
+    // Even if AGY_ENABLE_HUB=1 is set in the caller's shell (e.g., inside an agy-gyro CLI session),
+    // `agy-gyro app` must strip it when launching the desktop app.
+    let status = tokio::process::Command::new(env!("CARGO_BIN_EXE_agy-gyro"))
+        .env("HOME", &temp_dir)
+        .env("USERPROFILE", &temp_dir)
+        .env("AGY_ENABLE_HUB", "1")
+        .args(["app", "--headless", "--ssh-host=dev"])
+        .status()
+        .await
+        .unwrap();
+    assert!(status.success(), "agy-gyro app failed: {:?}", status);
+
+    // Wait briefly for the detached mock app script to finish writing its env dump
+    let mut dump = String::new();
+    for _ in 0..50 {
+        if let Ok(contents) = std::fs::read_to_string(&env_dump)
+            && contents.contains("ARGS=")
+        {
+            dump = contents;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    let _ = std::fs::remove_dir_all(&temp_dir);
+
+    assert!(
+        dump.contains(&format!("URL=http://127.0.0.1:{}", port)),
+        "unexpected dump:\n{}",
+        dump
+    );
+    assert!(dump.contains("PROTO=genai"), "unexpected dump:\n{}", dump);
+    assert!(
+        dump.contains("KEY=gyro:app:0:Antigravity"),
+        "unexpected dump:\n{}",
+        dump
+    );
+    assert!(dump.contains("HUB=\n"), "unexpected dump:\n{}", dump);
+    assert!(
+        dump.contains("ARGS=--headless --ssh-host=dev"),
+        "unexpected dump:\n{}",
+        dump
+    );
+
+    // No session should exist prior to the first proxied request
+    let client = Client::new();
+    let usage_url = format!("{}/usage", proxy_url);
+    let snap_before = fetch_usage_snapshot(&client, &usage_url).await.unwrap();
+    assert!(snap_before.sessions.is_empty());
+
+    // First request with the desktop app's API key lazily creates `#app Antigravity`
+    let res = client
+        .post(format!(
+            "{}/v1beta/models/gemini-4-argon:generateContent",
+            proxy_url
+        ))
+        .header("Authorization", "Bearer gyro:app:0:Antigravity")
+        .body(r#"{"contents":[]}"#)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 200);
+
+    let snap_after = fetch_usage_snapshot(&client, &usage_url).await.unwrap();
+    assert_eq!(snap_after.sessions.len(), 1);
+    assert_eq!(snap_after.sessions[0].id, "app");
+    assert_eq!(snap_after.sessions[0].label, "Antigravity");
+    assert_eq!(snap_after.sessions[0].pid, None);
+    assert!(snap_after.sessions[0].active);
+    assert_eq!(snap_after.sessions[0].totals.input_tokens, 12_000);
+    assert_eq!(snap_after.sessions[0].totals.output_tokens, 500);
 }

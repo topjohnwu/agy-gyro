@@ -776,94 +776,6 @@ impl UsageTracker {
         self.notify_usage_change();
     }
 
-    /// Registers a new `agy` wrapper session and returns its allocated [`SessionMeta`].
-    /// If an active session with the same positive `pid` is already registered, returns
-    /// that existing session's metadata (idempotent per active OS process).
-    pub fn register_session(&self, pid: Option<u32>, label: &str) -> SessionMeta {
-        self.register_session_with_status(pid, label).0
-    }
-
-    /// Registers a new `agy` wrapper session and returns `(meta, is_new)`, where `is_new` is
-    /// `true` when a new session was created and `false` when an active session with the same
-    /// positive `pid` was reused.
-    pub fn register_session_with_status(
-        &self,
-        pid: Option<u32>,
-        label: &str,
-    ) -> (SessionMeta, bool) {
-        let clean_label = sanitize_session_label(label);
-        let track_pid_liveness = pid.is_some_and(is_pid_alive);
-
-        let id = {
-            let mut inner = self.inner.write().unwrap_or_else(|e| e.into_inner());
-            if let Some(p) = pid.filter(|&p| p > 0)
-                && let Some(existing) = inner
-                    .sessions
-                    .values_mut()
-                    .find(|e| e.stats.active && e.stats.pid == Some(p))
-            {
-                existing.stats.label = clean_label.clone();
-                existing.track_pid_liveness = track_pid_liveness;
-                return (
-                    SessionMeta {
-                        id: existing.stats.id.clone(),
-                        label: clean_label,
-                        pid,
-                    },
-                    false,
-                );
-            }
-
-            let id = generate_session_uuid();
-            let seq = self.next_session_seq.fetch_add(1, Ordering::Relaxed);
-            inner.sessions.insert(
-                id.clone(),
-                SessionEntry {
-                    seq,
-                    stats: SessionUsageStats {
-                        id: id.clone(),
-                        label: clean_label.clone(),
-                        pid,
-                        active: true,
-                        stats: ScopeUsageStats::default(),
-                    },
-                    track_pid_liveness,
-                },
-            );
-            id
-        };
-
-        info!(
-            session_id = %id,
-            "[#{} {}] Session started (pid={})",
-            short_session_id(&id),
-            clean_label,
-            pid.map(|p| p.to_string()).unwrap_or_else(|| "n/a".to_string())
-        );
-        self.notify_usage_change();
-
-        (
-            SessionMeta {
-                id,
-                label: clean_label,
-                pid,
-            },
-            true,
-        )
-    }
-
-    /// Unconditionally marks a session as inactive and removes its stats and logs.
-    /// Used to clean up a pre-registered session if launching `agy` fails.
-    pub fn remove_session(&self, session_id: &str) {
-        if let Ok(mut inner) = self.inner.write()
-            && let Some(entry) = inner.sessions.get_mut(session_id)
-        {
-            entry.stats.active = false;
-            entry.track_pid_liveness = false;
-        }
-        self.reset_session(session_id);
-    }
-
     /// Marks an existing session as exited (`active = false`) while preserving its accumulated stats.
     pub fn mark_session_exited(&self, session_id: &str) -> bool {
         let mut label_opt = None;
@@ -889,34 +801,55 @@ impl UsageTracker {
         }
     }
 
+    fn log_session_started(meta: &SessionMeta) {
+        info!(
+            session_id = %meta.id,
+            "[#{} {}] Session started (pid={})",
+            meta.short_id(),
+            meta.label,
+            meta.pid
+                .map(|p| p.to_string())
+                .unwrap_or_else(|| "n/a".to_string())
+        );
+    }
+
     fn ensure_session_entry<'a>(
         &self,
         inner: &'a mut UsageInner,
         meta: &SessionMeta,
-    ) -> &'a mut SessionEntry {
-        inner
-            .sessions
-            .entry(meta.id.clone())
-            .and_modify(|e| {
+    ) -> (&'a mut SessionEntry, bool) {
+        use std::collections::btree_map::Entry;
+        match inner.sessions.entry(meta.id.clone()) {
+            Entry::Occupied(entry) => {
+                let e = entry.into_mut();
+                let was_active = e.stats.active;
                 e.stats.active = true;
                 if meta.pid.is_some() {
+                    if !was_active || !e.track_pid_liveness || e.stats.pid != meta.pid {
+                        e.track_pid_liveness = meta.pid.is_some_and(is_pid_alive);
+                    }
                     e.stats.pid = meta.pid;
                 }
                 if !meta.label.is_empty() && meta.label != "agy" {
                     e.stats.label = meta.label.clone();
                 }
-            })
-            .or_insert_with(|| SessionEntry {
-                seq: self.next_session_seq.fetch_add(1, Ordering::Relaxed),
-                stats: SessionUsageStats {
-                    id: meta.id.clone(),
-                    label: meta.label.clone(),
-                    pid: meta.pid,
-                    active: true,
-                    stats: ScopeUsageStats::default(),
-                },
-                track_pid_liveness: meta.pid.is_some_and(is_pid_alive),
-            })
+                (e, false)
+            }
+            Entry::Vacant(entry) => {
+                let e = entry.insert(SessionEntry {
+                    seq: self.next_session_seq.fetch_add(1, Ordering::Relaxed),
+                    stats: SessionUsageStats {
+                        id: meta.id.clone(),
+                        label: meta.label.clone(),
+                        pid: meta.pid,
+                        active: true,
+                        stats: ScopeUsageStats::default(),
+                    },
+                    track_pid_liveness: meta.pid.is_some_and(is_pid_alive),
+                });
+                (e, true)
+            }
+        }
     }
 
     /// Marks the start of an in-flight proxy request and returns an RAII guard that
@@ -930,10 +863,12 @@ impl UsageTracker {
         self: &Arc<Self>,
         session: Option<&SessionMeta>,
     ) -> ActiveRequestGuard {
+        let mut started_new = false;
         let session_id = if let Ok(mut inner) = self.inner.write() {
             inner.global.begin_request();
             if let Some(meta) = session {
-                let entry = self.ensure_session_entry(&mut inner, meta);
+                let (entry, is_new) = self.ensure_session_entry(&mut inner, meta);
+                started_new = is_new;
                 entry.stats.begin_request();
                 Some(meta.id.clone())
             } else {
@@ -942,6 +877,10 @@ impl UsageTracker {
         } else {
             session.map(|m| m.id.clone())
         };
+
+        if started_new && let Some(meta) = session {
+            Self::log_session_started(meta);
+        }
 
         self.notify_usage_change();
         ActiveRequestGuard {
@@ -957,12 +896,17 @@ impl UsageTracker {
 
     /// Increments the global and per-session retry counter when a request attempt is retried.
     pub fn record_session_retry(&self, session: Option<&SessionMeta>) {
+        let mut started_new = false;
         if let Ok(mut inner) = self.inner.write() {
             inner.global.record_retry();
             if let Some(meta) = session {
-                let entry = self.ensure_session_entry(&mut inner, meta);
+                let (entry, is_new) = self.ensure_session_entry(&mut inner, meta);
+                started_new = is_new;
                 entry.stats.record_retry();
             }
+        }
+        if started_new && let Some(meta) = session {
+            Self::log_session_started(meta);
         }
         self.notify_usage_change();
     }
@@ -1017,6 +961,7 @@ impl UsageTracker {
         let req_id = self.next_request_id.fetch_add(1, Ordering::Relaxed);
 
         let has_pricing = pricing.is_some();
+        let mut started_new = false;
         if let Ok(mut inner) = self.inner.write() {
             inner.global.record_completed(
                 &canonical_model,
@@ -1028,7 +973,8 @@ impl UsageTracker {
             );
 
             if let Some(meta) = session {
-                let sess_entry = self.ensure_session_entry(&mut inner, meta);
+                let (sess_entry, is_new) = self.ensure_session_entry(&mut inner, meta);
+                started_new = is_new;
                 sess_entry.stats.record_completed(
                     &canonical_model,
                     is_ok,
@@ -1038,6 +984,10 @@ impl UsageTracker {
                     pricing,
                 );
             }
+        }
+
+        if started_new && let Some(meta) = session {
+            Self::log_session_started(meta);
         }
 
         let cost_suffix = if has_pricing {
@@ -1406,8 +1356,16 @@ mod tests {
         assert_eq!(parsed.label, "my-workspace");
 
         let tracker = Arc::new(UsageTracker::default());
-        let s1 = tracker.register_session(None, "proj-alpha");
-        let s2 = tracker.register_session(None, "proj-beta");
+        let s1 = SessionMeta {
+            id: generate_session_uuid(),
+            label: "proj-alpha".to_string(),
+            pid: None,
+        };
+        let s2 = SessionMeta {
+            id: generate_session_uuid(),
+            label: "proj-beta".to_string(),
+            pid: None,
+        };
         assert_eq!(s1.id.len(), 36);
         assert_eq!(s2.id.len(), 36);
         assert_ne!(s1.id, s2.id);
@@ -1467,7 +1425,7 @@ mod tests {
 
     #[test]
     fn test_incremental_log_stream_cursor_and_ring_buffer() {
-        let tracker = UsageTracker::default();
+        let tracker = Arc::new(UsageTracker::default());
         let mut cursor = LogStreamCursor::default();
 
         // 1. Initial read on empty tracker returns empty Snapshot
@@ -1479,8 +1437,20 @@ mod tests {
         assert_eq!(tracker.next_log_stream_event(&mut cursor), None);
 
         // 2. Appending logs returns only newly added entries as Append (batched)
-        let s1 = tracker.register_session(None, "alpha");
-        let s2 = tracker.register_session(None, "beta");
+        let s1 = SessionMeta {
+            id: generate_session_uuid(),
+            label: "alpha".to_string(),
+            pid: None,
+        };
+        let s2 = SessionMeta {
+            id: generate_session_uuid(),
+            label: "beta".to_string(),
+            pid: None,
+        };
+        let _g1 = tracker.begin_session_request(Some(&s1));
+        let _g2 = tracker.begin_session_request(Some(&s2));
+        drop(_g1);
+        drop(_g2);
         tracker.record_log_with_session("INFO", "agy_gyro", Some(s1.id.clone()), "msg 1");
         tracker.record_log_with_session("WARN", "agy_gyro", Some(s2.id.clone()), "msg 2");
         tracker.record_log_with_session("INFO", "agy_gyro", Some(s1.id.clone()), "msg 3");

@@ -15,6 +15,7 @@ pub const ENV_API_KEY: &str = "AGY_GYRO_API_KEY";
 pub const ENV_HOST: &str = "AGY_GYRO_HOST";
 pub const ENV_PORT: &str = "AGY_GYRO_PORT";
 pub const ENV_AGY_PATH: &str = "AGY_GYRO_AGY_PATH";
+pub const ENV_APP_PATH: &str = "AGY_GYRO_APP_PATH";
 
 /// All configuration environment variables recognized by [`Cli::try_parse_with_config_from`].
 pub const KNOWN_ENV_VARS: &[&str] = &[
@@ -23,6 +24,7 @@ pub const KNOWN_ENV_VARS: &[&str] = &[
     ENV_HOST,
     ENV_PORT,
     ENV_AGY_PATH,
+    ENV_APP_PATH,
 ];
 
 /// Converts a wildcard bind address (`0.0.0.0`) into a loopback connect address (`127.0.0.1`).
@@ -51,6 +53,8 @@ pub enum Commands {
     Server,
     /// Run agy CLI wrapped with the local proxy (default mode)
     Run(Vec<String>),
+    /// Launch the Antigravity desktop app connected to the local proxy
+    App(Vec<String>),
     /// Monitor live token usage and cost in a terminal UI dashboard
     Monitor,
     /// Stop the running background agy-gyro daemon
@@ -66,6 +70,8 @@ pub struct FileConfig {
     pub api_key: Option<String>,
     #[serde(alias = "agy-path")]
     pub agy_path: Option<String>,
+    #[serde(alias = "app-path")]
+    pub app_path: Option<String>,
     #[serde(alias = "log-file")]
     pub log_file: Option<PathBuf>,
     #[serde(alias = "max-retries")]
@@ -124,6 +130,8 @@ pub struct Config {
     pub api_key: String,
     /// Executable path or command name for Antigravity CLI
     pub agy_path: String,
+    /// Optional path to the Antigravity desktop app bundle (macOS) or executable
+    pub app_path: Option<String>,
     /// Optional log file path for agy-gyro proxy tracing logs
     pub log_file: Option<PathBuf>,
     /// Maximum retry attempts on retriable errors
@@ -148,6 +156,7 @@ impl Default for Config {
             upstream: "https://generativelanguage.googleapis.com".to_string(),
             api_key: String::new(),
             agy_path: "agy".to_string(),
+            app_path: None,
             log_file: None,
             max_retries: 15,
             initial_delay_ms: 1000,
@@ -257,6 +266,7 @@ impl Cli {
         let agy_path = env_non_empty(ENV_AGY_PATH)
             .or(file_config.agy_path)
             .unwrap_or_else(|| "agy".to_string());
+        let app_path = env_non_empty(ENV_APP_PATH).or(file_config.app_path);
         let log_file = file_config.log_file;
 
         let config = Config {
@@ -271,6 +281,7 @@ impl Cli {
             request_timeout_secs,
             api_key,
             agy_path,
+            app_path,
             log_file,
         };
 
@@ -278,6 +289,15 @@ impl Cli {
             Some("server") => Commands::Server,
             Some("monitor") => Commands::Monitor,
             Some("stop") => Commands::Stop,
+            Some("app") => {
+                let rest = &args[1..];
+                let app_args = if rest.first().map(|s| s.as_str()) == Some("--") {
+                    rest[1..].to_vec()
+                } else {
+                    rest.to_vec()
+                };
+                Commands::App(app_args)
+            }
             _ => {
                 let agy_args = if args.first().map(|s| s.as_str()) == Some("--") {
                     args[1..].to_vec()
@@ -288,7 +308,10 @@ impl Cli {
             }
         };
 
-        let requires_api_key = matches!(command, Commands::Server | Commands::Run(_));
+        let requires_api_key = matches!(
+            command,
+            Commands::Server | Commands::Run(_) | Commands::App(_)
+        );
         if requires_api_key && config.api_key.trim().is_empty() {
             return Err(
                 "missing Gemini API key: set GEMINI_API_KEY or configure `api_key` in ~/.gemini/config/agy-gyro.toml"

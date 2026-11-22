@@ -1,10 +1,11 @@
 // SPDX-License-Identifier: MIT
 
+use crate::app::{APP_SESSION_ID, APP_SESSION_LABEL, launch_app, resolve_app_target};
 use crate::config::{Config, connect_host};
-use crate::proxy::{
-    DaemonStatusResponse, RegisterSessionRequest, RegisterSessionResponse, ShutdownResponse,
+use crate::proxy::{DaemonStatusResponse, ShutdownResponse};
+use crate::usage::{
+    format_session_api_key, generate_session_uuid, is_pid_alive, sanitize_session_label,
 };
-use crate::usage::{is_pid_alive, sanitize_session_label};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::{Duration, Instant};
@@ -17,7 +18,15 @@ fn current_workspace_label() -> String {
         .unwrap_or_else(|| "agy".to_string())
 }
 
-fn build_registration_client() -> reqwest::Result<reqwest::Client> {
+fn gateway_env_vars<'a>(daemon_url: &'a str, api_key: &'a str) -> [(&'static str, &'a str); 3] {
+    [
+        ("AGY_LLM_GATEWAY_URL", daemon_url),
+        ("AGY_LLM_GATEWAY_WIRE_PROTOCOL", "genai"),
+        ("AGY_LLM_GATEWAY_API_KEY", api_key),
+    ]
+}
+
+fn build_daemon_client() -> reqwest::Result<reqwest::Client> {
     reqwest::Client::builder()
         .connect_timeout(Duration::from_millis(200))
         .timeout(Duration::from_secs(15))
@@ -25,37 +34,19 @@ fn build_registration_client() -> reqwest::Result<reqwest::Client> {
         .build()
 }
 
-async fn try_register_session(
-    client: &reqwest::Client,
-    daemon_base_url: &str,
-    pid: Option<u32>,
-    label: &str,
-) -> Result<RegisterSessionResponse, String> {
-    let url = format!("{}/sessions", daemon_base_url.trim_end_matches('/'));
-    let res = client
-        .post(&url)
-        .json(&RegisterSessionRequest {
-            pid,
-            label: label.to_string(),
-        })
-        .send()
-        .await
-        .map_err(|e| e.to_string())?;
-
-    if !res.status().is_success() {
-        return Err(format!("HTTP {}", res.status()));
-    }
-
-    res.json::<RegisterSessionResponse>()
-        .await
-        .map_err(|e| e.to_string())
-}
-
 async fn try_fetch_daemon_status(
     client: &reqwest::Client,
     daemon_base_url: &str,
+    refresh: bool,
 ) -> Result<DaemonStatusResponse, String> {
-    let url = format!("{}/sessions", daemon_base_url.trim_end_matches('/'));
+    let url = if refresh {
+        format!(
+            "{}/sessions?refresh=1",
+            daemon_base_url.trim_end_matches('/')
+        )
+    } else {
+        format!("{}/sessions", daemon_base_url.trim_end_matches('/'))
+    };
     let res = client.get(&url).send().await.map_err(|e| e.to_string())?;
 
     if !res.status().is_success() {
@@ -249,10 +240,13 @@ enum DaemonLaunchOutcome {
 
 /// Probes the configured daemon address; if unreachable, spawns the background daemon.
 /// If a daemon is already running with a mismatched build ID, kills and restarts it automatically.
+/// When `refresh_if_running` is `true` and an already-running daemon matches the current build ID,
+/// triggers a deduplicated catalog & pricing refresh via `GET /sessions?refresh=1`.
 async fn ensure_daemon_status(
     config: &Config,
+    refresh_if_running: bool,
 ) -> Result<(String, DaemonStatusResponse, DaemonLaunchOutcome), Box<dyn std::error::Error>> {
-    let client = build_registration_client()?;
+    let client = build_daemon_client()?;
 
     let port = if config.port != 0 {
         config.port
@@ -264,8 +258,15 @@ async fn ensure_daemon_status(
     let daemon_url = format!("http://{}:{}", connect_host(&config.host), port);
     let expected_build_id = crate::BUILD_ID;
 
-    let outcome = match try_fetch_daemon_status(&client, &daemon_url).await {
+    let outcome = match try_fetch_daemon_status(&client, &daemon_url, false).await {
         Ok(status) if build_id_matches(status.build_id.as_deref(), expected_build_id) => {
+            let status = if refresh_if_running {
+                try_fetch_daemon_status(&client, &daemon_url, true)
+                    .await
+                    .unwrap_or(status)
+            } else {
+                status
+            };
             return Ok((daemon_url, status, DaemonLaunchOutcome::AlreadyRunning));
         }
         Ok(status) => {
@@ -293,7 +294,7 @@ async fn ensure_daemon_status(
     let start = Instant::now();
     while start.elapsed() < Duration::from_secs(15) {
         tokio::time::sleep(Duration::from_millis(40)).await;
-        if let Ok(status) = try_fetch_daemon_status(&client, &daemon_url).await
+        if let Ok(status) = try_fetch_daemon_status(&client, &daemon_url, false).await
             && build_id_matches(status.build_id.as_deref(), expected_build_id)
         {
             return Ok((daemon_url, status, outcome));
@@ -311,7 +312,7 @@ async fn ensure_daemon_status(
 /// If a daemon is already running with a matching build ID, prints its status and returns immediately.
 /// If a running daemon has a different build ID, kills and restarts it automatically.
 pub async fn start_daemon(config: Config) -> Result<(), Box<dyn std::error::Error>> {
-    let (daemon_url, status, outcome) = ensure_daemon_status(&config).await?;
+    let (daemon_url, status, outcome) = ensure_daemon_status(&config, false).await?;
 
     match outcome {
         DaemonLaunchOutcome::AlreadyRunning => {
@@ -345,9 +346,9 @@ pub async fn restart_daemon_if_build_mismatch(
         return Ok(false);
     }
 
-    let client = build_registration_client()?;
+    let client = build_daemon_client()?;
     let daemon_url = config.base_url();
-    let Ok(status) = try_fetch_daemon_status(&client, &daemon_url).await else {
+    let Ok(status) = try_fetch_daemon_status(&client, &daemon_url, false).await else {
         return Ok(false);
     };
 
@@ -355,79 +356,45 @@ pub async fn restart_daemon_if_build_mismatch(
         return Ok(false);
     }
 
-    let (_, _, outcome) = ensure_daemon_status(config).await?;
+    let (_, _, outcome) = ensure_daemon_status(config, false).await?;
     Ok(matches!(outcome, DaemonLaunchOutcome::Restarted { .. }))
 }
 
-async fn ensure_daemon_and_register(
-    config: &Config,
-    pid: Option<u32>,
-    label: &str,
-) -> Result<(String, RegisterSessionResponse), Box<dyn std::error::Error>> {
-    let (daemon_url, _, _) = ensure_daemon_status(config).await?;
-    let client = build_registration_client()?;
-    let reg = try_register_session(&client, &daemon_url, pid, label)
-        .await
-        .map_err(|e| format!("Failed to register session on {}: {}", daemon_url, e))?;
-
-    Ok((daemon_url, reg))
-}
-
-fn cleanup_failed_session(daemon_url: &str, session_id: &str) {
-    let Ok(rt) = tokio::runtime::Builder::new_current_thread()
+fn ensure_daemon_blocking(config: &Config) -> Result<String, Box<dyn std::error::Error>> {
+    let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
-        .build()
-    else {
-        return;
-    };
-    rt.block_on(async {
-        if let Ok(client) = build_registration_client() {
-            let url = format!(
-                "{}/sessions/{}",
-                daemon_url.trim_end_matches('/'),
-                session_id
-            );
-            let _ = client
-                .delete(&url)
-                .timeout(Duration::from_millis(500))
-                .send()
-                .await;
-        }
-    });
+        .build()?;
+    let (daemon_url, _, _) = rt.block_on(ensure_daemon_status(config, true))?;
+    Ok(daemon_url)
 }
 
-/// Ensures the background `agy-gyro` daemon is running, registers a session for this `agy`
-/// instance, configures the gateway environment variables, and replaces the current process
-/// in-place with `agy` (`execvp` on Unix) so no wrapper process remains.
+/// Ensures the background `agy-gyro` daemon is running, configures the gateway environment
+/// variables with a lazy session token (`gyro:<uuid>:<pid>:<workspace>`), and replaces the
+/// current process in-place with `agy` (`execvp` on Unix) so no wrapper process remains.
 pub fn run_wrapper(
     config: Config,
     agy_args: Vec<String>,
 ) -> Result<i32, Box<dyn std::error::Error>> {
-    let pid = Some(std::process::id());
-    let label = current_workspace_label();
+    let daemon_url = ensure_daemon_blocking(&config)?;
 
-    let (daemon_url, reg) = {
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()?;
-        rt.block_on(ensure_daemon_and_register(&config, pid, &label))?
-    };
+    let session_id = generate_session_uuid();
+    let label = current_workspace_label();
+    let api_key = format_session_api_key(&session_id, Some(std::process::id()), &label);
 
     let mut cmd = std::process::Command::new(&config.agy_path);
     cmd.args(&agy_args)
-        .env("AGY_LLM_GATEWAY_URL", &daemon_url)
-        .env("AGY_LLM_GATEWAY_WIRE_PROTOCOL", "genai")
-        .env("AGY_LLM_GATEWAY_API_KEY", &reg.api_key)
         .env("AGY_ENABLE_HUB", "1")
         .stdin(Stdio::inherit())
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit());
+    for (k, v) in gateway_env_vars(&daemon_url, &api_key) {
+        cmd.env(k, v);
+    }
 
     #[cfg(unix)]
     {
         use std::os::unix::process::CommandExt;
         let err = cmd.exec();
-        cleanup_failed_session(&daemon_url, &reg.session_id);
         eprintln!("agy-gyro: failed to execute '{}': {}", config.agy_path, err);
         Ok(127)
     }
@@ -437,7 +404,6 @@ pub fn run_wrapper(
         match cmd.status() {
             Ok(status) => Ok(status.code().unwrap_or(1)),
             Err(err) => {
-                cleanup_failed_session(&daemon_url, &reg.session_id);
                 eprintln!("agy-gyro: failed to execute '{}': {}", config.agy_path, err);
                 Ok(127)
             }
@@ -445,11 +411,21 @@ pub fn run_wrapper(
     }
 }
 
+/// Ensures the background `agy-gyro` daemon is running and launches the Antigravity desktop app
+/// detached with the gateway environment variables and fixed lazy session (`#app Antigravity`).
+pub fn run_app(config: Config, app_args: Vec<String>) -> Result<i32, Box<dyn std::error::Error>> {
+    let target = resolve_app_target(config.app_path.as_deref())?;
+    let daemon_url = ensure_daemon_blocking(&config)?;
+    let api_key = format_session_api_key(APP_SESSION_ID, None, APP_SESSION_LABEL);
+    let env = gateway_env_vars(&daemon_url, &api_key);
+    launch_app(&target, &env, &app_args)
+}
+
 /// Stops a running `agy-gyro` background daemon at the target address configured by `config`.
 pub async fn stop_daemon(config: Config) -> Result<(), Box<dyn std::error::Error>> {
     let base_url = config.base_url();
     let shutdown_url = format!("{}/shutdown", base_url);
-    let client = build_registration_client()?;
+    let client = build_daemon_client()?;
 
     let res = match client
         .post(&shutdown_url)

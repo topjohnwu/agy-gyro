@@ -419,7 +419,11 @@ pub fn expand_gateway_models(models: &[GeminiModelInfo]) -> Vec<GatewayModelEntr
             for effort in efforts {
                 expanded.push(GatewayModelEntry {
                     name: format!("models/{}-{}", base_id, effort),
-                    display_name: Some(format!("{} ({})", base_display, format_effort_label(effort))),
+                    display_name: Some(format!(
+                        "{} ({})",
+                        base_display,
+                        format_effort_label(effort)
+                    )),
                     description: model.description.clone(),
                     input_token_limit: model.input_token_limit,
                     output_token_limit: model.output_token_limit,

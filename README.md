@@ -6,16 +6,16 @@
 
 > **Disclaimer**: `agy-gyro` is an independent open-source project and is not affiliated with, endorsed by, or sponsored by Google or the Antigravity team.
 
-`agy-gyro` is a high-performance, lightweight local **Antigravity Enterprise Gateway** and retry proxy written in Rust. It forwards Antigravity's Enterprise Gateway `genai` wire protocol requests to standard Google Gemini API endpoints (`generativelanguage.googleapis.com`) and stabilizes the Antigravity CLI (`agy`) against transient API errors.
+`agy-gyro` is a high-performance, lightweight local **Antigravity Enterprise Gateway** and retry proxy written in Rust. It forwards Antigravity's Enterprise Gateway `genai` wire protocol requests to standard Google Gemini API endpoints (`generativelanguage.googleapis.com`) and stabilizes Antigravity against transient API errors.
 
 
 ## Motivation
 
 ### 1. First-Class Enterprise Gateway Mode vs Raw Gemini API Key Mode
 
-While Antigravity supports a Gemini API key mode (`"modelProvider": "gemini"`), many first-class features and latest models are incomplete or unavailable in that mode.
+Raw Gemini API key mode (`"modelProvider": "gemini"`) is only officially supported in the Antigravity CLI (`agy`), and many first-class features and latest models are incomplete or unavailable in that mode.
 
-By contrast, [Antigravity Enterprise Gateway](https://docs.cloud.google.com/gemini/enterprise/docs/ai-developer-tools/deploy-enterprise-gateway) is a first-class integration mode across `agy` and IDE extensions. `agy-gyro` acts as a local Enterprise Gateway server that forwards `genai` gateway wire protocol requests to standard Gemini API endpoints.
+By contrast, [Antigravity Enterprise Gateway](https://docs.cloud.google.com/gemini/enterprise/docs/ai-developer-tools/deploy-enterprise-gateway) is a first-class integration mode supported across all Antigravity products. `agy-gyro` acts as a local Enterprise Gateway server that forwards `genai` gateway wire protocol requests to standard Gemini API endpoints.
 
 ### 2. Transient API Errors & Lack of Retries
 
@@ -26,18 +26,18 @@ When interacting with the Google Gemini API directly using an API key, requests 
 - **HTTP 500 / 502 / 504**: Transient backend gateway or server errors.
 - **HTTP 408 / Transport Drops**: Network timeouts or aborted socket connections.
 
-By default, the Antigravity CLI (`agy`) does not implement automatic retry loops with exponential backoff. When an error status code is encountered, `agy` terminates the active session immediately, disrupting the agentic workflow.
+By default, Antigravity does not implement automatic retry loops with exponential backoff. When an error status code is encountered, Antigravity terminates the active session immediately, disrupting the agentic workflow.
 
 <p align="center">
   <img src="assets/error.png" alt="The dreaded &quot;Agent execution terminated&quot; error" width="650" /><br/>
   <em>The dreaded "Agent execution terminated" error</em>
 </p>
 
-`agy-gyro` solves this by catching transient errors, retrying the requests internally using exponential backoff with jitter (following the [Gemini API Troubleshooting Guide](https://ai.google.dev/gemini-api/docs/troubleshooting)), and only returning the final result to `agy` once resolved (or when retry attempts are exhausted).
+`agy-gyro` solves this by catching transient errors, retrying the requests internally using exponential backoff with jitter (following the [Gemini API Troubleshooting Guide](https://ai.google.dev/gemini-api/docs/troubleshooting)), and only returning the final result to Antigravity once resolved (or when retry attempts are exhausted).
 
 ```mermaid
 flowchart LR
-    AGY["Antigravity CLI\n(agy)"]
+    AGY["Antigravity"]
     GYRO["agy-gyro\n(127.0.0.1:6470)"]
     GEMINI["Google Gemini API\n(generativelanguage.googleapis.com)"]
 
@@ -60,25 +60,51 @@ Prebuilt executables for Linux, macOS, and Windows are also available in the [la
 
 ## Usage
 
-`agy-gyro` runs a single persistent background daemon (`127.0.0.1:6470` by default) shared across all `agy` instances, tracking each session's token usage, request stats, and cost independently.
+`agy-gyro` runs a single persistent background daemon (`127.0.0.1:6470` by default) shared across all Antigravity instances, tracking each session's token usage, request stats, and estimated cost independently.
 
-### Launching Antigravity (`agy`)
-
-Running `agy-gyro` (when the first argument is not `server`, `stop`, or `monitor`) ensures the background daemon is running, configures the environment (`AGY_LLM_GATEWAY_*` and `AGY_ENABLE_HUB=1`), and launches `agy` with all arguments transparently passed through:
+Before launching, provide your Gemini API key via `GEMINI_API_KEY` (or persist `api_key` in `~/.gemini/config/agy-gyro.toml`):
 
 ```bash
 export GEMINI_API_KEY="your-gemini-api-key"
+```
 
+When launching any Antigravity client (`agy-gyro` or `agy-gyro app`), `agy-gyro` automatically ensures the background daemon is running, injects the Enterprise Gateway environment variables (`AGY_LLM_GATEWAY_*`), and transparently forwards any trailing arguments.
+
+### Launching Antigravity CLI (`agy`)
+
+Running `agy-gyro` (when the first argument is not `app`, `server`, `stop`, or `monitor`) launches `agy` in-place (also setting `AGY_ENABLE_HUB=1`):
+
+```bash
 # Launch agy connected to the agy-gyro gateway:
 agy-gyro
 
-# Arguments are transparently passed through to agy:
+# Pass arguments through to agy:
 agy-gyro --dangerously-skip-permissions
 ```
 
+### Launching Antigravity Desktop App (`agy-gyro app`)
+
+Running `agy-gyro app` launches the Antigravity desktop application detached (tracked as `#app Antigravity` in `agy-gyro monitor`):
+
+```bash
+# Launch the Antigravity desktop app connected to agy-gyro:
+agy-gyro app
+
+# Pass arguments through to the Antigravity desktop app:
+agy-gyro app --headless
+```
+
+By default, `agy-gyro app` locates the desktop app automatically:
+- **macOS**: Launches via LaunchServices (`open -b com.google.antigravity`), preserving native macOS permissions and bundle discovery (or `open -a <app_path>` when a `.app` bundle path is configured).
+- **Linux / Windows**: Auto-discovers standard install locations and `PATH` (overridable via `app_path` or `AGY_GYRO_APP_PATH`).
+
+> **Notes for Desktop App**:
+> - Antigravity enforces a single-instance lock. If the desktop app is already running without `agy-gyro`, quit the existing app completely before running `agy-gyro app` so the fresh launch picks up the gateway environment variables.
+> - Antigravity merges your login shell environment (`~/.zshrc`, `~/.bash_profile`, etc.) over inherited process environment variables when starting its bundled language server. Avoid exporting stale `AGY_LLM_GATEWAY_*` variables in your shell rc files.
+
 ### Live Usage & Cost TUI Dashboard (`agy-gyro monitor`)
 
-`agy-gyro monitor` provides an interactive TUI frontend for real-time token usage, request statistics, estimated USD costs, and gateway logs (use `Tab` or `←`/`→` to switch between `[All Sessions]` and individual `agy` sessions, `r` to reset stats, and `b` to toggle full SSE buffering at runtime):
+`agy-gyro monitor` provides an interactive TUI frontend for real-time token usage, request statistics, estimated USD costs, and gateway logs (use `Tab` or `←`/`→` to switch between `[All Sessions]` and individual sessions, `r` to reset stats, and `b` to toggle full SSE buffering at runtime):
 
 ```bash
 agy-gyro monitor
@@ -86,10 +112,10 @@ agy-gyro monitor
 
 ### Managing the Background Daemon (`agy-gyro server` / `agy-gyro stop`)
 
-While running `agy-gyro` starts the daemon automatically, you can also start or stop the background daemon explicitly:
+You can also start or stop the background daemon explicitly without launching Antigravity:
 
 ```bash
-# Start the background daemon without launching agy:
+# Start the background daemon without launching Antigravity:
 agy-gyro server
 
 # Stop the background daemon at any time:
@@ -122,6 +148,7 @@ Settings are resolved in order of precedence: **Environment variables > `~/.gemi
 | `port`                       | `AGY_GYRO_PORT`      | `6470`      | Port to listen on or connect to (`0` = OS-assigned port) |
 | `api_key`                    | `AGY_GYRO_API_KEY`   | _None_      | Gemini API key for authenticating upstream requests      |
 | `agy_path`                   | `AGY_GYRO_AGY_PATH`  | `agy`       | Executable path for Antigravity CLI                      |
+| `app_path`                   | `AGY_GYRO_APP_PATH`  | _Auto_      | Path to `Antigravity.app` (macOS) or desktop executable  |
 | `log_file`                   | _TOML only_          | _None_      | Path to log file for daemon proxy tracing logs           |
 | `max_retries`                | _TOML only_          | `15`        | Maximum number of retry attempts for retriable errors    |
 | `initial_delay_ms`           | _TOML only_          | `1000`      | Initial retry backoff delay in milliseconds              |
@@ -145,17 +172,17 @@ log_file = "/tmp/gyro.log"
 ### Default Mode: Streaming Passthrough (`buffer = false`)
 
 In default mode, `agy-gyro` verifies Chunk 1 and immediately streams subsequent tokens to minimize time-to-first-token latency:
-- **Chunk 1 Error**: Retried seamlessly before sending headers to `agy`.
-- **Automatic Keep-Alive Heartbeats**: If waiting on Chunk 1 or retry backoff exceeds 15 seconds, `agy-gyro` commits `200 OK` headers and streams periodic keep-alive heartbeats (`: keep-alive\n\n` for SSE) to satisfy `agy`'s 60-second `ResponseHeaderTimeout`.
+- **Chunk 1 Error**: Retried seamlessly before sending headers to Antigravity.
+- **Automatic Keep-Alive Heartbeats**: If waiting on Chunk 1 or retry backoff exceeds 15 seconds, `agy-gyro` commits `200 OK` headers and streams periodic keep-alive heartbeats (`: keep-alive\n\n` for SSE) to satisfy Antigravity's 60-second `ResponseHeaderTimeout`.
 - **Mid-Stream Error (Chunk $N > 1$)**: Forwarded downstream to prevent duplicated tokens.
 
 ### Full Stream Buffering Mode (`buffer = true`)
 
-When `buffer = true` in `~/.gemini/config/agy-gyro.toml` (or toggled live by pressing `b` in `agy-gyro monitor`), `agy-gyro` buffers all incoming stream chunks before delivering them to `agy`:
+When `buffer = true` in `~/.gemini/config/agy-gyro.toml` (or toggled live by pressing `b` in `agy-gyro monitor`), `agy-gyro` buffers all incoming stream chunks before delivering them to Antigravity:
 1. **Full Verification**: Ensures every chunk in the response is error-free and that the upstream stream completes cleanly.
 2. **Zero-Byte Leakage**: If an error (e.g. `503 UNAVAILABLE`, `429 RESOURCE_EXHAUSTED`, or network disconnect) occurs at chunk 1 or mid-stream, `agy-gyro` discards the buffered chunks and replays the request from scratch.
 3. **Automatic Keep-Alive Heartbeats**: If buffering or retry backoff exceeds 15 seconds, `agy-gyro` commits `200 OK` headers and streams periodic keep-alive heartbeats (`: keep-alive\n\n` for SSE) while continuing to buffer and retry in the background.
-4. **Flawless Delivery**: `agy` only receives verified, complete streams without partial output or syntax errors.
+4. **Flawless Delivery**: Antigravity only receives verified, complete streams without partial output or syntax errors.
 
 ## License
 

@@ -2,7 +2,7 @@
 
 use agy_gyro::config::{Cli, Commands, Config};
 use agy_gyro::proxy::{ProxyState, create_router};
-use agy_gyro::runner::{run_wrapper, start_daemon, stop_daemon};
+use agy_gyro::runner::{run_app, run_wrapper, start_daemon, stop_daemon};
 use agy_gyro::tui::run_monitor;
 use agy_gyro::usage::UsageLogLayer;
 use std::path::Path;
@@ -44,6 +44,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         Commands::Run(agy_args) => {
             let code = run_wrapper(cli.config, agy_args)?;
+            std::process::exit(code);
+        }
+        Commands::App(app_args) => {
+            let code = run_app(cli.config, app_args)?;
             std::process::exit(code);
         }
     }
