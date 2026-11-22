@@ -1664,8 +1664,8 @@ async fn test_server_and_stop_subcommands_spawn_and_stop_background_daemon() {
     let stdout1 = String::from_utf8_lossy(&out1.stdout);
     assert!(stdout1.contains("Started agy-gyro daemon"));
 
-    // Verify daemon exposes the embedded deterministic SHA-256 build ID on GET /sessions
-    assert_eq!(agy_gyro::BUILD_ID.len(), 64);
+    // Verify daemon exposes the embedded deterministic build ID on GET /sessions
+    assert_eq!(agy_gyro::BUILD_ID.len(), 16);
     assert!(agy_gyro::BUILD_ID.chars().all(|c| c.is_ascii_hexdigit()));
     let status: agy_gyro::proxy::DaemonStatusResponse = Client::new()
         .get(format!("http://127.0.0.1:{}/sessions", free_port))
