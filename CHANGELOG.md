@@ -5,6 +5,19 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.3] - 2026-11-21
+
+### Added
+- **Antigravity Desktop App Launcher (`agy-gyro app`)**: Added the `agy-gyro app` subcommand to launch the Antigravity desktop application detached with Enterprise Gateway environment variables configured. Launches via macOS LaunchServices (`open -b com.google.antigravity` or `-a <app_path>` for `.app` bundles), or auto-discovers and spawns the executable directly on Linux, Windows, and custom binary paths, with `app_path` and `AGY_GYRO_APP_PATH` override support.
+
+### Changed
+- **Unified Lazy Session Lifecycle**: Unified both `agy` CLI and desktop app onto lazy session creation driven by `AGY_LLM_GATEWAY_API_KEY`, removing eager `POST /sessions` and `DELETE /sessions/{id}` registration/cleanup calls to prevent stale sessions on quick exits or Electron single-instance handoffs. CLI sessions preserve OS PID liveness tracking, the desktop app uses a fixed `#app Antigravity` session, and catalog/pricing refreshes on already-running daemons are triggered via `GET /sessions?refresh=1`.
+- **Recency-Ordered TUI Session Tabs**: Updated `agy-gyro monitor` and `/usage` snapshots to order individual session tabs with the most recently used active session leftmost (immediately after `[All Sessions]`), followed by older active sessions and exited sessions on the right.
+- **Simplified Build ID Hashing**: Replaced the custom SHA-256 implementation in `build.rs` with `std::hash::DefaultHasher` over the crate source files (`Cargo.toml`, `Cargo.lock`, `build.rs`, and `src/`).
+
+### Removed
+- **`AGY_GYRO_API_KEY` Environment Variable**: Removed `AGY_GYRO_API_KEY` support; the Gemini API key is now configurable exclusively via `GEMINI_API_KEY` or `api_key` in `~/.gemini/config/agy-gyro.toml`.
+
 ## [0.2.2] - 2026-11-21
 
 ### Added
