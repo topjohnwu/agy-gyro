@@ -173,7 +173,6 @@ log_file = "/tmp/gyro.log"
 
 In default mode, `agy-gyro` verifies Chunk 1 and immediately streams subsequent tokens to minimize time-to-first-token latency:
 - **Chunk 1 Error**: Retried seamlessly before sending headers to Antigravity.
-- **Automatic Keep-Alive Heartbeats**: If waiting on Chunk 1 or retry backoff exceeds 15 seconds, `agy-gyro` commits `200 OK` headers and streams periodic keep-alive heartbeats (`: keep-alive\n\n` for SSE) to satisfy Antigravity's 60-second `ResponseHeaderTimeout`.
 - **Mid-Stream Error (Chunk $N > 1$)**: Forwarded downstream to prevent duplicated tokens.
 
 ### Full Stream Buffering Mode (`buffer = true`)

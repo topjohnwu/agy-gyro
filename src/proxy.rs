@@ -35,7 +35,8 @@ use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 use tracing::{Instrument, debug, error, info, info_span, warn};
 
-/// Default interval before committing early 200 OK headers and between keep-alive heartbeats.
+/// Default interval before committing early 200 OK headers and between keep-alive heartbeats
+/// when full SSE buffering is enabled.
 /// Set to 15 seconds to stay well below agy's 60-second ResponseHeaderTimeout.
 pub const DEFAULT_KEEP_ALIVE_INTERVAL: Duration = Duration::from_secs(15);
 
@@ -643,6 +644,7 @@ struct RequestContext {
     model_from_path: Option<String>,
     req_start: Instant,
     active_guard: Option<ActiveRequestGuard>,
+    buffer_enabled: bool,
 }
 
 enum AttemptOutcome {
@@ -658,6 +660,7 @@ impl RequestContext {
         headers: HeaderMap,
         body: Bytes,
         session: Option<SessionMeta>,
+        buffer_enabled: bool,
     ) -> Self {
         let req_start = Instant::now();
         let endpoint = format_endpoint(&target_url);
@@ -682,6 +685,7 @@ impl RequestContext {
             model_from_path,
             req_start,
             active_guard,
+            buffer_enabled,
         }
     }
 
@@ -1153,7 +1157,7 @@ async fn execute_single_attempt(ctx: &mut RequestContext, attempt: u32) -> Attem
                     .and_then(|v| v.to_str().ok())
                     .is_some_and(|v| v.contains("text/event-stream"));
 
-            if ctx.state.is_buffer_enabled() {
+            if ctx.buffer_enabled {
                 collect_buffered_response(ctx, status, res_headers, upstream_res, is_sse, attempt)
                     .await
             } else {
@@ -1202,8 +1206,17 @@ async fn execute_proxy_request(
     headers: HeaderMap,
     body: Bytes,
     session: Option<SessionMeta>,
+    buffer_enabled: bool,
 ) -> UpstreamOutcome {
-    let mut ctx = RequestContext::new(state, method, target_url, headers, body, session);
+    let mut ctx = RequestContext::new(
+        state,
+        method,
+        target_url,
+        headers,
+        body,
+        session,
+        buffer_enabled,
+    );
     let mut attempt = 0;
 
     loop {
@@ -1285,15 +1298,33 @@ pub async fn proxy_handler(
         }
     };
 
+    let buffer_enabled = state.is_buffer_enabled();
+    drop(_enter);
+
+    if !buffer_enabled {
+        let outcome =
+            execute_proxy_request(state, method, target_url, headers, body, session, false)
+                .instrument(req_span.clone())
+                .await;
+        let _enter = req_span.enter();
+        return outcome.into_fast_response(&session_prefix);
+    }
+
     let is_sse = is_sse_request(&rewritten_path_and_query, &headers);
     let keep_alive_interval = state.keep_alive_interval;
     let endpoint = format_endpoint(&target_url);
 
-    drop(_enter);
-
     let mut work_fut = Box::pin(
-        execute_proxy_request(state, method.clone(), target_url, headers, body, session)
-            .instrument(req_span.clone()),
+        execute_proxy_request(
+            state,
+            method.clone(),
+            target_url,
+            headers,
+            body,
+            session,
+            true,
+        )
+        .instrument(req_span.clone()),
     );
 
     // Wait up to `keep_alive_interval` for the request (including buffering/retries) to finish

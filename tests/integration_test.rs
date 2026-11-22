@@ -1185,8 +1185,9 @@ async fn test_keep_alive_forwards_in_stream_error_when_retries_exhausted() {
         .mount(&mock_server)
         .await;
 
+    // Buffered mode (buffer = true) enables keep-alive heartbeats while retrying
     let proxy_url =
-        spawn_test_proxy_with_keep_alive(mock_server.uri(), 1, false, Duration::from_millis(25))
+        spawn_test_proxy_with_keep_alive(mock_server.uri(), 1, true, Duration::from_millis(25))
             .await;
 
     let req_client = Client::new();
@@ -1249,6 +1250,162 @@ async fn test_buffered_mode_json_keep_alive_on_slow_generate_content() {
         body["candidates"][0]["content"]["parts"][0]["text"],
         "Slow non-SSE JSON response"
     );
+}
+
+#[tokio::test]
+async fn test_passthrough_mode_skips_keep_alive_heartbeat() {
+    use agy_gyro::tui::{fetch_logs_snapshot, toggle_remote_buffer};
+
+    let mock_server = MockServer::start().await;
+
+    // 1. Slow SSE response exceeding keep_alive_interval
+    Mock::given(method("POST"))
+        .and(path("/v1beta/models/gemini-4-argon:streamGenerateContent"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_delay(Duration::from_millis(60))
+                .insert_header("content-type", "text/event-stream")
+                .insert_header("x-upstream-marker", "passthrough-sse")
+                .set_body_string(
+                    "data: {\"candidates\": [{\"content\": {\"parts\": [{\"text\": \"Slow passthrough SSE\"}]}}]}\n\n",
+                ),
+        )
+        .expect(2)
+        .mount(&mock_server)
+        .await;
+
+    // 2. Slow non-SSE JSON response exceeding keep_alive_interval
+    Mock::given(method("POST"))
+        .and(path("/v1beta/models/gemini-4-argon:generateContent"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_delay(Duration::from_millis(60))
+                .insert_header("content-type", "application/json")
+                .insert_header("x-upstream-marker", "passthrough-json")
+                .set_body_json(serde_json::json!({
+                    "candidates": [{
+                        "content": { "parts": [{ "text": "Slow passthrough JSON" }] }
+                    }]
+                })),
+        )
+        .expect(1)
+        .mount(&mock_server)
+        .await;
+
+    // 3. Slow 503 error response exceeding keep_alive_interval across retries
+    Mock::given(method("POST"))
+        .and(path("/v1beta/models/gemini-4-neon:streamGenerateContent"))
+        .respond_with(
+            ResponseTemplate::new(503)
+                .set_delay(Duration::from_millis(40))
+                .set_body_json(serde_json::json!({
+                    "error": {
+                        "code": 503,
+                        "message": "Persistent backend overload",
+                        "status": "UNAVAILABLE"
+                    }
+                })),
+        )
+        .expect(2)
+        .mount(&mock_server)
+        .await;
+
+    let proxy_url =
+        spawn_test_proxy_with_keep_alive(mock_server.uri(), 1, false, Duration::from_millis(20))
+            .await;
+
+    let client = Client::new();
+
+    // 1. Slow SSE in passthrough mode (buffer = false): no keep-alive frame, original headers preserved
+    let sse_res = client
+        .post(format!(
+            "{}/v1beta/models/gemini-4-argon:streamGenerateContent?alt=sse",
+            proxy_url
+        ))
+        .header("Authorization", "Bearer gyro:8:999:nokeepalive-sess")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(sse_res.status(), 200);
+    assert_eq!(
+        sse_res
+            .headers()
+            .get("x-upstream-marker")
+            .and_then(|v| v.to_str().ok()),
+        Some("passthrough-sse")
+    );
+    let sse_text = sse_res.text().await.unwrap();
+    assert!(!sse_text.contains(": keep-alive"));
+    assert!(sse_text.contains("Slow passthrough SSE"));
+
+    // 2. Slow JSON in passthrough mode (buffer = false): no leading newline keep-alive byte
+    let json_res = client
+        .post(format!(
+            "{}/v1beta/models/gemini-4-argon:generateContent",
+            proxy_url
+        ))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(json_res.status(), 200);
+    assert_eq!(
+        json_res
+            .headers()
+            .get("x-upstream-marker")
+            .and_then(|v| v.to_str().ok()),
+        Some("passthrough-json")
+    );
+    let json_bytes = json_res.bytes().await.unwrap();
+    assert!(!json_bytes.starts_with(b"\n"));
+    let json_val: serde_json::Value = serde_json::from_slice(&json_bytes).unwrap();
+    assert_eq!(
+        json_val["candidates"][0]["content"]["parts"][0]["text"],
+        "Slow passthrough JSON"
+    );
+
+    // 3. Exhausted retries in passthrough mode return actual upstream 503 without committing 200 OK
+    let err_res = client
+        .post(format!(
+            "{}/v1beta/models/gemini-4-neon:streamGenerateContent?alt=sse",
+            proxy_url
+        ))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(err_res.status(), 503);
+    let err_text = err_res.text().await.unwrap();
+    assert!(!err_text.contains(": keep-alive"));
+    assert!(err_text.contains("Persistent backend overload"));
+
+    // Verify no keep-alive heartbeats were logged while buffering was disabled
+    let logs = fetch_logs_snapshot(&client, &format!("{}/logs", proxy_url))
+        .await
+        .unwrap();
+    assert!(!logs.iter().any(|l| {
+        l.session_id.as_deref() == Some("8")
+            && (l.message.contains("Sending keep-alive heartbeat")
+                || l.message.contains("starting keep-alive stream"))
+    }));
+
+    // 4. Enabling buffering at runtime via POST /buffer re-enables keep-alive heartbeats
+    let toggled_on = toggle_remote_buffer(&client, &format!("{}/buffer", proxy_url), Some(true))
+        .await
+        .unwrap();
+    assert!(toggled_on.buffer_enabled);
+
+    let buffered_sse_res = client
+        .post(format!(
+            "{}/v1beta/models/gemini-4-argon:streamGenerateContent?alt=sse",
+            proxy_url
+        ))
+        .header("Authorization", "Bearer gyro:8:999:nokeepalive-sess")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(buffered_sse_res.status(), 200);
+    let buffered_sse_text = buffered_sse_res.text().await.unwrap();
+    assert!(buffered_sse_text.contains(": keep-alive\n\n"));
+    assert!(buffered_sse_text.contains("Slow passthrough SSE"));
 }
 
 #[tokio::test]
