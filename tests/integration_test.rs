@@ -1584,6 +1584,14 @@ async fn test_multi_session_registration_attribution_and_exit() {
         assert_eq!(res.status(), 200);
     }
 
+    // While both sessions are active, Session 2 (most recently used) appears first
+    let snap_active = fetch_usage_snapshot(&client, &usage_url).await.unwrap();
+    assert_eq!(snap_active.sessions.len(), 2);
+    assert_eq!(snap_active.sessions[0].id, session2_id);
+    assert!(snap_active.sessions[0].active);
+    assert_eq!(snap_active.sessions[1].id, session1_id);
+    assert!(snap_active.sessions[1].active);
+
     // Terminate Session 2's OS process and reap it so OS-level process monitoring sees it exited
     dummy_proc.kill().await.unwrap();
     let _ = dummy_proc.wait().await;

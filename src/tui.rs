@@ -239,61 +239,50 @@ impl DashboardState {
             .or_else(|| self.snapshot.as_ref().map(|s| &s.stats))
     }
 
-    /// Switches to the next session tab (`[All Sessions]` -> `#1` -> `#2` -> ... -> `[All Sessions]`).
-    pub fn select_next_session(&mut self) {
+    /// Returns sessions in TUI tab order: active sessions first (most recently active leftmost),
+    /// followed by exited sessions on the right.
+    pub fn ordered_sessions(&self) -> Vec<&SessionUsageStats> {
         let Some(ref snap) = self.snapshot else {
-            self.selected_session = None;
-            return;
+            return Vec::new();
         };
-        if snap.sessions.is_empty() {
+        let mut sessions: Vec<&SessionUsageStats> = snap.sessions.iter().collect();
+        sessions.sort_by_key(|s| !s.active);
+        sessions
+    }
+
+    /// Switches to the next session tab (`[All Sessions]` -> most recent active -> ... -> exited -> `[All Sessions]`).
+    pub fn select_next_session(&mut self) {
+        let sessions = self.ordered_sessions();
+        if sessions.is_empty() {
             self.selected_session = None;
             return;
         }
-        match self.selected_session.as_deref() {
-            None => {
-                self.selected_session = Some(snap.sessions[0].id.clone());
-            }
-            Some(cur) => {
-                if let Some(pos) = snap.sessions.iter().position(|s| s.id == cur) {
-                    if pos + 1 < snap.sessions.len() {
-                        self.selected_session = Some(snap.sessions[pos + 1].id.clone());
-                    } else {
-                        self.selected_session = None;
-                    }
-                } else {
-                    self.selected_session = None;
-                }
-            }
-        }
+        let next = match self.selected_session.as_deref() {
+            None => Some(sessions[0].id.clone()),
+            Some(cur) => match sessions.iter().position(|s| s.id == cur) {
+                Some(pos) if pos + 1 < sessions.len() => Some(sessions[pos + 1].id.clone()),
+                _ => None,
+            },
+        };
+        self.selected_session = next;
         self.log_scroll_from_bottom = 0;
     }
 
-    /// Switches to the previous session tab (`[All Sessions]` <- `#1` <- `#2` <- ...).
+    /// Switches to the previous session tab (`[All Sessions]` <- most recent active <- ... <- exited).
     pub fn select_prev_session(&mut self) {
-        let Some(ref snap) = self.snapshot else {
+        let sessions = self.ordered_sessions();
+        if sessions.is_empty() {
             self.selected_session = None;
             return;
+        }
+        let prev = match self.selected_session.as_deref() {
+            None => sessions.last().map(|s| s.id.clone()),
+            Some(cur) => match sessions.iter().position(|s| s.id == cur) {
+                Some(pos) if pos > 0 => Some(sessions[pos - 1].id.clone()),
+                _ => None,
+            },
         };
-        if snap.sessions.is_empty() {
-            self.selected_session = None;
-            return;
-        }
-        match self.selected_session.as_deref() {
-            None => {
-                self.selected_session = snap.sessions.last().map(|s| s.id.clone());
-            }
-            Some(cur) => {
-                if let Some(pos) = snap.sessions.iter().position(|s| s.id == cur) {
-                    if pos > 0 {
-                        self.selected_session = Some(snap.sessions[pos - 1].id.clone());
-                    } else {
-                        self.selected_session = None;
-                    }
-                } else {
-                    self.selected_session = None;
-                }
-            }
-        }
+        self.selected_session = prev;
         self.log_scroll_from_bottom = 0;
     }
 
@@ -783,44 +772,42 @@ fn render_header(frame: &mut Frame, area: Rect, state: &DashboardState) {
         },
     ));
 
-    if let Some(ref snap) = state.snapshot {
-        for sess in &snap.sessions {
-            session_spans.push(Span::raw("  "));
-            let is_selected = state.selected_session.as_deref() == Some(sess.id.as_str());
-            let indicator = if sess.active_requests > 0 {
-                spinner
-            } else if sess.active {
-                "●"
-            } else {
-                "○"
-            };
-            let suffix = if !sess.active {
-                " [exited]".to_string()
-            } else if let Some(pid) = sess.pid {
-                format!(" ({})", pid)
-            } else {
-                String::new()
-            };
-            let tab_text = format!(
-                " {} #{} {}{} · {} ",
-                indicator,
-                short_session_id(&sess.id),
-                sess.label,
-                suffix,
-                format_usd(sess.totals.total_cost_usd)
-            );
-            let style = if is_selected {
-                Style::default()
-                    .fg(Color::Black)
-                    .bg(Color::Cyan)
-                    .add_modifier(Modifier::BOLD)
-            } else if sess.active {
-                Style::default().fg(Color::Green)
-            } else {
-                Style::default().fg(Color::DarkGray)
-            };
-            session_spans.push(Span::styled(tab_text, style));
-        }
+    for sess in state.ordered_sessions() {
+        session_spans.push(Span::raw("  "));
+        let is_selected = state.selected_session.as_deref() == Some(sess.id.as_str());
+        let indicator = if sess.active_requests > 0 {
+            spinner
+        } else if sess.active {
+            "●"
+        } else {
+            "○"
+        };
+        let suffix = if !sess.active {
+            " [exited]".to_string()
+        } else if let Some(pid) = sess.pid {
+            format!(" ({})", pid)
+        } else {
+            String::new()
+        };
+        let tab_text = format!(
+            " {} #{} {}{} · {} ",
+            indicator,
+            short_session_id(&sess.id),
+            sess.label,
+            suffix,
+            format_usd(sess.totals.total_cost_usd)
+        );
+        let style = if is_selected {
+            Style::default()
+                .fg(Color::Black)
+                .bg(Color::Cyan)
+                .add_modifier(Modifier::BOLD)
+        } else if sess.active {
+            Style::default().fg(Color::Green)
+        } else {
+            Style::default().fg(Color::DarkGray)
+        };
+        session_spans.push(Span::styled(tab_text, style));
     }
 
     let block = Block::default()
@@ -2012,5 +1999,86 @@ mod tests {
             .map(|s| s.content.as_ref())
             .collect();
         assert_eq!(last_text, format!("{}Explicit newline row", " ".repeat(17)));
+    }
+
+    #[test]
+    fn test_session_tab_ordering_and_navigation() {
+        let mut state = DashboardState::new(&Config::default());
+        state.connected = true;
+        state.snapshot = Some(UsageSnapshot {
+            uptime_secs: 42,
+            stats: ScopeUsageStats::default(),
+            pricing_source: "test".to_string(),
+            buffer_enabled: false,
+            // Deliberately place an exited session ahead of active sessions to verify TUI ordering
+            sessions: vec![
+                SessionUsageStats {
+                    id: "dead-1".to_string(),
+                    label: "old-proj".to_string(),
+                    pid: None,
+                    active: false,
+                    stats: ScopeUsageStats::default(),
+                },
+                SessionUsageStats {
+                    id: "a1-new".to_string(),
+                    label: "recent-proj".to_string(),
+                    pid: Some(200),
+                    active: true,
+                    stats: ScopeUsageStats::default(),
+                },
+                SessionUsageStats {
+                    id: "a2-old".to_string(),
+                    label: "earlier-proj".to_string(),
+                    pid: Some(100),
+                    active: true,
+                    stats: ScopeUsageStats::default(),
+                },
+            ],
+        });
+
+        let backend = TestBackend::new(160, 20);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| render_dashboard(frame, &state))
+            .unwrap();
+
+        let buffer = terminal.backend().buffer();
+        let mut rendered = String::new();
+        for y in 0..buffer.area.height {
+            for x in 0..buffer.area.width {
+                rendered.push_str(buffer[(x, y)].symbol());
+            }
+            rendered.push('\n');
+        }
+
+        // Layout: [All Sessions]  [most recent active]  [older active]  [exited]
+        let all_pos = rendered.find("All Sessions (3)").unwrap();
+        let recent_pos = rendered.find("#a1 recent-proj").unwrap();
+        let earlier_pos = rendered.find("#a2 earlier-proj").unwrap();
+        let dead_pos = rendered.find("#dead old-proj [exited]").unwrap();
+        assert!(all_pos < recent_pos);
+        assert!(recent_pos < earlier_pos);
+        assert!(earlier_pos < dead_pos);
+
+        // Forward Tab / → navigation follows exact left-to-right visual tab order
+        assert_eq!(state.selected_session, None);
+        state.select_next_session();
+        assert_eq!(state.selected_session.as_deref(), Some("a1-new"));
+        state.select_next_session();
+        assert_eq!(state.selected_session.as_deref(), Some("a2-old"));
+        state.select_next_session();
+        assert_eq!(state.selected_session.as_deref(), Some("dead-1"));
+        state.select_next_session();
+        assert_eq!(state.selected_session, None);
+
+        // Backward Shift+Tab / ← navigation follows reverse visual tab order
+        state.select_prev_session();
+        assert_eq!(state.selected_session.as_deref(), Some("dead-1"));
+        state.select_prev_session();
+        assert_eq!(state.selected_session.as_deref(), Some("a2-old"));
+        state.select_prev_session();
+        assert_eq!(state.selected_session.as_deref(), Some("a1-new"));
+        state.select_prev_session();
+        assert_eq!(state.selected_session, None);
     }
 }

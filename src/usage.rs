@@ -493,7 +493,7 @@ impl DerefMut for UsageSnapshot {
 
 #[derive(Debug, Clone)]
 struct SessionEntry {
-    seq: u64,
+    last_activity_seq: u64,
     stats: SessionUsageStats,
     track_pid_liveness: bool,
 }
@@ -501,7 +501,55 @@ struct SessionEntry {
 #[derive(Debug, Default)]
 struct UsageInner {
     global: ScopeUsageStats,
+    next_activity_seq: u64,
     sessions: BTreeMap<String, SessionEntry>,
+}
+
+impl UsageInner {
+    fn ensure_session_entry(
+        &mut self,
+        meta: &SessionMeta,
+        touch_activity: bool,
+    ) -> (&mut SessionEntry, bool) {
+        use std::collections::btree_map::Entry;
+        let next_seq = &mut self.next_activity_seq;
+        match self.sessions.entry(meta.id.clone()) {
+            Entry::Occupied(entry) => {
+                let e = entry.into_mut();
+                let was_active = e.stats.active;
+                e.stats.active = true;
+                if touch_activity || !was_active {
+                    *next_seq += 1;
+                    e.last_activity_seq = *next_seq;
+                }
+                if meta.pid.is_some() {
+                    if !was_active || !e.track_pid_liveness || e.stats.pid != meta.pid {
+                        e.track_pid_liveness = meta.pid.is_some_and(is_pid_alive);
+                    }
+                    e.stats.pid = meta.pid;
+                }
+                if !meta.label.is_empty() && meta.label != "agy" {
+                    e.stats.label = meta.label.clone();
+                }
+                (e, false)
+            }
+            Entry::Vacant(entry) => {
+                *next_seq += 1;
+                let e = entry.insert(SessionEntry {
+                    last_activity_seq: *next_seq,
+                    stats: SessionUsageStats {
+                        id: meta.id.clone(),
+                        label: meta.label.clone(),
+                        pid: meta.pid,
+                        active: true,
+                        stats: ScopeUsageStats::default(),
+                    },
+                    track_pid_liveness: meta.pid.is_some_and(is_pid_alive),
+                });
+                (e, true)
+            }
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -527,7 +575,6 @@ impl Default for LogBuffer {
 pub struct UsageTracker {
     started_at: Instant,
     next_request_id: AtomicU64,
-    next_session_seq: AtomicU64,
     buffer_enabled: AtomicBool,
     pricing: RwLock<PricingTable>,
     inner: RwLock<UsageInner>,
@@ -549,7 +596,6 @@ impl UsageTracker {
         Self {
             started_at: Instant::now(),
             next_request_id: AtomicU64::new(1),
-            next_session_seq: AtomicU64::new(1),
             buffer_enabled: AtomicBool::new(false),
             pricing: RwLock::new(pricing),
             inner: RwLock::new(UsageInner::default()),
@@ -813,45 +859,6 @@ impl UsageTracker {
         );
     }
 
-    fn ensure_session_entry<'a>(
-        &self,
-        inner: &'a mut UsageInner,
-        meta: &SessionMeta,
-    ) -> (&'a mut SessionEntry, bool) {
-        use std::collections::btree_map::Entry;
-        match inner.sessions.entry(meta.id.clone()) {
-            Entry::Occupied(entry) => {
-                let e = entry.into_mut();
-                let was_active = e.stats.active;
-                e.stats.active = true;
-                if meta.pid.is_some() {
-                    if !was_active || !e.track_pid_liveness || e.stats.pid != meta.pid {
-                        e.track_pid_liveness = meta.pid.is_some_and(is_pid_alive);
-                    }
-                    e.stats.pid = meta.pid;
-                }
-                if !meta.label.is_empty() && meta.label != "agy" {
-                    e.stats.label = meta.label.clone();
-                }
-                (e, false)
-            }
-            Entry::Vacant(entry) => {
-                let e = entry.insert(SessionEntry {
-                    seq: self.next_session_seq.fetch_add(1, Ordering::Relaxed),
-                    stats: SessionUsageStats {
-                        id: meta.id.clone(),
-                        label: meta.label.clone(),
-                        pid: meta.pid,
-                        active: true,
-                        stats: ScopeUsageStats::default(),
-                    },
-                    track_pid_liveness: meta.pid.is_some_and(is_pid_alive),
-                });
-                (e, true)
-            }
-        }
-    }
-
     /// Marks the start of an in-flight proxy request and returns an RAII guard that
     /// decrements `active_requests` when dropped.
     pub fn begin_request(self: &Arc<Self>) -> ActiveRequestGuard {
@@ -867,7 +874,7 @@ impl UsageTracker {
         let session_id = if let Ok(mut inner) = self.inner.write() {
             inner.global.begin_request();
             if let Some(meta) = session {
-                let (entry, is_new) = self.ensure_session_entry(&mut inner, meta);
+                let (entry, is_new) = inner.ensure_session_entry(meta, true);
                 started_new = is_new;
                 entry.stats.begin_request();
                 Some(meta.id.clone())
@@ -900,7 +907,7 @@ impl UsageTracker {
         if let Ok(mut inner) = self.inner.write() {
             inner.global.record_retry();
             if let Some(meta) = session {
-                let (entry, is_new) = self.ensure_session_entry(&mut inner, meta);
+                let (entry, is_new) = inner.ensure_session_entry(meta, false);
                 started_new = is_new;
                 entry.stats.record_retry();
             }
@@ -973,7 +980,7 @@ impl UsageTracker {
             );
 
             if let Some(meta) = session {
-                let (sess_entry, is_new) = self.ensure_session_entry(&mut inner, meta);
+                let (sess_entry, is_new) = inner.ensure_session_entry(meta, false);
                 started_new = is_new;
                 sess_entry.stats.record_completed(
                     &canonical_model,
@@ -1116,9 +1123,14 @@ impl UsageTracker {
                 let mut entries: Vec<(u64, SessionUsageStats)> = inner
                     .sessions
                     .values()
-                    .map(|e| (e.seq, e.stats.clone()))
+                    .map(|e| (e.last_activity_seq, e.stats.clone()))
                     .collect();
-                entries.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.id.cmp(&b.1.id)));
+                entries.sort_by(|a, b| {
+                    b.1.active
+                        .cmp(&a.1.active)
+                        .then_with(|| b.0.cmp(&a.0))
+                        .then_with(|| a.1.id.cmp(&b.1.id))
+                });
                 let sessions = entries.into_iter().map(|(_, s)| s).collect();
                 (inner.global.clone(), sessions)
             }
@@ -1421,6 +1433,92 @@ mod tests {
         assert_eq!(snap2.sessions.len(), 1);
         assert_eq!(snap2.sessions[0].id, s1.id);
         assert_eq!(snap2.totals.input_tokens, 10_000);
+    }
+
+    #[test]
+    fn test_session_ordering_most_recent_active_first() {
+        let tracker = Arc::new(UsageTracker::default());
+        let s1 = SessionMeta {
+            id: generate_session_uuid(),
+            label: "one".to_string(),
+            pid: None,
+        };
+        let s2 = SessionMeta {
+            id: generate_session_uuid(),
+            label: "two".to_string(),
+            pid: None,
+        };
+        let s3 = SessionMeta {
+            id: generate_session_uuid(),
+            label: "three".to_string(),
+            pid: None,
+        };
+
+        let ids = |tracker: &UsageTracker| -> Vec<String> {
+            tracker
+                .snapshot()
+                .sessions
+                .into_iter()
+                .map(|s| s.id)
+                .collect()
+        };
+
+        let g1 = tracker.begin_session_request(Some(&s1));
+        assert_eq!(ids(&tracker), vec![s1.id.clone()]);
+
+        let g2 = tracker.begin_session_request(Some(&s2));
+        assert_eq!(ids(&tracker), vec![s2.id.clone(), s1.id.clone()]);
+
+        let g3 = tracker.begin_session_request(Some(&s3));
+        assert_eq!(
+            ids(&tracker),
+            vec![s3.id.clone(), s2.id.clone(), s1.id.clone()]
+        );
+
+        // Sending a new request on older session s1 moves it to the leftmost slot
+        let g1_b = tracker.begin_session_request(Some(&s1));
+        assert_eq!(
+            ids(&tracker),
+            vec![s1.id.clone(), s3.id.clone(), s2.id.clone()]
+        );
+
+        // Completing an older in-flight request on s2 must NOT steal the leftmost slot from s1
+        drop(g2);
+        tracker.record_session_completed_request(
+            Some(&s2),
+            "gemini-4-argon",
+            200,
+            0,
+            Duration::from_millis(10),
+            None,
+        );
+        assert_eq!(
+            ids(&tracker),
+            vec![s1.id.clone(), s3.id.clone(), s2.id.clone()]
+        );
+
+        drop((g1, g1_b, g3));
+
+        // Exiting s1 moves it to the right of active sessions s3 and s2
+        tracker.mark_session_exited(&s1.id);
+        assert_eq!(
+            ids(&tracker),
+            vec![s3.id.clone(), s2.id.clone(), s1.id.clone()]
+        );
+
+        // Exiting s2 puts both exited sessions on the right, ordered by recency (s1 more recent than s2)
+        tracker.mark_session_exited(&s2.id);
+        assert_eq!(
+            ids(&tracker),
+            vec![s3.id.clone(), s1.id.clone(), s2.id.clone()]
+        );
+
+        // Reviving exited s2 with a new request moves it back to leftmost
+        let _g2_revived = tracker.begin_session_request(Some(&s2));
+        assert_eq!(
+            ids(&tracker),
+            vec![s2.id.clone(), s3.id.clone(), s1.id.clone()]
+        );
     }
 
     #[test]
