@@ -289,6 +289,7 @@ fn clear_test_env_vars() {
         }
     }
     for &var in &[
+        "AGY_GYRO_API_KEY",
         "AGY_GYRO_MAX_RETRIES",
         "AGY_GYRO_INITIAL_DELAY_MS",
         "AGY_GYRO_MAX_DELAY_MS",
@@ -908,6 +909,13 @@ fn test_cli_parse_toml_config() {
     assert!(Cli::try_parse_with_config_from(["agy-gyro", "server"], Some(&temp_path)).is_err());
     assert!(Cli::try_parse_with_config_from(["agy-gyro", "app"], Some(&temp_path)).is_err());
 
+    // AGY_GYRO_API_KEY is not recognized; API key must come from TOML or GEMINI_API_KEY
+    unsafe {
+        std::env::set_var("AGY_GYRO_API_KEY", "ignored-agy-gyro-key");
+    }
+    assert!(Cli::try_parse_with_config_from(["agy-gyro"], Some(&temp_path)).is_err());
+    clear_test_env_vars();
+
     // Create temporary agy-gyro.toml
     std::fs::write(
         &temp_path,
@@ -987,13 +995,21 @@ request_timeout_secs = 120
     );
 
     // 3. Precedence: Environment variables override TOML for wrapper/network settings,
-    // but daemon-only settings cannot be overridden via environment variables.
+    // but daemon-only settings and AGY_GYRO_API_KEY are not recognized via environment variables.
     unsafe {
+        std::env::set_var("AGY_GYRO_API_KEY", "ignored-agy-gyro-key");
         std::env::set_var("AGY_GYRO_MAX_RETRIES", "42");
         std::env::set_var("AGY_GYRO_HOST", "10.0.0.1");
         std::env::set_var("AGY_GYRO_AGY_PATH", "/custom/agy");
         std::env::set_var("AGY_GYRO_APP_PATH", "/custom/Antigravity.app");
         std::env::set_var("AGY_GYRO_BUFFER", "false");
+    }
+
+    let cli_ignored_api_key =
+        Cli::try_parse_with_config_from(["agy-gyro"], Some(&temp_path)).unwrap();
+    assert_eq!(cli_ignored_api_key.config.api_key, "toml-gemini-key");
+
+    unsafe {
         std::env::set_var("GEMINI_API_KEY", "env-gemini-key-123");
     }
 

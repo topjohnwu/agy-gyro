@@ -11,7 +11,6 @@ pub use crate::models::{DEFAULT_GATEWAY_MODELS, MODEL_EFFORT_LEVELS, NON_CORE_KE
 pub const DEFAULT_PORT: u16 = 6470;
 
 pub const ENV_GEMINI_API_KEY: &str = "GEMINI_API_KEY";
-pub const ENV_API_KEY: &str = "AGY_GYRO_API_KEY";
 pub const ENV_HOST: &str = "AGY_GYRO_HOST";
 pub const ENV_PORT: &str = "AGY_GYRO_PORT";
 pub const ENV_AGY_PATH: &str = "AGY_GYRO_AGY_PATH";
@@ -20,7 +19,6 @@ pub const ENV_APP_PATH: &str = "AGY_GYRO_APP_PATH";
 /// All configuration environment variables recognized by [`Cli::try_parse_with_config_from`].
 pub const KNOWN_ENV_VARS: &[&str] = &[
     ENV_GEMINI_API_KEY,
-    ENV_API_KEY,
     ENV_HOST,
     ENV_PORT,
     ENV_AGY_PATH,
@@ -201,7 +199,6 @@ impl Config {
     pub fn apply_env_to_command(&self, cmd: &mut std::process::Command, port: u16) {
         cmd.env(ENV_HOST, &self.host)
             .env(ENV_PORT, port.to_string())
-            .env(ENV_API_KEY, &self.api_key)
             .env(ENV_GEMINI_API_KEY, &self.api_key);
     }
 }
@@ -259,8 +256,7 @@ impl Cli {
         let no_jitter = file_config.no_jitter.unwrap_or(false);
         let buffer = file_config.buffer.unwrap_or(false);
         let request_timeout_secs = file_config.request_timeout_secs.unwrap_or(600);
-        let api_key = env_non_empty(ENV_API_KEY)
-            .or_else(|| env_non_empty(ENV_GEMINI_API_KEY))
+        let api_key = env_non_empty(ENV_GEMINI_API_KEY)
             .or(file_config.api_key)
             .unwrap_or_default();
         let agy_path = env_non_empty(ENV_AGY_PATH)

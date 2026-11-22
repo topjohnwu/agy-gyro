@@ -146,7 +146,7 @@ Settings are resolved in order of precedence: **Environment variables > `~/.gemi
 | :--------------------------- | :------------------- | :---------- | :------------------------------------------------------- |
 | `host`                       | `AGY_GYRO_HOST`      | `127.0.0.1` | Host address to bind or connect to the gateway server    |
 | `port`                       | `AGY_GYRO_PORT`      | `6470`      | Port to listen on or connect to (`0` = OS-assigned port) |
-| `api_key`                    | `AGY_GYRO_API_KEY`   | _None_      | Gemini API key for authenticating upstream requests      |
+| `api_key`                    | `GEMINI_API_KEY`     | _None_      | Gemini API key for authenticating upstream requests      |
 | `agy_path`                   | `AGY_GYRO_AGY_PATH`  | `agy`       | Executable path for Antigravity CLI                      |
 | `app_path`                   | `AGY_GYRO_APP_PATH`  | _Auto_      | Path to `Antigravity.app` (macOS) or desktop executable  |
 | `log_file`                   | _TOML only_          | _None_      | Path to log file for daemon proxy tracing logs           |
