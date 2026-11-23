@@ -1276,7 +1276,7 @@ pub async fn proxy_handler(
     let _enter = req_span.enter();
 
     let (rewritten_path_and_query, effort_from_path) =
-        rewrite_request_path_and_extract_effort(raw_path_and_query);
+        crate::models::rewrite_proxy_request_path(raw_path_and_query, || state.gateway_models());
     let body = match effort_from_path {
         Some(effort) => inject_thinking_level_if_missing(body, effort),
         None => body,

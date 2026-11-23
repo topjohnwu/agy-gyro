@@ -9,12 +9,24 @@ use tracing::{info, warn};
 /// Fallback list of Gemini models if dynamic discovery fails.
 pub const DEFAULT_GATEWAY_MODELS: &[&str] = &[
     "gemini-4-neon",
+    "gemini-4-carbon",
     "gemini-4-hydrogen",
     "gemini-4-argon",
     "gemini-3.8-flash",
     "gemini-3.1-flash-image",
     "gemini-3.5-flash-lite",
 ];
+
+/// Synthetic gateway model identifier exposed in `/v1beta/models` so Antigravity Hub and CLI
+/// enable the client-side Orchestrator (Plan & Execute) row.
+pub const ORCHESTRATOR_MODEL_ID: &str = "gemini-pro-orchestrator";
+
+/// Gemini base model IDs eligible for the Orchestrator (planner) role in Antigravity.
+pub const ORCHESTRATOR_PLANNER_MODELS: &[&str] =
+    &["gemini-4-neon", "gemini-4-carbon", "gemini-4-argon"];
+
+/// Gemini base model IDs eligible for the Executor role in Antigravity.
+pub const ORCHESTRATOR_EXECUTOR_MODELS: &[&str] = &["gemini-4-hydrogen"];
 
 /// Effort suffixes recognized for thinking-capable Gemini models (`medium -> high -> low` so
 /// `-medium` is the default for primary models).
@@ -205,31 +217,111 @@ pub fn extract_model_from_path(path_and_query: &str) -> Option<String> {
     }
 }
 
+struct ModelsPathParts<'a> {
+    prefix: &'a str,
+    model: &'a str,
+    rest_path: &'a str,
+    query: Option<&'a str>,
+}
+
+impl<'a> ModelsPathParts<'a> {
+    fn parse(path_and_query: &'a str) -> Option<Self> {
+        let (path, query) = match path_and_query.split_once('?') {
+            Some((p, q)) => (p, Some(q)),
+            None => (path_and_query, None),
+        };
+        let (prefix, after_models) = path.split_once("/models/")?;
+        let sep_idx = after_models.find([':', '/']).unwrap_or(after_models.len());
+        Some(Self {
+            prefix,
+            model: &after_models[..sep_idx],
+            rest_path: &after_models[sep_idx..],
+            query,
+        })
+    }
+
+    fn format_with_model(&self, model: &str) -> String {
+        match self.query {
+            Some(q) => format!("{}/models/{}{}?{}", self.prefix, model, self.rest_path, q),
+            None => format!("{}/models/{}{}", self.prefix, model, self.rest_path),
+        }
+    }
+}
+
 /// Strips a trailing `-<effort>` suffix from the model segment of a Gemini API request path
 /// (e.g. `/v1beta/models/gemini-4-argon-medium:streamGenerateContent?alt=sse` ->
 /// `("/v1beta/models/gemini-4-argon:streamGenerateContent?alt=sse", Some("medium"))`).
 pub fn rewrite_request_path_and_extract_effort(
     path_and_query: &str,
 ) -> (String, Option<&'static str>) {
-    let (path, query) = match path_and_query.split_once('?') {
-        Some((p, q)) => (p, Some(q)),
-        None => (path_and_query, None),
+    if let Some(parts) = ModelsPathParts::parse(path_and_query)
+        && let Some((base, effort)) = split_effort_suffix(parts.model)
+        && base.starts_with("gemini-")
+    {
+        return (parts.format_with_model(base), Some(effort));
+    }
+
+    (path_and_query.to_string(), None)
+}
+
+/// Resolves the best available upstream Gemini planner model from `gateway_models` for fallback
+/// forwarding when a client sends `gemini-pro-orchestrator` directly to the proxy.
+pub fn resolve_orchestrator_fallback_model(gateway_models: &[GatewayModelEntry]) -> String {
+    for &preferred in ORCHESTRATOR_PLANNER_MODELS {
+        if gateway_models
+            .iter()
+            .any(|entry| normalize_model_id(entry.id()) == preferred)
+        {
+            return preferred.to_string();
+        }
+    }
+    for entry in gateway_models {
+        let base = normalize_model_id(entry.id());
+        if !base.is_empty()
+            && base != ORCHESTRATOR_MODEL_ID
+            && !base.ends_with("-image")
+            && !base.ends_with("-lite")
+        {
+            return base;
+        }
+    }
+    ORCHESTRATOR_PLANNER_MODELS[0].to_string()
+}
+
+/// Rewrites a gateway request path for upstream forwarding and extracts any thinking effort.
+///
+/// - Requests targeting `gemini-pro-orchestrator` (bare or effort-suffixed) fall back to the
+///   best available upstream planner model in `gateway_models()`, defaulting effort to `"high"`.
+/// - Other effort-suffixed `gemini-*` models are stripped to their base ID with the extracted
+///   effort level, without evaluating `gateway_models()`.
+pub fn rewrite_proxy_request_path<F>(
+    path_and_query: &str,
+    gateway_models: F,
+) -> (String, Option<&'static str>)
+where
+    F: FnOnce() -> Vec<GatewayModelEntry>,
+{
+    let Some(parts) = ModelsPathParts::parse(path_and_query) else {
+        return (path_and_query.to_string(), None);
     };
 
-    if let Some((prefix, after_models)) = path.split_once("/models/") {
-        let sep_idx = after_models.find([':', '/']).unwrap_or(after_models.len());
-        let model_part = &after_models[..sep_idx];
-        let rest_path = &after_models[sep_idx..];
+    let (base, effort) = match split_effort_suffix(parts.model) {
+        Some((b, e)) => (b, Some(e)),
+        None => (parts.model, None),
+    };
 
-        if let Some((base, effort)) = split_effort_suffix(model_part)
-            && base.starts_with("gemini-")
-        {
-            let rewritten = match query {
-                Some(q) => format!("{}/models/{}{}?{}", prefix, base, rest_path, q),
-                None => format!("{}/models/{}{}", prefix, base, rest_path),
-            };
-            return (rewritten, Some(effort));
-        }
+    if base == ORCHESTRATOR_MODEL_ID {
+        let target_model = resolve_orchestrator_fallback_model(&gateway_models());
+        return (
+            parts.format_with_model(&target_model),
+            Some(effort.unwrap_or("high")),
+        );
+    }
+
+    if let Some(effort) = effort
+        && base.starts_with("gemini-")
+    {
+        return (parts.format_with_model(base), Some(effort));
     }
 
     (path_and_query.to_string(), None)
@@ -396,7 +488,7 @@ pub fn expand_gateway_models(models: &[GeminiModelInfo]) -> Vec<GatewayModelEntr
             // thinking-capable even if upstream `/v1beta/models` reports `thinking: true`.
             entry.thinking = None;
             expanded.push(entry);
-        } else if base_id.ends_with("-lite") {
+        } else if base_id.ends_with("-lite") || base_id == ORCHESTRATOR_MODEL_ID {
             let mut entry = model.clone();
             entry.name = format!("models/{}", base_id);
             if entry
@@ -404,7 +496,11 @@ pub fn expand_gateway_models(models: &[GeminiModelInfo]) -> Vec<GatewayModelEntr
                 .as_deref()
                 .is_none_or(|s| s.trim().is_empty())
             {
-                entry.display_name = Some(humanize_model_id(base_id));
+                entry.display_name = Some(if base_id == ORCHESTRATOR_MODEL_ID {
+                    "Orchestrator".to_string()
+                } else {
+                    humanize_model_id(base_id)
+                });
             }
             expanded.push(entry);
         } else {
@@ -433,6 +529,30 @@ pub fn expand_gateway_models(models: &[GeminiModelInfo]) -> Vec<GatewayModelEntr
             }
         }
     }
+
+    let already_has_orchestrator = models.iter().any(|m| m.id() == ORCHESTRATOR_MODEL_ID);
+    let preferred_planner = ORCHESTRATOR_PLANNER_MODELS
+        .iter()
+        .find_map(|&id| models.iter().find(|m| normalize_model_id(m.id()) == id));
+    let has_executor = models
+        .iter()
+        .any(|m| ORCHESTRATOR_EXECUTOR_MODELS.contains(&normalize_model_id(m.id()).as_str()));
+
+    if !already_has_orchestrator
+        && let Some(planner) = preferred_planner
+        && has_executor
+    {
+        expanded.push(GatewayModelEntry {
+            name: format!("models/{}", ORCHESTRATOR_MODEL_ID),
+            display_name: Some("Orchestrator".to_string()),
+            description: None,
+            input_token_limit: planner.input_token_limit.or(Some(1_048_576)),
+            output_token_limit: planner.output_token_limit.or(Some(65_536)),
+            supported_generation_methods: vec!["generateContent".to_string()],
+            thinking: Some(true),
+        });
+    }
+
     expanded
 }
 
@@ -567,6 +687,9 @@ mod tests {
                 "gemini-4-neon-xhigh",
                 "gemini-4-neon-medium",
                 "gemini-4-neon-low",
+                "gemini-4-carbon-medium",
+                "gemini-4-carbon-high",
+                "gemini-4-carbon-low",
                 "gemini-4-hydrogen-high",
                 "gemini-4-hydrogen-xhigh",
                 "gemini-4-hydrogen-medium",
@@ -579,6 +702,7 @@ mod tests {
                 "gemini-3.8-flash-low",
                 "gemini-3.1-flash-image",
                 "gemini-3.5-flash-lite",
+                "gemini-pro-orchestrator",
             ]
         );
         assert_eq!(
@@ -586,8 +710,12 @@ mod tests {
             Some("Gemini 4 Neon (XHigh)")
         );
         assert_eq!(
-            expanded[5].display_name.as_deref(),
+            expanded[8].display_name.as_deref(),
             Some("Gemini 4 Hydrogen (XHigh)")
+        );
+        assert_eq!(
+            expanded.last().and_then(|m| m.display_name.as_deref()),
+            Some("Orchestrator")
         );
 
         let upstream = vec![
@@ -639,7 +767,7 @@ mod tests {
         ];
 
         let rich_expanded = expand_gateway_models(&upstream);
-        assert_eq!(rich_expanded.len(), 12);
+        assert_eq!(rich_expanded.len(), 13);
         assert_eq!(rich_expanded[0].name, "models/gemini-4-argon-medium");
         assert_eq!(
             rich_expanded[0].display_name.as_deref(),
@@ -671,6 +799,84 @@ mod tests {
         assert_eq!(image.input_token_limit, Some(65_536));
         assert_eq!(image.output_token_limit, Some(65_536));
         assert_eq!(image.thinking, None);
+
+        let orchestrator = &rich_expanded[12];
+        assert_eq!(orchestrator.name, "models/gemini-pro-orchestrator");
+        assert_eq!(orchestrator.display_name.as_deref(), Some("Orchestrator"));
+        assert_eq!(orchestrator.input_token_limit, Some(1_048_576));
+        assert_eq!(orchestrator.output_token_limit, Some(65_536));
+        assert_eq!(
+            orchestrator.supported_generation_methods,
+            vec!["generateContent".to_string()]
+        );
+        assert_eq!(orchestrator.thinking, Some(true));
+    }
+
+    #[test]
+    fn test_expand_gateway_models_requires_planner_and_executor_for_orchestrator() {
+        let planner_only =
+            expand_gateway_models(&[GeminiModelInfo::from_model_id("gemini-4-carbon")]);
+        assert!(planner_only.iter().all(|m| m.id() != ORCHESTRATOR_MODEL_ID));
+
+        let executor_only =
+            expand_gateway_models(&[GeminiModelInfo::from_model_id("gemini-4-hydrogen")]);
+        assert!(
+            executor_only
+                .iter()
+                .all(|m| m.id() != ORCHESTRATOR_MODEL_ID)
+        );
+
+        let passthrough_orchestrator =
+            expand_gateway_models(&[GeminiModelInfo::from_model_id(ORCHESTRATOR_MODEL_ID)]);
+        assert_eq!(
+            passthrough_orchestrator
+                .iter()
+                .map(GeminiModelInfo::id)
+                .collect::<Vec<_>>(),
+            vec![ORCHESTRATOR_MODEL_ID]
+        );
+    }
+
+    #[test]
+    fn test_rewrite_proxy_request_path_orchestrator_fallback() {
+        let with_carbon_and_argon = expand_gateway_models(&[
+            GeminiModelInfo::from_model_id("gemini-4-argon"),
+            GeminiModelInfo::from_model_id("gemini-4-carbon"),
+            GeminiModelInfo::from_model_id("gemini-4-hydrogen"),
+        ]);
+        assert_eq!(
+            rewrite_proxy_request_path(
+                "/v1beta/models/gemini-pro-orchestrator:streamGenerateContent?alt=sse",
+                || with_carbon_and_argon.clone()
+            ),
+            (
+                "/v1beta/models/gemini-4-carbon:streamGenerateContent?alt=sse".to_string(),
+                Some("high")
+            )
+        );
+
+        let with_neon = default_gateway_models();
+        assert_eq!(
+            rewrite_proxy_request_path(
+                "/v1beta/models/gemini-pro-orchestrator-low:generateContent",
+                || with_neon.clone()
+            ),
+            (
+                "/v1beta/models/gemini-4-neon:generateContent".to_string(),
+                Some("low")
+            )
+        );
+
+        assert_eq!(
+            rewrite_proxy_request_path(
+                "/v1beta/models/gemini-4-argon-medium:streamGenerateContent?alt=sse",
+                || panic!("gateway_models should not be read for non-orchestrator paths")
+            ),
+            (
+                "/v1beta/models/gemini-4-argon:streamGenerateContent?alt=sse".to_string(),
+                Some("medium")
+            )
+        );
     }
 
     #[test]

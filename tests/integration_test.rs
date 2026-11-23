@@ -718,6 +718,7 @@ async fn test_resolve_gateway_models_fetches_and_expands_models() {
             "gemini-99-flash-low",
             "gemini-99-flash-image",
             "gemini-99-flash-lite",
+            "gemini-pro-orchestrator",
         ]
     );
 
@@ -761,6 +762,7 @@ async fn test_resolve_gateway_models_fetches_and_expands_models() {
             "models/gemini-99-flash-low",
             "models/gemini-99-flash-image",
             "models/gemini-99-flash-lite",
+            "models/gemini-pro-orchestrator",
         ]
     );
     assert_eq!(
@@ -791,7 +793,7 @@ async fn test_resolve_gateway_models_fetches_and_expands_models() {
     assert_eq!(image_entry.output_token_limit, Some(65_536));
     assert_eq!(image_entry.thinking, None);
 
-    let flash_lite_entry = gateway_res.models.last().unwrap();
+    let flash_lite_entry = &gateway_res.models[15];
     assert_eq!(
         flash_lite_entry.display_name.as_deref(),
         Some("Gemini 99 Flash-Lite")
@@ -799,6 +801,78 @@ async fn test_resolve_gateway_models_fetches_and_expands_models() {
     assert_eq!(flash_lite_entry.input_token_limit, Some(1_048_576));
     assert_eq!(flash_lite_entry.output_token_limit, Some(65_536));
     assert_eq!(flash_lite_entry.thinking, Some(true));
+
+    let orchestrator_entry = gateway_res.models.last().unwrap();
+    assert_eq!(orchestrator_entry.name, "models/gemini-pro-orchestrator");
+    assert_eq!(
+        orchestrator_entry.display_name.as_deref(),
+        Some("Orchestrator")
+    );
+    assert_eq!(orchestrator_entry.input_token_limit, Some(1_048_576));
+    assert_eq!(orchestrator_entry.output_token_limit, Some(65_536));
+    assert_eq!(
+        orchestrator_entry.supported_generation_methods,
+        vec!["generateContent".to_string()]
+    );
+    assert_eq!(orchestrator_entry.thinking, Some(true));
+}
+
+#[tokio::test]
+async fn test_orchestrator_fallback_forwards_to_planner_model() {
+    use agy_gyro::tui::fetch_usage_snapshot;
+
+    let mock_server = MockServer::start().await;
+
+    Mock::given(method("POST"))
+        .and(path("/v1beta/models/gemini-4-neon:streamGenerateContent"))
+        .and(query_param("alt", "sse"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "text/event-stream")
+                .set_body_string(
+                    "data: {\"candidates\": [{\"content\": {\"parts\": [{\"text\": \"Orchestrator fallback OK\"}]}}], \"usageMetadata\": {\"promptTokenCount\": 1000, \"candidatesTokenCount\": 200, \"totalTokenCount\": 1200}}\n\n",
+                ),
+        )
+        .expect(1)
+        .mount(&mock_server)
+        .await;
+
+    let proxy_url = spawn_test_proxy(mock_server.uri(), 1).await;
+    let client = Client::new();
+
+    let res = client
+        .post(format!(
+            "{}/v1beta/models/gemini-pro-orchestrator:streamGenerateContent?alt=sse",
+            proxy_url
+        ))
+        .header("Authorization", "Bearer gyro:11:123:orch-test")
+        .header("Content-Type", "application/json")
+        .body(r#"{"contents":[{"role":"user","parts":[{"text":"hi"}]}],"generationConfig":{"thinkingConfig":{"includeThoughts":true,"thinkingBudget":1024}}}"#)
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(res.status(), 200);
+    assert!(
+        res.text()
+            .await
+            .unwrap()
+            .contains("Orchestrator fallback OK")
+    );
+
+    let received = mock_server.received_requests().await.unwrap();
+    assert_eq!(received.len(), 1);
+    let forwarded_json: serde_json::Value = serde_json::from_slice(&received[0].body).unwrap();
+    assert_eq!(
+        forwarded_json["generationConfig"]["thinkingConfig"]["thinkingLevel"],
+        "HIGH"
+    );
+
+    let snap = fetch_usage_snapshot(&client, &format!("{}/usage", proxy_url))
+        .await
+        .unwrap();
+    assert!(snap.models.contains_key("gemini-4-neon"));
+    assert!(!snap.models.contains_key("gemini-pro-orchestrator"));
 }
 
 #[tokio::test]
