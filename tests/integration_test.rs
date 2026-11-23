@@ -603,10 +603,8 @@ async fn test_run_wrapper_executes_child_and_propagates_exit_code() {
 }
 
 #[tokio::test]
-async fn test_resolve_gateway_models_fetches_and_expands_models() {
-    use agy_gyro::proxy::{
-        GatewayModelsResponse, ProxyState, create_router, resolve_gateway_models,
-    };
+async fn test_fetch_gateway_models_fetches_and_expands_models() {
+    use agy_gyro::proxy::{GatewayModelsResponse, ProxyState, create_router, fetch_gateway_models};
 
     let mock_server = MockServer::start().await;
     Mock::given(method("GET"))
@@ -697,7 +695,7 @@ async fn test_resolve_gateway_models_fetches_and_expands_models() {
     };
 
     let client = Client::new();
-    let models = resolve_gateway_models(&client, &config).await;
+    let models = fetch_gateway_models(&client, &config).await.unwrap();
     let model_ids: Vec<&str> = models.iter().map(|m| m.id()).collect();
     assert_eq!(
         model_ids,
@@ -815,6 +813,155 @@ async fn test_resolve_gateway_models_fetches_and_expands_models() {
         vec!["generateContent".to_string()]
     );
     assert_eq!(orchestrator_entry.thinking, Some(true));
+}
+
+#[tokio::test]
+async fn test_models_endpoint_requires_backend_and_recovers_after_failure() {
+    use agy_gyro::proxy::{GatewayModelsResponse, ProxyState, create_router, fetch_gateway_models};
+
+    let mock_server = MockServer::start().await;
+
+    // 1. Upstream returns 503 -> fetch_gateway_models returns Err and /v1beta/models returns 502
+    Mock::given(method("GET"))
+        .and(path("/v1beta/models"))
+        .and(header("x-goog-api-key", "test-key-123"))
+        .respond_with(ResponseTemplate::new(503))
+        .up_to_n_times(2)
+        .expect(2)
+        .mount(&mock_server)
+        .await;
+
+    // 2. Upstream returns 200 with no matching core models -> still rejected (no fallback)
+    Mock::given(method("GET"))
+        .and(path("/v1beta/models"))
+        .and(header("x-goog-api-key", "test-key-123"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "application/json")
+                .set_body_json(serde_json::json!({ "models": [] })),
+        )
+        .up_to_n_times(2)
+        .expect(2)
+        .mount(&mock_server)
+        .await;
+
+    // 3. Upstream recovers and returns real models -> /v1beta/models retries and succeeds
+    Mock::given(method("GET"))
+        .and(path("/v1beta/models"))
+        .and(header("x-goog-api-key", "test-key-123"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "application/json")
+                .set_body_json(serde_json::json!({
+                    "models": [
+                        {
+                            "name": "models/gemini-4-argon",
+                            "displayName": "Gemini 4 Argon",
+                            "supportedGenerationMethods": ["generateContent"],
+                            "thinking": true
+                        }
+                    ]
+                })),
+        )
+        .expect(1)
+        .mount(&mock_server)
+        .await;
+
+    let config = Config {
+        host: "127.0.0.1".to_string(),
+        port: 0,
+        upstream: mock_server.uri(),
+        max_retries: 1,
+        initial_delay_ms: 10,
+        max_delay_ms: 100,
+        no_jitter: true,
+        buffer: false,
+        request_timeout_secs: 10,
+        api_key: "test-key-123".to_string(),
+        ..Config::default()
+    };
+
+    let client = Client::new();
+
+    // Direct fetch_gateway_models returns Err on 503
+    let err_503 = fetch_gateway_models(&client, &config)
+        .await
+        .expect_err("503 from backend must fail model discovery");
+    assert!(err_503.contains("503"), "unexpected error: {}", err_503);
+
+    // Fresh ProxyState starts empty (no hardcoded offline fallback catalog)
+    let state = Arc::new(
+        ProxyState::new(config.clone(), client.clone())
+            .with_pricing_url(format!("{}/pricing.json", mock_server.uri())),
+    );
+    assert!(state.gateway_models().is_empty());
+
+    let app = create_router(state);
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+
+    // GET /v1beta/models returns 502 Bad Gateway on upstream 503
+    let res_503 = client
+        .get(format!("http://{}/v1beta/models", addr))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res_503.status(), 502);
+    let body_503: serde_json::Value = res_503.json().await.unwrap();
+    assert_eq!(body_503["error"]["code"], 502);
+    assert!(
+        body_503["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("503")
+    );
+
+    // Direct fetch_gateway_models returns Err when upstream returns empty models list
+    let err_empty = fetch_gateway_models(&client, &config)
+        .await
+        .expect_err("empty backend model list must fail model discovery");
+    assert!(
+        err_empty.contains("no matching core Gemini models"),
+        "unexpected error: {}",
+        err_empty
+    );
+
+    // GET /v1beta/models returns 502 Bad Gateway when upstream returns empty models list
+    let res_empty = client
+        .get(format!("http://{}/v1beta/models", addr))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res_empty.status(), 502);
+    let body_empty: serde_json::Value = res_empty.json().await.unwrap();
+    assert_eq!(body_empty["error"]["code"], 502);
+    assert!(
+        body_empty["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("no matching core Gemini models")
+    );
+
+    // Once upstream returns models, GET /v1beta/models retries and succeeds with 200 OK
+    let res_ok = client
+        .get(format!("http://{}/v1beta/models", addr))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res_ok.status(), 200);
+    let gateway_res: GatewayModelsResponse = res_ok.json().await.unwrap();
+    let ids: Vec<&str> = gateway_res.models.iter().map(|m| m.id()).collect();
+    assert_eq!(
+        ids,
+        vec![
+            "gemini-4-argon-medium",
+            "gemini-4-argon-high",
+            "gemini-4-argon-low",
+        ]
+    );
 }
 
 #[tokio::test]

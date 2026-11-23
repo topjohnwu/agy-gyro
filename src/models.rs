@@ -6,17 +6,6 @@ use serde::{Deserialize, Serialize};
 use std::time::Duration;
 use tracing::{info, warn};
 
-/// Fallback list of Gemini models if dynamic discovery fails.
-pub const DEFAULT_GATEWAY_MODELS: &[&str] = &[
-    "gemini-4-neon",
-    "gemini-4-carbon",
-    "gemini-4-hydrogen",
-    "gemini-4-argon",
-    "gemini-3.8-flash",
-    "gemini-3.1-flash-image",
-    "gemini-3.5-flash-lite",
-];
-
 /// Synthetic gateway model identifier exposed in `/v1beta/models` so Antigravity Hub and CLI
 /// enable the client-side Orchestrator (Plan & Execute) row.
 pub const ORCHESTRATOR_MODEL_ID: &str = "gemini-pro-orchestrator";
@@ -98,35 +87,6 @@ impl GeminiModelInfo {
     /// Returns the bare model identifier with any leading `"models/"` prefix stripped.
     pub fn id(&self) -> &str {
         self.name.trim().trim_start_matches("models/")
-    }
-
-    /// Constructs a fallback [`GeminiModelInfo`] from a model ID when upstream metadata is
-    /// unavailable (e.g. offline fallback).
-    pub fn from_model_id(id: impl AsRef<str>) -> Self {
-        let clean = id.as_ref().trim().trim_start_matches("models/");
-        let is_image = clean.ends_with("-image");
-        let display_name = if is_image {
-            None
-        } else {
-            match split_effort_suffix(clean) {
-                Some((base_id, eff)) => Some(format!(
-                    "{} ({})",
-                    humanize_model_id(base_id),
-                    format_effort_label(eff)
-                )),
-                None => Some(humanize_model_id(clean)),
-            }
-        };
-
-        Self {
-            name: format!("models/{}", clean),
-            display_name,
-            description: None,
-            input_token_limit: None,
-            output_token_limit: None,
-            supported_generation_methods: vec!["generateContent".to_string()],
-            thinking: if is_image { None } else { Some(true) },
-        }
     }
 }
 
@@ -556,22 +516,13 @@ pub fn expand_gateway_models(models: &[GeminiModelInfo]) -> Vec<GatewayModelEntr
     expanded
 }
 
-/// Returns the expanded fallback model catalog derived from [`DEFAULT_GATEWAY_MODELS`].
-pub fn default_gateway_models() -> Vec<GatewayModelEntry> {
-    let base: Vec<GeminiModelInfo> = DEFAULT_GATEWAY_MODELS
-        .iter()
-        .map(GeminiModelInfo::from_model_id)
-        .collect();
-    expand_gateway_models(&base)
-}
-
 /// Queries `GET {upstream}/v1beta/models` and returns the list of active Gemini models
-/// expanded with effort suffixes and upstream metadata, or `None` if the request fails
-/// or yields no matching core models.
+/// expanded with effort suffixes and upstream metadata, or an error if the backend request
+/// fails or yields no matching core models.
 pub async fn fetch_gateway_models(
     client: &reqwest::Client,
     config: &Config,
-) -> Option<Vec<GatewayModelEntry>> {
+) -> Result<Vec<GatewayModelEntry>, String> {
     let api_key = config.api_key.trim();
     let upstream_base = config.upstream.trim_end_matches('/');
     let mut all_models = Vec::new();
@@ -593,19 +544,18 @@ pub async fn fetch_gateway_models(
         {
             Ok(res) if res.status().is_success() => res,
             Ok(res) => {
-                warn!(
-                    "Failed to fetch models from {} (status {}); keeping current model list",
+                let msg = format!(
+                    "Failed to fetch models from {} (status {})",
                     url,
                     res.status()
                 );
-                return None;
+                warn!("{}", msg);
+                return Err(msg);
             }
             Err(err) => {
-                warn!(
-                    "Error fetching models from {}: {}; keeping current model list",
-                    url, err
-                );
-                return None;
+                let msg = format!("Error fetching models from {}: {}", url, err);
+                warn!("{}", msg);
+                return Err(msg);
             }
         };
 
@@ -619,41 +569,41 @@ pub async fn fetch_gateway_models(
                 }
             }
             Err(err) => {
-                warn!(
-                    "Failed to parse /v1beta/models JSON response: {}; keeping current model list",
-                    err
-                );
-                return None;
+                let msg = format!("Failed to parse /v1beta/models JSON response: {}", err);
+                warn!("{}", msg);
+                return Err(msg);
             }
         }
     }
 
     let models = filter_core_gemini_models(&all_models);
     if models.is_empty() {
-        warn!("No core Gemini models matched filter; keeping current model list");
-        None
+        let msg = "Upstream /v1beta/models returned no matching core Gemini models".to_string();
+        warn!("{}", msg);
+        Err(msg)
     } else {
         let ids: Vec<&str> = models.iter().map(GeminiModelInfo::id).collect();
         info!("Discovered available Gemini models: {}", ids.join(","));
-        Some(expand_gateway_models(&models))
+        Ok(expand_gateway_models(&models))
     }
-}
-
-/// Queries `GET {upstream}/v1beta/models` and returns the list of active Gemini models
-/// expanded with effort suffixes and upstream metadata (falling back to [`default_gateway_models`]
-/// if the request fails).
-pub async fn resolve_gateway_models(
-    client: &reqwest::Client,
-    config: &Config,
-) -> Vec<GatewayModelEntry> {
-    fetch_gateway_models(client, config)
-        .await
-        .unwrap_or_else(default_gateway_models)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn test_model(id: &str) -> GeminiModelInfo {
+        let is_image = id.ends_with("-image");
+        GeminiModelInfo {
+            name: format!("models/{}", id),
+            display_name: None,
+            description: None,
+            input_token_limit: None,
+            output_token_limit: None,
+            supported_generation_methods: vec!["generateContent".to_string()],
+            thinking: if is_image { None } else { Some(true) },
+        }
+    }
 
     #[test]
     fn test_extract_model_from_path() {
@@ -678,7 +628,19 @@ mod tests {
 
     #[test]
     fn test_expand_gateway_models_orders_efforts_and_preserves_upstream_metadata() {
-        let expanded = default_gateway_models();
+        let base_models = [
+            "gemini-4-neon",
+            "gemini-4-carbon",
+            "gemini-4-hydrogen",
+            "gemini-4-argon",
+            "gemini-3.8-flash",
+            "gemini-3.1-flash-image",
+            "gemini-3.5-flash-lite",
+        ]
+        .into_iter()
+        .map(test_model)
+        .collect::<Vec<_>>();
+        let expanded = expand_gateway_models(&base_models);
         let ids: Vec<&str> = expanded.iter().map(GeminiModelInfo::id).collect();
         assert_eq!(
             ids,
@@ -814,20 +776,17 @@ mod tests {
 
     #[test]
     fn test_expand_gateway_models_requires_planner_and_executor_for_orchestrator() {
-        let planner_only =
-            expand_gateway_models(&[GeminiModelInfo::from_model_id("gemini-4-carbon")]);
+        let planner_only = expand_gateway_models(&[test_model("gemini-4-carbon")]);
         assert!(planner_only.iter().all(|m| m.id() != ORCHESTRATOR_MODEL_ID));
 
-        let executor_only =
-            expand_gateway_models(&[GeminiModelInfo::from_model_id("gemini-4-hydrogen")]);
+        let executor_only = expand_gateway_models(&[test_model("gemini-4-hydrogen")]);
         assert!(
             executor_only
                 .iter()
                 .all(|m| m.id() != ORCHESTRATOR_MODEL_ID)
         );
 
-        let passthrough_orchestrator =
-            expand_gateway_models(&[GeminiModelInfo::from_model_id(ORCHESTRATOR_MODEL_ID)]);
+        let passthrough_orchestrator = expand_gateway_models(&[test_model(ORCHESTRATOR_MODEL_ID)]);
         assert_eq!(
             passthrough_orchestrator
                 .iter()
@@ -840,9 +799,9 @@ mod tests {
     #[test]
     fn test_rewrite_proxy_request_path_orchestrator_fallback() {
         let with_carbon_and_argon = expand_gateway_models(&[
-            GeminiModelInfo::from_model_id("gemini-4-argon"),
-            GeminiModelInfo::from_model_id("gemini-4-carbon"),
-            GeminiModelInfo::from_model_id("gemini-4-hydrogen"),
+            test_model("gemini-4-argon"),
+            test_model("gemini-4-carbon"),
+            test_model("gemini-4-hydrogen"),
         ]);
         assert_eq!(
             rewrite_proxy_request_path(
@@ -855,7 +814,11 @@ mod tests {
             )
         );
 
-        let with_neon = default_gateway_models();
+        let with_neon = expand_gateway_models(&[
+            test_model("gemini-4-neon"),
+            test_model("gemini-4-carbon"),
+            test_model("gemini-4-hydrogen"),
+        ]);
         assert_eq!(
             rewrite_proxy_request_path(
                 "/v1beta/models/gemini-pro-orchestrator-low:generateContent",

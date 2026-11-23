@@ -2,10 +2,9 @@
 
 use crate::config::Config;
 pub use crate::models::{
-    DEFAULT_GATEWAY_MODELS, GatewayModelEntry, GatewayModelsResponse, GeminiModelInfo,
-    GeminiModelsResponse, MODEL_EFFORT_LEVELS, NON_CORE_KEYWORDS, default_gateway_models,
-    expand_gateway_models, fetch_gateway_models, filter_core_gemini_models,
-    inject_thinking_level_if_missing, resolve_gateway_models,
+    GatewayModelEntry, GatewayModelsResponse, GeminiModelInfo, GeminiModelsResponse,
+    MODEL_EFFORT_LEVELS, NON_CORE_KEYWORDS, expand_gateway_models, fetch_gateway_models,
+    filter_core_gemini_models, inject_thinking_level_if_missing,
     rewrite_request_path_and_extract_effort,
 };
 use crate::retry::{
@@ -49,6 +48,7 @@ pub struct ProxyState {
     pub build_id: String,
     pub usage: Arc<UsageTracker>,
     pub gateway_models: RwLock<Vec<GatewayModelEntry>>,
+    last_model_fetch_error: RwLock<Option<String>>,
     refresh_in_flight: Mutex<Option<tokio::sync::watch::Receiver<bool>>>,
     shutdown_tx: tokio::sync::watch::Sender<bool>,
 }
@@ -94,7 +94,8 @@ impl ProxyState {
             keep_alive_interval: DEFAULT_KEEP_ALIVE_INTERVAL,
             build_id: crate::BUILD_ID.to_string(),
             usage,
-            gateway_models: RwLock::new(default_gateway_models()),
+            gateway_models: RwLock::new(Vec::new()),
+            last_model_fetch_error: RwLock::new(None),
             refresh_in_flight: Mutex::new(None),
             shutdown_tx,
         }
@@ -125,8 +126,12 @@ impl ProxyState {
     }
 
     pub fn set_gateway_models(&self, models: Vec<GatewayModelEntry>) {
+        let non_empty = !models.is_empty();
         if let Ok(mut guard) = self.gateway_models.write() {
             *guard = models;
+        }
+        if non_empty && let Ok(mut guard) = self.last_model_fetch_error.write() {
+            *guard = None;
         }
     }
 
@@ -137,13 +142,27 @@ impl ProxyState {
             .unwrap_or_default()
     }
 
+    pub fn last_model_fetch_error(&self) -> Option<String> {
+        self.last_model_fetch_error
+            .read()
+            .ok()
+            .and_then(|g| g.clone())
+    }
+
     async fn perform_catalog_and_pricing_refresh(&self) {
-        let (models_opt, pricing_opt) = tokio::join!(
+        let (models_res, pricing_opt) = tokio::join!(
             fetch_gateway_models(&self.client, &self.config),
             try_fetch_model_pricing(&self.client, &self.pricing_url),
         );
-        if let Some(models) = models_opt {
-            self.set_gateway_models(models);
+        match models_res {
+            Ok(models) => {
+                self.set_gateway_models(models);
+            }
+            Err(err) => {
+                if let Ok(mut guard) = self.last_model_fetch_error.write() {
+                    *guard = Some(err);
+                }
+            }
         }
         if let Some(pricing) = pricing_opt {
             self.usage.set_pricing(pricing);
@@ -356,12 +375,31 @@ async fn daemon_status_handler(
     })
 }
 
-async fn models_handler(State(state): State<Arc<ProxyState>>) -> Json<GatewayModelsResponse> {
+async fn models_handler(State(state): State<Arc<ProxyState>>) -> Response {
     state.wait_for_in_flight_refresh().await;
+    let mut models = state.gateway_models();
+    if models.is_empty() {
+        state.refresh_catalog_and_pricing().await;
+        models = state.gateway_models();
+    }
+
+    if models.is_empty() {
+        let err_msg = state
+            .last_model_fetch_error()
+            .unwrap_or_else(|| "Upstream backend did not return any Gemini models".to_string());
+        return (
+            StatusCode::BAD_GATEWAY,
+            [(axum::http::header::CONTENT_TYPE, "application/json")],
+            format_json_error_chunk(StatusCode::BAD_GATEWAY, err_msg.as_bytes()),
+        )
+            .into_response();
+    }
+
     Json(GatewayModelsResponse {
-        models: state.gateway_models(),
+        models,
         next_page_token: None,
     })
+    .into_response()
 }
 
 /// Response payload from `POST /shutdown`.
