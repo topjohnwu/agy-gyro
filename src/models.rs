@@ -3,49 +3,151 @@
 use crate::config::Config;
 use axum::body::Bytes;
 use serde::{Deserialize, Serialize};
+use std::sync::OnceLock;
 use std::time::Duration;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
-/// Synthetic gateway model identifier exposed in `/v1beta/models` so Antigravity Hub and CLI
-/// enable the client-side Orchestrator (Plan & Execute) row.
-pub const ORCHESTRATOR_MODEL_ID: &str = "gemini-pro-orchestrator";
+/// Default GitHub raw URL for fetching live model discovery rules (`models.toml`).
+pub const DEFAULT_MODEL_RULES_URL: &str =
+    "https://raw.githubusercontent.com/topjohnwu/agy-gyro/main/models.toml";
 
-/// Gemini base model IDs eligible for the Orchestrator (planner) role in Antigravity.
-pub const ORCHESTRATOR_PLANNER_MODELS: &[&str] =
-    &["gemini-4-neon", "gemini-4-carbon", "gemini-4-argon"];
+/// Bundled `models.toml` embedded at compile time as the offline fallback when GitHub is unreachable.
+const BUNDLED_MODEL_RULES_TOML: &str = include_str!("../models.toml");
 
-/// Gemini base model IDs eligible for the Executor role in Antigravity.
-pub const ORCHESTRATOR_EXECUTOR_MODELS: &[&str] = &["gemini-4-hydrogen"];
+/// Protocol-level effort suffixes recognized in Gemini request paths and model IDs.
+const KNOWN_EFFORT_LEVELS: &[&str] = &["high", "xhigh", "medium", "low"];
 
-/// Effort suffixes recognized for thinking-capable Gemini models (`medium -> high -> low` so
-/// `-medium` is the default for primary models).
-pub const MODEL_EFFORT_LEVELS: &[&str] = &["medium", "high", "low"];
+/// Pattern-matched effort suffix override rule loaded from `models.toml`.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct EffortRule {
+    #[serde(rename = "match")]
+    pub patterns: Vec<String>,
+    pub efforts: Vec<String>,
+}
 
-/// Effort ordering for Flash models (`high -> medium -> low`).
-const FLASH_EFFORT_LEVELS: &[&str] = &["high", "medium", "low"];
+/// Synthetic Orchestrator synthesis and fallback routing rules loaded from `models.toml`.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct OrchestratorRules {
+    pub model_id: String,
+    pub display_name: String,
+    #[serde(default)]
+    pub planner_models: Vec<String>,
+    #[serde(default)]
+    pub executor_models: Vec<String>,
+}
 
-/// Effort ordering for models that support `xhigh` (`high -> xhigh -> medium -> low` so `-high`
-/// is the default), matching normal `agy`.
-const XHIGH_EFFORT_LEVELS: &[&str] = &["high", "xhigh", "medium", "low"];
+/// Model discovery mappings loaded from `models.toml` (or fetched dynamically from GitHub).
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct ModelRules {
+    #[serde(default)]
+    pub non_core_keywords: Vec<String>,
+    pub default_efforts: Vec<String>,
+    #[serde(default)]
+    pub effort_rules: Vec<EffortRule>,
+    pub orchestrator: OrchestratorRules,
+}
 
-/// Keywords identifying preview, lite, rolling-alias, or non-text/specialized Gemini variants
-/// that should be excluded when discovering core reasoning models from `/v1beta/models`.
-pub const NON_CORE_KEYWORDS: &[&str] = &[
-    "-preview",
-    "-lite",
-    "-latest",
-    "-customtools",
-    "-image",
-    "-banana",
-    "-tts",
-    "-audio",
-    "-live",
-    "-transcribe",
-    "-omni",
-    "-robotics",
-    "-computer-use",
-    "-embedding",
-];
+impl ModelRules {
+    /// Returns the compile-time bundled [`ModelRules`] parsed from `models.toml`.
+    pub fn bundled() -> &'static Self {
+        static BUNDLED: OnceLock<ModelRules> = OnceLock::new();
+        BUNDLED.get_or_init(|| {
+            Self::parse(BUNDLED_MODEL_RULES_TOML).expect("bundled models.toml must be valid")
+        })
+    }
+
+    /// Parses and validates a `models.toml` payload, ignoring unknown future keys.
+    pub fn parse(toml_str: &str) -> Result<Self, String> {
+        let rules: Self =
+            toml::from_str(toml_str).map_err(|e| format!("Invalid model rules TOML: {}", e))?;
+        let has_blank =
+            |list: &[String]| list.is_empty() || list.iter().any(|s| s.trim().is_empty());
+        if has_blank(&rules.default_efforts)
+            || rules.effort_rules.iter().any(|r| has_blank(&r.efforts))
+            || rules.orchestrator.model_id.trim().is_empty()
+            || rules.orchestrator.display_name.trim().is_empty()
+        {
+            return Err("Model rules TOML contains empty required fields".to_string());
+        }
+        Ok(rules)
+    }
+
+    /// Returns the ordered thinking effort suffixes configured for `base_id`.
+    pub fn effort_levels_for_model(&self, base_id: &str) -> &[String] {
+        for rule in &self.effort_rules {
+            if rule
+                .patterns
+                .iter()
+                .any(|p| !p.is_empty() && base_id.contains(p.as_str()))
+            {
+                return &rule.efforts;
+            }
+        }
+        &self.default_efforts
+    }
+}
+
+impl Default for ModelRules {
+    fn default() -> Self {
+        Self::bundled().clone()
+    }
+}
+
+/// Fetches live model discovery rules (`models.toml`) from `rules_url` (usually GitHub),
+/// returning `None` on network, HTTP, or TOML parse/validation error.
+pub async fn try_fetch_model_rules(
+    client: &reqwest::Client,
+    rules_url: &str,
+) -> Option<ModelRules> {
+    let res = match client
+        .get(rules_url)
+        .timeout(Duration::from_secs(5))
+        .send()
+        .await
+    {
+        Ok(res) if res.status().is_success() => res,
+        Ok(res) => {
+            warn!(
+                "Model discovery rules endpoint {} returned status {}; keeping current rules",
+                rules_url,
+                res.status()
+            );
+            return None;
+        }
+        Err(err) => {
+            debug!(
+                "Could not fetch model discovery rules from {}: {}; keeping current rules",
+                rules_url, err
+            );
+            return None;
+        }
+    };
+
+    let text = match res.text().await {
+        Ok(text) => text,
+        Err(err) => {
+            warn!(
+                "Failed to read model discovery rules response from {}: {}; keeping current rules",
+                rules_url, err
+            );
+            return None;
+        }
+    };
+
+    match ModelRules::parse(&text) {
+        Ok(rules) => {
+            info!("Loaded model discovery rules from {}", rules_url);
+            Some(rules)
+        }
+        Err(err) => {
+            warn!(
+                "Failed to parse model discovery rules from {}: {}; keeping current rules",
+                rules_url, err
+            );
+            None
+        }
+    }
+}
 
 /// Response payload from upstream `GET /v1beta/models` and served by the local gateway's
 /// `GET /v1beta/models` discovery endpoint.
@@ -110,16 +212,6 @@ fn format_effort_label(effort: &str) -> String {
     }
 }
 
-fn effort_levels_for_model(base_id: &str) -> &'static [&'static str] {
-    if base_id.contains("hydrogen") || base_id.contains("neon") {
-        XHIGH_EFFORT_LEVELS
-    } else if base_id.contains("flash") {
-        FLASH_EFFORT_LEVELS
-    } else {
-        MODEL_EFFORT_LEVELS
-    }
-}
-
 /// Converts a base Gemini model ID (e.g. `gemini-4-argon` or `gemini-3.5-flash-lite`) into a
 /// human-readable title (`Gemini 4 Argon`, `Gemini 3.5 Flash Lite`).
 pub fn humanize_model_id(base_id: &str) -> String {
@@ -135,7 +227,7 @@ pub fn humanize_model_id(base_id: &str) -> String {
 /// Splits a trailing `-<effort>` suffix (where `<effort>` is a recognized effort level such as
 /// `low`, `medium`, `high`, or `xhigh`) from a model identifier, returning `(base_model, effort)`.
 pub fn split_effort_suffix(model_id: &str) -> Option<(&str, &'static str)> {
-    for &effort in XHIGH_EFFORT_LEVELS {
+    for &effort in KNOWN_EFFORT_LEVELS {
         if let Some(prefix) = model_id.strip_suffix(effort)
             && let Some(base) = prefix.strip_suffix('-')
             && !base.is_empty()
@@ -224,38 +316,49 @@ pub fn rewrite_request_path_and_extract_effort(
     (path_and_query.to_string(), None)
 }
 
-/// Resolves the best available upstream Gemini planner model from `gateway_models` for fallback
-/// forwarding when a client sends `gemini-pro-orchestrator` directly to the proxy.
-pub fn resolve_orchestrator_fallback_model(gateway_models: &[GatewayModelEntry]) -> String {
-    for &preferred in ORCHESTRATOR_PLANNER_MODELS {
+/// Resolves the best available upstream Gemini planner model from `gateway_models` using
+/// `rules` for fallback forwarding when a client sends the synthetic orchestrator model directly
+/// to the proxy.
+pub fn resolve_orchestrator_fallback_model(
+    gateway_models: &[GatewayModelEntry],
+    rules: &ModelRules,
+) -> String {
+    for preferred in &rules.orchestrator.planner_models {
         if gateway_models
             .iter()
-            .any(|entry| normalize_model_id(entry.id()) == preferred)
+            .any(|entry| normalize_model_id(entry.id()) == preferred.as_str())
         {
-            return preferred.to_string();
+            return preferred.clone();
         }
     }
     for entry in gateway_models {
         let base = normalize_model_id(entry.id());
         if !base.is_empty()
-            && base != ORCHESTRATOR_MODEL_ID
+            && base != rules.orchestrator.model_id
             && !base.ends_with("-image")
             && !base.ends_with("-lite")
         {
             return base;
         }
     }
-    ORCHESTRATOR_PLANNER_MODELS[0].to_string()
+    rules
+        .orchestrator
+        .planner_models
+        .first()
+        .cloned()
+        .unwrap_or_else(|| rules.orchestrator.model_id.clone())
 }
 
-/// Rewrites a gateway request path for upstream forwarding and extracts any thinking effort.
+/// Rewrites a gateway request path for upstream forwarding using `rules` and extracts any
+/// thinking effort.
 ///
-/// - Requests targeting `gemini-pro-orchestrator` (bare or effort-suffixed) fall back to the
+/// - Requests targeting `rules.orchestrator.model_id` (bare or effort-suffixed) fall back to the
 ///   best available upstream planner model in `gateway_models()`, defaulting effort to `"high"`.
 /// - Other effort-suffixed `gemini-*` models are stripped to their base ID with the extracted
 ///   effort level, without evaluating `gateway_models()`.
 pub fn rewrite_proxy_request_path<F>(
     path_and_query: &str,
+    rules: &ModelRules,
     gateway_models: F,
 ) -> (String, Option<&'static str>)
 where
@@ -270,8 +373,8 @@ where
         None => (parts.model, None),
     };
 
-    if base == ORCHESTRATOR_MODEL_ID {
-        let target_model = resolve_orchestrator_fallback_model(&gateway_models());
+    if base == rules.orchestrator.model_id {
+        let target_model = resolve_orchestrator_fallback_model(&gateway_models(), rules);
         return (
             parts.format_with_model(&target_model),
             Some(effort.unwrap_or("high")),
@@ -362,10 +465,13 @@ pub fn inject_thinking_level_if_missing(body: Bytes, effort: &str) -> Bytes {
     }
 }
 
-/// Filters a list of `/v1beta/models` entries to retain core Gemini Text / Reasoning models
-/// (ordered newest-first with primary models before Flash models), followed by the newest
-/// non-preview `-flash-image` and `-flash-lite` models if available.
-pub fn filter_core_gemini_models(models: &[GeminiModelInfo]) -> Vec<GeminiModelInfo> {
+/// Filters a list of `/v1beta/models` entries using `rules` to retain core Gemini Text /
+/// Reasoning models (ordered newest-first with primary models before Flash models), followed by
+/// the newest non-preview `-flash-image` and `-flash-lite` models if available.
+pub fn filter_core_gemini_models(
+    models: &[GeminiModelInfo],
+    rules: &ModelRules,
+) -> Vec<GeminiModelInfo> {
     let mut filtered: Vec<GeminiModelInfo> = models
         .iter()
         .filter(|m| {
@@ -383,7 +489,10 @@ pub fn filter_core_gemini_models(models: &[GeminiModelInfo]) -> Vec<GeminiModelI
             {
                 return false;
             }
-            !NON_CORE_KEYWORDS.iter().any(|kw| id.contains(kw))
+            !rules
+                .non_core_keywords
+                .iter()
+                .any(|kw| !kw.is_empty() && id.contains(kw.as_str()))
         })
         .cloned()
         .collect();
@@ -434,11 +543,15 @@ pub fn filter_core_gemini_models(models: &[GeminiModelInfo]) -> Vec<GeminiModelI
 }
 
 /// Expands a list of base [`GeminiModelInfo`] entries into effort-suffixed [`GatewayModelEntry`]
-/// entries (`medium -> high -> low` for primary models so `-medium` is the default, and
-/// `high -> medium -> low` for Flash models), while passing auxiliary `-image` and `-lite` models
-/// through with their upstream metadata preserved.
-pub fn expand_gateway_models(models: &[GeminiModelInfo]) -> Vec<GatewayModelEntry> {
+/// entries according to `rules`, while passing auxiliary `-image`, `-lite`, and orchestrator
+/// models through with their upstream metadata preserved.
+pub fn expand_gateway_models(
+    models: &[GeminiModelInfo],
+    rules: &ModelRules,
+) -> Vec<GatewayModelEntry> {
     let mut expanded = Vec::new();
+    let orch_id = rules.orchestrator.model_id.as_str();
+
     for model in models {
         let base_id = model.id();
         if base_id.ends_with("-image") {
@@ -448,7 +561,7 @@ pub fn expand_gateway_models(models: &[GeminiModelInfo]) -> Vec<GatewayModelEntr
             // thinking-capable even if upstream `/v1beta/models` reports `thinking: true`.
             entry.thinking = None;
             expanded.push(entry);
-        } else if base_id.ends_with("-lite") || base_id == ORCHESTRATOR_MODEL_ID {
+        } else if base_id.ends_with("-lite") || base_id == orch_id {
             let mut entry = model.clone();
             entry.name = format!("models/{}", base_id);
             if entry
@@ -456,8 +569,8 @@ pub fn expand_gateway_models(models: &[GeminiModelInfo]) -> Vec<GatewayModelEntr
                 .as_deref()
                 .is_none_or(|s| s.trim().is_empty())
             {
-                entry.display_name = Some(if base_id == ORCHESTRATOR_MODEL_ID {
-                    "Orchestrator".to_string()
+                entry.display_name = Some(if base_id == orch_id {
+                    rules.orchestrator.display_name.clone()
                 } else {
                     humanize_model_id(base_id)
                 });
@@ -471,7 +584,7 @@ pub fn expand_gateway_models(models: &[GeminiModelInfo]) -> Vec<GatewayModelEntr
                 .filter(|s| !s.is_empty())
                 .map(str::to_string)
                 .unwrap_or_else(|| humanize_model_id(base_id));
-            let efforts = effort_levels_for_model(base_id);
+            let efforts = rules.effort_levels_for_model(base_id);
             for effort in efforts {
                 expanded.push(GatewayModelEntry {
                     name: format!("models/{}-{}", base_id, effort),
@@ -490,21 +603,28 @@ pub fn expand_gateway_models(models: &[GeminiModelInfo]) -> Vec<GatewayModelEntr
         }
     }
 
-    let already_has_orchestrator = models.iter().any(|m| m.id() == ORCHESTRATOR_MODEL_ID);
-    let preferred_planner = ORCHESTRATOR_PLANNER_MODELS
+    let already_has_orchestrator = models.iter().any(|m| m.id() == orch_id);
+    let preferred_planner = rules
+        .orchestrator
+        .planner_models
         .iter()
-        .find_map(|&id| models.iter().find(|m| normalize_model_id(m.id()) == id));
-    let has_executor = models
-        .iter()
-        .any(|m| ORCHESTRATOR_EXECUTOR_MODELS.contains(&normalize_model_id(m.id()).as_str()));
+        .find_map(|id| models.iter().find(|m| normalize_model_id(m.id()) == *id));
+    let has_executor = models.iter().any(|m| {
+        let normalized = normalize_model_id(m.id());
+        rules
+            .orchestrator
+            .executor_models
+            .iter()
+            .any(|exec| exec == &normalized)
+    });
 
     if !already_has_orchestrator
         && let Some(planner) = preferred_planner
         && has_executor
     {
         expanded.push(GatewayModelEntry {
-            name: format!("models/{}", ORCHESTRATOR_MODEL_ID),
-            display_name: Some("Orchestrator".to_string()),
+            name: format!("models/{}", orch_id),
+            display_name: Some(rules.orchestrator.display_name.clone()),
             description: None,
             input_token_limit: planner.input_token_limit.or(Some(1_048_576)),
             output_token_limit: planner.output_token_limit.or(Some(65_536)),
@@ -516,13 +636,12 @@ pub fn expand_gateway_models(models: &[GeminiModelInfo]) -> Vec<GatewayModelEntr
     expanded
 }
 
-/// Queries `GET {upstream}/v1beta/models` and returns the list of active Gemini models
-/// expanded with effort suffixes and upstream metadata, or an error if the backend request
-/// fails or yields no matching core models.
-pub async fn fetch_gateway_models(
+/// Queries `GET {upstream}/v1beta/models` (paginated) and returns all raw [`GeminiModelInfo`]
+/// entries reported by the upstream Gemini API.
+pub async fn fetch_upstream_gemini_models(
     client: &reqwest::Client,
     config: &Config,
-) -> Result<Vec<GatewayModelEntry>, String> {
+) -> Result<Vec<GeminiModelInfo>, String> {
     let api_key = config.api_key.trim();
     let upstream_base = config.upstream.trim_end_matches('/');
     let mut all_models = Vec::new();
@@ -576,7 +695,16 @@ pub async fn fetch_gateway_models(
         }
     }
 
-    let models = filter_core_gemini_models(&all_models);
+    Ok(all_models)
+}
+
+/// Filters `all_models` using `rules` and expands them into [`GatewayModelEntry`] items, or returns
+/// an error if no matching core Gemini models remain.
+pub fn build_gateway_models(
+    all_models: &[GeminiModelInfo],
+    rules: &ModelRules,
+) -> Result<Vec<GatewayModelEntry>, String> {
+    let models = filter_core_gemini_models(all_models, rules);
     if models.is_empty() {
         let msg = "Upstream /v1beta/models returned no matching core Gemini models".to_string();
         warn!("{}", msg);
@@ -584,8 +712,20 @@ pub async fn fetch_gateway_models(
     } else {
         let ids: Vec<&str> = models.iter().map(GeminiModelInfo::id).collect();
         info!("Discovered available Gemini models: {}", ids.join(","));
-        Ok(expand_gateway_models(&models))
+        Ok(expand_gateway_models(&models, rules))
     }
+}
+
+/// Queries `GET {upstream}/v1beta/models` and returns the list of active Gemini models
+/// filtered and expanded according to `rules`, or an error if the backend request fails or yields
+/// no matching core models.
+pub async fn fetch_gateway_models(
+    client: &reqwest::Client,
+    config: &Config,
+    rules: &ModelRules,
+) -> Result<Vec<GatewayModelEntry>, String> {
+    let all_models = fetch_upstream_gemini_models(client, config).await?;
+    build_gateway_models(&all_models, rules)
 }
 
 #[cfg(test)]
@@ -640,7 +780,7 @@ mod tests {
         .into_iter()
         .map(test_model)
         .collect::<Vec<_>>();
-        let expanded = expand_gateway_models(&base_models);
+        let expanded = expand_gateway_models(&base_models, ModelRules::bundled());
         let ids: Vec<&str> = expanded.iter().map(GeminiModelInfo::id).collect();
         assert_eq!(
             ids,
@@ -728,7 +868,7 @@ mod tests {
             },
         ];
 
-        let rich_expanded = expand_gateway_models(&upstream);
+        let rich_expanded = expand_gateway_models(&upstream, ModelRules::bundled());
         assert_eq!(rich_expanded.len(), 13);
         assert_eq!(rich_expanded[0].name, "models/gemini-4-argon-medium");
         assert_eq!(
@@ -776,36 +916,40 @@ mod tests {
 
     #[test]
     fn test_expand_gateway_models_requires_planner_and_executor_for_orchestrator() {
-        let planner_only = expand_gateway_models(&[test_model("gemini-4-carbon")]);
-        assert!(planner_only.iter().all(|m| m.id() != ORCHESTRATOR_MODEL_ID));
+        let rules = ModelRules::bundled();
+        let orch_id = rules.orchestrator.model_id.as_str();
 
-        let executor_only = expand_gateway_models(&[test_model("gemini-4-hydrogen")]);
-        assert!(
-            executor_only
-                .iter()
-                .all(|m| m.id() != ORCHESTRATOR_MODEL_ID)
-        );
+        let planner_only = expand_gateway_models(&[test_model("gemini-4-carbon")], rules);
+        assert!(planner_only.iter().all(|m| m.id() != orch_id));
 
-        let passthrough_orchestrator = expand_gateway_models(&[test_model(ORCHESTRATOR_MODEL_ID)]);
+        let executor_only = expand_gateway_models(&[test_model("gemini-4-hydrogen")], rules);
+        assert!(executor_only.iter().all(|m| m.id() != orch_id));
+
+        let passthrough_orchestrator = expand_gateway_models(&[test_model(orch_id)], rules);
         assert_eq!(
             passthrough_orchestrator
                 .iter()
                 .map(GeminiModelInfo::id)
                 .collect::<Vec<_>>(),
-            vec![ORCHESTRATOR_MODEL_ID]
+            vec![orch_id]
         );
     }
 
     #[test]
     fn test_rewrite_proxy_request_path_orchestrator_fallback() {
-        let with_carbon_and_argon = expand_gateway_models(&[
-            test_model("gemini-4-argon"),
-            test_model("gemini-4-carbon"),
-            test_model("gemini-4-hydrogen"),
-        ]);
+        let rules = ModelRules::bundled();
+        let with_carbon_and_argon = expand_gateway_models(
+            &[
+                test_model("gemini-4-argon"),
+                test_model("gemini-4-carbon"),
+                test_model("gemini-4-hydrogen"),
+            ],
+            rules,
+        );
         assert_eq!(
             rewrite_proxy_request_path(
                 "/v1beta/models/gemini-pro-orchestrator:streamGenerateContent?alt=sse",
+                rules,
                 || with_carbon_and_argon.clone()
             ),
             (
@@ -814,14 +958,18 @@ mod tests {
             )
         );
 
-        let with_neon = expand_gateway_models(&[
-            test_model("gemini-4-neon"),
-            test_model("gemini-4-carbon"),
-            test_model("gemini-4-hydrogen"),
-        ]);
+        let with_neon = expand_gateway_models(
+            &[
+                test_model("gemini-4-neon"),
+                test_model("gemini-4-carbon"),
+                test_model("gemini-4-hydrogen"),
+            ],
+            rules,
+        );
         assert_eq!(
             rewrite_proxy_request_path(
                 "/v1beta/models/gemini-pro-orchestrator-low:generateContent",
+                rules,
                 || with_neon.clone()
             ),
             (
@@ -833,6 +981,7 @@ mod tests {
         assert_eq!(
             rewrite_proxy_request_path(
                 "/v1beta/models/gemini-4-argon-medium:streamGenerateContent?alt=sse",
+                rules,
                 || panic!("gateway_models should not be read for non-orchestrator paths")
             ),
             (
@@ -978,7 +1127,7 @@ mod tests {
             },
         ];
 
-        let filtered = filter_core_gemini_models(&upstream);
+        let filtered = filter_core_gemini_models(&upstream, ModelRules::bundled());
         let filtered_ids: Vec<&str> = filtered.iter().map(GeminiModelInfo::id).collect();
         assert_eq!(
             filtered_ids,
@@ -990,6 +1139,96 @@ mod tests {
                 "gemini-3.1-flash-image",
                 "gemini-3.9-flash-lite",
             ]
+        );
+    }
+
+    #[test]
+    fn test_custom_model_rules_parsing_and_discovery() {
+        let rules = ModelRules::parse(
+            r#"
+            non_core_keywords = ["-preview", "-blocked"]
+            default_efforts = ["medium", "low"]
+            future_top_level_key = true
+
+            [[effort_rules]]
+            match = ["krypton"]
+            efforts = ["high", "xhigh", "medium", "low"]
+
+            [orchestrator]
+            model_id = "gemini-pro-orchestrator"
+            display_name = "Custom Orchestrator"
+            planner_models = ["gemini-5-krypton", "gemini-4-neon"]
+            executor_models = ["gemini-5-helium"]
+            future_nested_key = "ignored"
+            "#,
+        )
+        .unwrap();
+
+        assert!(ModelRules::parse("").is_err());
+        assert!(ModelRules::parse("unrelated = 123\n").is_err());
+        assert!(
+            ModelRules::parse(
+                "default_efforts = []\n[orchestrator]\nmodel_id = \"a\"\ndisplay_name = \"b\"\n"
+            )
+            .is_err()
+        );
+        assert!(
+            ModelRules::parse(
+                "default_efforts = [\"medium\"]\n[[effort_rules]]\nmatch = [\"x\"]\nefforts = []\n[orchestrator]\nmodel_id = \"a\"\ndisplay_name = \"b\"\n"
+            )
+            .is_err()
+        );
+        assert!(
+            ModelRules::parse(
+                "default_efforts = [\"medium\"]\n[orchestrator]\nmodel_id = \"  \"\ndisplay_name = \"b\"\n"
+            )
+            .is_err()
+        );
+
+        let upstream = vec![
+            test_model("gemini-4-neon"),
+            test_model("gemini-5-blocked"),
+            test_model("gemini-5-helium"),
+            test_model("gemini-5-krypton"),
+        ];
+        let filtered = filter_core_gemini_models(&upstream, &rules);
+        let filtered_ids: Vec<&str> = filtered.iter().map(GeminiModelInfo::id).collect();
+        assert_eq!(
+            filtered_ids,
+            vec!["gemini-5-krypton", "gemini-5-helium", "gemini-4-neon"]
+        );
+
+        let expanded = expand_gateway_models(&filtered, &rules);
+        let expanded_ids: Vec<&str> = expanded.iter().map(GeminiModelInfo::id).collect();
+        assert_eq!(
+            expanded_ids,
+            vec![
+                "gemini-5-krypton-high",
+                "gemini-5-krypton-xhigh",
+                "gemini-5-krypton-medium",
+                "gemini-5-krypton-low",
+                "gemini-5-helium-medium",
+                "gemini-5-helium-low",
+                "gemini-4-neon-medium",
+                "gemini-4-neon-low",
+                "gemini-pro-orchestrator",
+            ]
+        );
+        assert_eq!(
+            expanded.last().and_then(|m| m.display_name.as_deref()),
+            Some("Custom Orchestrator")
+        );
+
+        assert_eq!(
+            rewrite_proxy_request_path(
+                "/v1beta/models/gemini-pro-orchestrator:streamGenerateContent?alt=sse",
+                &rules,
+                || expanded.clone()
+            ),
+            (
+                "/v1beta/models/gemini-5-krypton:streamGenerateContent?alt=sse".to_string(),
+                Some("high")
+            )
         );
     }
 }

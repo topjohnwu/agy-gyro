@@ -1,0 +1,44 @@
+# Model discovery mappings for agy-gyro.
+# Fetched dynamically from GitHub on startup and session refresh,
+# with the bundled copy used as a fallback if GitHub is unreachable.
+
+# Keywords identifying preview, lite, rolling-alias, or non-text/specialized Gemini
+# variants excluded when discovering core reasoning models from /v1beta/models.
+non_core_keywords = [
+    "-preview",
+    "-lite",
+    "-latest",
+    "-customtools",
+    "-image",
+    "-banana",
+    "-tts",
+    "-audio",
+    "-live",
+    "-transcribe",
+    "-omni",
+    "-robotics",
+    "-computer-use",
+    "-embedding",
+]
+
+# Default thinking effort suffixes for core Gemini models (first entry is the default).
+default_efforts = ["medium", "high", "low"]
+
+# Ordered effort override rules (first matching rule wins; matches if model ID contains
+# any substring in `match`).
+[[effort_rules]]
+match = ["hydrogen", "neon"]
+efforts = ["high", "xhigh", "medium", "low"]
+
+[[effort_rules]]
+match = ["flash"]
+efforts = ["high", "medium", "low"]
+
+# Synthetic client-side Orchestrator (Plan & Execute) synthesis and fallback routing.
+[orchestrator]
+model_id = "gemini-pro-orchestrator"
+display_name = "Orchestrator"
+# Ordered by preference: highest-priority available planner is used for token limits
+# and direct fallback routing.
+planner_models = ["gemini-4-neon", "gemini-4-carbon", "gemini-4-argon"]
+executor_models = ["gemini-4-hydrogen"]

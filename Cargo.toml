@@ -15,6 +15,7 @@ categories = [
 ]
 include = [
     "build.rs",
+    "models.toml",
     "src/**/*",
     "tests/**/*",
     "assets/*",

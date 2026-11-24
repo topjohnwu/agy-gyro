@@ -2,10 +2,14 @@
 
 use crate::config::Config;
 pub use crate::models::{
-    GatewayModelEntry, GatewayModelsResponse, GeminiModelInfo, GeminiModelsResponse,
-    MODEL_EFFORT_LEVELS, NON_CORE_KEYWORDS, expand_gateway_models, fetch_gateway_models,
+    DEFAULT_MODEL_RULES_URL, GatewayModelEntry, GatewayModelsResponse, GeminiModelInfo,
+    GeminiModelsResponse, ModelRules, expand_gateway_models, fetch_gateway_models,
     filter_core_gemini_models, inject_thinking_level_if_missing,
     rewrite_request_path_and_extract_effort,
+};
+use crate::models::{
+    build_gateway_models, fetch_upstream_gemini_models, rewrite_proxy_request_path,
+    try_fetch_model_rules,
 };
 use crate::retry::{
     calculate_backoff, is_retriable_error, is_retriable_status, parse_in_stream_error,
@@ -44,9 +48,11 @@ pub struct ProxyState {
     pub client: reqwest::Client,
     pub upstream_base: String,
     pub pricing_url: String,
+    pub model_rules_url: String,
     pub keep_alive_interval: Duration,
     pub build_id: String,
     pub usage: Arc<UsageTracker>,
+    pub model_rules: RwLock<Arc<ModelRules>>,
     pub gateway_models: RwLock<Vec<GatewayModelEntry>>,
     last_model_fetch_error: RwLock<Option<String>>,
     refresh_in_flight: Mutex<Option<tokio::sync::watch::Receiver<bool>>>,
@@ -91,9 +97,11 @@ impl ProxyState {
             client,
             upstream_base,
             pricing_url: DEFAULT_PRICING_URL.to_string(),
+            model_rules_url: DEFAULT_MODEL_RULES_URL.to_string(),
             keep_alive_interval: DEFAULT_KEEP_ALIVE_INTERVAL,
             build_id: crate::BUILD_ID.to_string(),
             usage,
+            model_rules: RwLock::new(Arc::new(ModelRules::bundled().clone())),
             gateway_models: RwLock::new(Vec::new()),
             last_model_fetch_error: RwLock::new(None),
             refresh_in_flight: Mutex::new(None),
@@ -119,6 +127,18 @@ impl ProxyState {
     pub fn with_pricing_url(mut self, pricing_url: impl Into<String>) -> Self {
         self.pricing_url = pricing_url.into();
         self
+    }
+
+    pub fn with_model_rules_url(mut self, model_rules_url: impl Into<String>) -> Self {
+        self.model_rules_url = model_rules_url.into();
+        self
+    }
+
+    pub fn model_rules(&self) -> Arc<ModelRules> {
+        self.model_rules
+            .read()
+            .map(|g| Arc::clone(&g))
+            .unwrap_or_else(|_| Arc::new(ModelRules::bundled().clone()))
     }
 
     pub fn is_buffer_enabled(&self) -> bool {
@@ -150,10 +170,19 @@ impl ProxyState {
     }
 
     async fn perform_catalog_and_pricing_refresh(&self) {
-        let (models_res, pricing_opt) = tokio::join!(
-            fetch_gateway_models(&self.client, &self.config),
+        let (upstream_res, rules_opt, pricing_opt) = tokio::join!(
+            fetch_upstream_gemini_models(&self.client, &self.config),
+            try_fetch_model_rules(&self.client, &self.model_rules_url),
             try_fetch_model_pricing(&self.client, &self.pricing_url),
         );
+        if let Some(rules) = rules_opt
+            && let Ok(mut guard) = self.model_rules.write()
+        {
+            *guard = Arc::new(rules);
+        }
+        let rules = self.model_rules();
+        let models_res =
+            upstream_res.and_then(|all_models| build_gateway_models(&all_models, &rules));
         match models_res {
             Ok(models) => {
                 self.set_gateway_models(models);
@@ -1313,8 +1342,9 @@ pub async fn proxy_handler(
     let req_span = info_span!("proxy_request", session_id = %session_id_str);
     let _enter = req_span.enter();
 
+    let rules = state.model_rules();
     let (rewritten_path_and_query, effort_from_path) =
-        crate::models::rewrite_proxy_request_path(raw_path_and_query, || state.gateway_models());
+        rewrite_proxy_request_path(raw_path_and_query, &rules, || state.gateway_models());
     let body = match effort_from_path {
         Some(effort) => inject_thinking_level_if_missing(body, effort),
         None => body,

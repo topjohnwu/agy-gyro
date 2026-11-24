@@ -70,11 +70,13 @@ async fn spawn_test_proxy_with_keep_alive(
     .unwrap();
 
     let pricing_url = format!("{}/pricing.json", config.upstream.trim_end_matches('/'));
+    let model_rules_url = format!("{}/models.toml", config.upstream.trim_end_matches('/'));
     let state = Arc::new(
         ProxyState::new(config, client)
             .with_keep_alive_interval(keep_alive_interval)
             .with_pricing(pricing)
-            .with_pricing_url(pricing_url),
+            .with_pricing_url(pricing_url)
+            .with_model_rules_url(model_rules_url),
     );
 
     let app = create_router(state);
@@ -604,7 +606,9 @@ async fn test_run_wrapper_executes_child_and_propagates_exit_code() {
 
 #[tokio::test]
 async fn test_fetch_gateway_models_fetches_and_expands_models() {
-    use agy_gyro::proxy::{GatewayModelsResponse, ProxyState, create_router, fetch_gateway_models};
+    use agy_gyro::proxy::{
+        GatewayModelsResponse, ModelRules, ProxyState, create_router, fetch_gateway_models,
+    };
 
     let mock_server = MockServer::start().await;
     Mock::given(method("GET"))
@@ -695,7 +699,9 @@ async fn test_fetch_gateway_models_fetches_and_expands_models() {
     };
 
     let client = Client::new();
-    let models = fetch_gateway_models(&client, &config).await.unwrap();
+    let models = fetch_gateway_models(&client, &config, ModelRules::bundled())
+        .await
+        .unwrap();
     let model_ids: Vec<&str> = models.iter().map(|m| m.id()).collect();
     assert_eq!(
         model_ids,
@@ -817,7 +823,9 @@ async fn test_fetch_gateway_models_fetches_and_expands_models() {
 
 #[tokio::test]
 async fn test_models_endpoint_requires_backend_and_recovers_after_failure() {
-    use agy_gyro::proxy::{GatewayModelsResponse, ProxyState, create_router, fetch_gateway_models};
+    use agy_gyro::proxy::{
+        GatewayModelsResponse, ModelRules, ProxyState, create_router, fetch_gateway_models,
+    };
 
     let mock_server = MockServer::start().await;
 
@@ -884,7 +892,7 @@ async fn test_models_endpoint_requires_backend_and_recovers_after_failure() {
     let client = Client::new();
 
     // Direct fetch_gateway_models returns Err on 503
-    let err_503 = fetch_gateway_models(&client, &config)
+    let err_503 = fetch_gateway_models(&client, &config, ModelRules::bundled())
         .await
         .expect_err("503 from backend must fail model discovery");
     assert!(err_503.contains("503"), "unexpected error: {}", err_503);
@@ -892,7 +900,8 @@ async fn test_models_endpoint_requires_backend_and_recovers_after_failure() {
     // Fresh ProxyState starts empty (no hardcoded offline fallback catalog)
     let state = Arc::new(
         ProxyState::new(config.clone(), client.clone())
-            .with_pricing_url(format!("{}/pricing.json", mock_server.uri())),
+            .with_pricing_url(format!("{}/pricing.json", mock_server.uri()))
+            .with_model_rules_url(format!("{}/models.toml", mock_server.uri())),
     );
     assert!(state.gateway_models().is_empty());
 
@@ -920,7 +929,7 @@ async fn test_models_endpoint_requires_backend_and_recovers_after_failure() {
     );
 
     // Direct fetch_gateway_models returns Err when upstream returns empty models list
-    let err_empty = fetch_gateway_models(&client, &config)
+    let err_empty = fetch_gateway_models(&client, &config, ModelRules::bundled())
         .await
         .expect_err("empty backend model list must fail model discovery");
     assert!(
@@ -2276,7 +2285,8 @@ async fn test_new_session_refetches_model_catalog_and_pricing() {
     let client = build_http_client(&config).unwrap();
     let state = Arc::new(
         ProxyState::new(config, client.clone())
-            .with_pricing_url(format!("{}/pricing.json", mock_server.uri())),
+            .with_pricing_url(format!("{}/pricing.json", mock_server.uri()))
+            .with_model_rules_url(format!("{}/models.toml", mock_server.uri())),
     );
     state.refresh_catalog_and_pricing().await;
 
@@ -3106,4 +3116,183 @@ async fn test_run_app_launches_detached_and_tracks_lazy_desktop_session() {
     assert!(snap_after.sessions[0].active);
     assert_eq!(snap_after.sessions[0].totals.input_tokens, 12_000);
     assert_eq!(snap_after.sessions[0].totals.output_tokens, 500);
+}
+
+#[tokio::test]
+async fn test_dynamic_model_rules_fetch_refresh_and_fallback() {
+    use agy_gyro::proxy::{DaemonStatusResponse, ProxyState, create_router};
+
+    let mock_server = MockServer::start().await;
+    let model = |id: &str| {
+        serde_json::json!({
+            "name": format!("models/{}", id),
+            "supportedGenerationMethods": ["generateContent"],
+            "thinking": true
+        })
+    };
+
+    Mock::given(method("GET"))
+        .and(path("/v1beta/models"))
+        .and(header("x-goog-api-key", "test-key-123"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "application/json")
+                .set_body_json(serde_json::json!({
+                    "models": [
+                        model("gemini-4-argon"),
+                        model("gemini-5-helium"),
+                        model("gemini-5-krypton"),
+                        model("gemini-5-blocked"),
+                    ]
+                })),
+        )
+        .expect(3)
+        .mount(&mock_server)
+        .await;
+
+    for toml_body in [
+        r#"
+non_core_keywords = ["-preview", "-blocked"]
+default_efforts = ["medium", "high", "low"]
+[[effort_rules]]
+match = ["krypton"]
+efforts = ["high", "xhigh", "medium", "low"]
+[orchestrator]
+model_id = "gemini-pro-orchestrator"
+display_name = "Orchestrator"
+planner_models = ["gemini-5-krypton", "gemini-4-argon"]
+executor_models = ["gemini-5-helium"]
+"#,
+        r#"
+non_core_keywords = ["-preview", "-blocked"]
+default_efforts = ["medium", "high", "low"]
+[[effort_rules]]
+match = ["argon"]
+efforts = ["high", "xhigh", "medium", "low"]
+[orchestrator]
+model_id = "gemini-pro-orchestrator"
+display_name = "Orchestrator"
+planner_models = ["gemini-4-argon", "gemini-5-krypton"]
+executor_models = ["gemini-5-helium"]
+"#,
+    ] {
+        Mock::given(method("GET"))
+            .and(path("/models.toml"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(toml_body))
+            .up_to_n_times(1)
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+    }
+
+    Mock::given(method("GET"))
+        .and(path("/models.toml"))
+        .respond_with(ResponseTemplate::new(503))
+        .expect(1)
+        .mount(&mock_server)
+        .await;
+
+    Mock::given(method("POST"))
+        .and(path("/v1beta/models/gemini-4-argon:generateContent"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "candidates": [{ "content": { "parts": [{ "text": "Routed to Argon" }] } }]
+        })))
+        .expect(1)
+        .mount(&mock_server)
+        .await;
+
+    let config = Config {
+        host: "127.0.0.1".to_string(),
+        port: 0,
+        upstream: mock_server.uri(),
+        max_retries: 0,
+        api_key: "test-key-123".to_string(),
+        ..Config::default()
+    };
+    let client = build_http_client(&config).unwrap();
+    let state = Arc::new(
+        ProxyState::new(config, client.clone())
+            .with_pricing_url(format!("{}/pricing.json", mock_server.uri()))
+            .with_model_rules_url(format!("{}/models.toml", mock_server.uri())),
+    );
+    state.refresh_catalog_and_pricing().await;
+
+    let app = create_router(state);
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let proxy_url = format!("http://{}", listener.local_addr().unwrap());
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+
+    let status1: DaemonStatusResponse = client
+        .get(format!("{}/sessions", proxy_url))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(
+        status1.gateway_models,
+        vec![
+            "gemini-5-krypton-high",
+            "gemini-5-krypton-xhigh",
+            "gemini-5-krypton-medium",
+            "gemini-5-krypton-low",
+            "gemini-5-helium-medium",
+            "gemini-5-helium-high",
+            "gemini-5-helium-low",
+            "gemini-4-argon-medium",
+            "gemini-4-argon-high",
+            "gemini-4-argon-low",
+            "gemini-pro-orchestrator",
+        ]
+    );
+
+    let status2: DaemonStatusResponse = client
+        .get(format!("{}/sessions?refresh=1", proxy_url))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(
+        status2.gateway_models,
+        vec![
+            "gemini-5-krypton-medium",
+            "gemini-5-krypton-high",
+            "gemini-5-krypton-low",
+            "gemini-5-helium-medium",
+            "gemini-5-helium-high",
+            "gemini-5-helium-low",
+            "gemini-4-argon-high",
+            "gemini-4-argon-xhigh",
+            "gemini-4-argon-medium",
+            "gemini-4-argon-low",
+            "gemini-pro-orchestrator",
+        ]
+    );
+
+    let orch_res = client
+        .post(format!(
+            "{}/v1beta/models/gemini-pro-orchestrator:generateContent",
+            proxy_url
+        ))
+        .body(r#"{"contents":[{"role":"user","parts":[{"text":"hi"}]}]}"#)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(orch_res.status(), 200);
+    assert!(orch_res.text().await.unwrap().contains("Routed to Argon"));
+
+    let status3: DaemonStatusResponse = client
+        .get(format!("{}/sessions?refresh=1", proxy_url))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(status3.gateway_models, status2.gateway_models);
 }

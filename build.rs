@@ -20,7 +20,7 @@ fn collect_files(path: &Path, out: &mut Vec<PathBuf>) {
 
 fn main() {
     let mut files = Vec::new();
-    for path in ["Cargo.toml", "Cargo.lock", "build.rs", "src"] {
+    for path in ["Cargo.toml", "Cargo.lock", "build.rs", "models.toml", "src"] {
         collect_files(Path::new(path), &mut files);
     }
 
