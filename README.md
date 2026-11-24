@@ -72,7 +72,7 @@ When launching any Antigravity client (`agy-gyro` or `agy-gyro app`), `agy-gyro`
 
 ### Launching Antigravity CLI (`agy`)
 
-Running `agy-gyro` (when the first argument is not `app`, `server`, `stop`, or `monitor`) launches `agy` in-place (also setting `AGY_ENABLE_HUB=1`):
+Running `agy-gyro` (when the first argument is not `app`, `server`, `stop`, or `monitor`) launches `agy` in-place. It also automatically sets `AGY_ENABLE_HUB=1`, unlocking Antigravity's local Hub web interface (`--hub`, which requires Enterprise Gateway mode):
 
 ```bash
 # Launch agy connected to the agy-gyro gateway:
@@ -80,6 +80,9 @@ agy-gyro
 
 # Pass arguments through to agy:
 agy-gyro --dangerously-skip-permissions
+
+# Launch Antigravity's local Hub web UI:
+agy-gyro --hub [--hub-port 4400]
 ```
 
 ### Launching Antigravity Desktop App (`agy-gyro app`)
@@ -121,22 +124,6 @@ agy-gyro server
 # Stop the background daemon at any time:
 agy-gyro stop
 ```
-
-### Antigravity Hub Web UI (`--hub`)
-
-`agy-gyro` automatically sets `AGY_ENABLE_HUB=1` when launching `agy`, unlocking Antigravity's local Hub web interface (which requires Enterprise Gateway mode):
-
-```bash
-agy-gyro --hub [--hub-port 4400]
-```
-
-Once the server is running, open the Hub UI in your browser with `?useWebSocket=true`:
-
-```text
-http://localhost:4400/?useWebSocket=true
-```
-
-> **Important**: Always include `?useWebSocket=true` when accessing the Hub UI over `http://localhost:4400`. Without it, the web UI opens multiple long-lived HTTP/1.1 streaming RPCs that exhaust the browser's 6-connection-per-origin limit and cause the UI to stall when switching or starting conversations. With `?useWebSocket=true`, all RPC streams are multiplexed over a single WebSocket connection.
 
 ## Configuration
 
