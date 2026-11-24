@@ -5,6 +5,17 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.4] - 2026-11-23
+
+### Added
+- **Synthetic `gemini-pro-orchestrator` Model & Planner Fallback Routing**: Synthesizes `gemini-pro-orchestrator` in `GET /v1beta/models` whenever both an eligible planner (`gemini-4-neon`, `gemini-4-carbon`, or `gemini-4-argon`) and executor (`gemini-4-hydrogen`) are available (inheriting the preferred planner's token limits and passing through any upstream orchestrator entry unsuffixed). Incoming proxy requests targeting `gemini-pro-orchestrator` are automatically rewritten to the highest-priority available planner model with `HIGH` (or suffix-derived) thinking level.
+
+### Changed
+- **Keep-Alive Heartbeats Scoped to Buffered Mode**: Bypassed the keep-alive timeout and early `200 OK` heartbeat stream when full SSE buffering is disabled (`buffer = false`), preserving exact upstream status codes, response headers, and unpadded payloads in passthrough mode while keeping keep-alive protection active when full buffering is enabled (including when toggled at runtime via `POST /buffer`).
+
+### Removed
+- **Offline Fallback Model Catalog**: Removed the hardcoded offline fallback model catalog (`DEFAULT_GATEWAY_MODELS`, `default_gateway_models`, and `resolve_gateway_models`). `ProxyState` now starts with an empty catalog and `GET /v1beta/models` dynamically fetches from upstream when empty, returning `502 Bad Gateway` with a Gemini JSON error if upstream discovery fails or returns no matching core models.
+
 ## [0.2.3] - 2026-11-21
 
 ### Added
