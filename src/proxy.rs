@@ -1,15 +1,14 @@
 // SPDX-License-Identifier: MIT
 
 use crate::config::Config;
-pub use crate::models::{
-    DEFAULT_MODEL_RULES_URL, GatewayModelEntry, GatewayModelsResponse, GeminiModelInfo,
-    GeminiModelsResponse, ModelRules, expand_gateway_models, fetch_gateway_models,
-    filter_core_gemini_models, inject_thinking_level_if_missing,
-    rewrite_request_path_and_extract_effort,
-};
 use crate::models::{
-    build_gateway_models, fetch_upstream_gemini_models, rewrite_proxy_request_path,
-    try_fetch_model_rules,
+    DEFAULT_MODEL_RULES_URL, build_gateway_models, fetch_upstream_gemini_models,
+    rewrite_proxy_request_path, try_fetch_model_rules,
+};
+pub use crate::models::{
+    GatewayModelEntry, GatewayModelsResponse, GeminiModelInfo, GeminiModelsResponse, ModelRules,
+    expand_gateway_models, fetch_gateway_models, filter_core_gemini_models,
+    inject_thinking_level_if_missing, rewrite_request_path_and_extract_effort,
 };
 use crate::retry::{
     calculate_backoff, is_retriable_error, is_retriable_status, parse_in_stream_error,
@@ -175,12 +174,25 @@ impl ProxyState {
             try_fetch_model_rules(&self.client, &self.model_rules_url),
             try_fetch_model_pricing(&self.client, &self.pricing_url),
         );
-        if let Some(rules) = rules_opt
+        let rules = if let Some(fetched) = rules_opt
             && let Ok(mut guard) = self.model_rules.write()
         {
-            *guard = Arc::new(rules);
-        }
-        let rules = self.model_rules();
+            if fetched.version > guard.version {
+                info!(
+                    "Updated model discovery rules to v{} from {} (previous v{})",
+                    fetched.version, self.model_rules_url, guard.version
+                );
+                *guard = Arc::new(fetched);
+            } else {
+                debug!(
+                    "Keeping model discovery rules v{} (fetched v{} from {})",
+                    guard.version, fetched.version, self.model_rules_url
+                );
+            }
+            Arc::clone(&guard)
+        } else {
+            self.model_rules()
+        };
         let models_res =
             upstream_res.and_then(|all_models| build_gateway_models(&all_models, &rules));
         match models_res {

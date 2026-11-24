@@ -1,6 +1,8 @@
 # Model discovery mappings for agy-gyro.
 # Fetched dynamically from GitHub on startup and session refresh,
 # with the bundled copy used as a fallback if GitHub is unreachable.
+# Only fetched rules with a strictly higher `version` than the active copy are applied.
+version = 1
 
 # Keywords identifying preview, lite, rolling-alias, or non-text/specialized Gemini
 # variants excluded when discovering core reasoning models from /v1beta/models.

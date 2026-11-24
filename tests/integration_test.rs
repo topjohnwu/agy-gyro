@@ -3146,12 +3146,13 @@ async fn test_dynamic_model_rules_fetch_refresh_and_fallback() {
                     ]
                 })),
         )
-        .expect(3)
+        .expect(4)
         .mount(&mock_server)
         .await;
 
     for toml_body in [
         r#"
+version = 2
 non_core_keywords = ["-preview", "-blocked"]
 default_efforts = ["medium", "high", "low"]
 [[effort_rules]]
@@ -3164,6 +3165,7 @@ planner_models = ["gemini-5-krypton", "gemini-4-argon"]
 executor_models = ["gemini-5-helium"]
 "#,
         r#"
+version = 3
 non_core_keywords = ["-preview", "-blocked"]
 default_efforts = ["medium", "high", "low"]
 [[effort_rules]]
@@ -3173,6 +3175,17 @@ efforts = ["high", "xhigh", "medium", "low"]
 model_id = "gemini-pro-orchestrator"
 display_name = "Orchestrator"
 planner_models = ["gemini-4-argon", "gemini-5-krypton"]
+executor_models = ["gemini-5-helium"]
+"#,
+        // Older version (v2 < active v3) must be ignored in favor of newer active rules.
+        r#"
+version = 2
+non_core_keywords = ["-preview"]
+default_efforts = ["low"]
+[orchestrator]
+model_id = "gemini-pro-orchestrator"
+display_name = "Orchestrator"
+planner_models = ["gemini-5-krypton"]
 executor_models = ["gemini-5-helium"]
 "#,
     ] {
@@ -3286,6 +3299,7 @@ executor_models = ["gemini-5-helium"]
     assert_eq!(orch_res.status(), 200);
     assert!(orch_res.text().await.unwrap().contains("Routed to Argon"));
 
+    // Older fetched rules (v2 < v3) are ignored; v3 remains active.
     let status3: DaemonStatusResponse = client
         .get(format!("{}/sessions?refresh=1", proxy_url))
         .send()
@@ -3295,4 +3309,15 @@ executor_models = ["gemini-5-helium"]
         .await
         .unwrap();
     assert_eq!(status3.gateway_models, status2.gateway_models);
+
+    // Fetch failure (503) also preserves active v3 rules.
+    let status4: DaemonStatusResponse = client
+        .get(format!("{}/sessions?refresh=1", proxy_url))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(status4.gateway_models, status2.gateway_models);
 }

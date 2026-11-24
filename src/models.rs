@@ -40,6 +40,8 @@ pub struct OrchestratorRules {
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 pub struct ModelRules {
     #[serde(default)]
+    pub version: u64,
+    #[serde(default)]
     pub non_core_keywords: Vec<String>,
     pub default_efforts: Vec<String>,
     #[serde(default)]
@@ -87,12 +89,6 @@ impl ModelRules {
     }
 }
 
-impl Default for ModelRules {
-    fn default() -> Self {
-        Self::bundled().clone()
-    }
-}
-
 /// Fetches live model discovery rules (`models.toml`) from `rules_url` (usually GitHub),
 /// returning `None` on network, HTTP, or TOML parse/validation error.
 pub async fn try_fetch_model_rules(
@@ -135,10 +131,7 @@ pub async fn try_fetch_model_rules(
     };
 
     match ModelRules::parse(&text) {
-        Ok(rules) => {
-            info!("Loaded model discovery rules from {}", rules_url);
-            Some(rules)
-        }
+        Ok(rules) => Some(rules),
         Err(err) => {
             warn!(
                 "Failed to parse model discovery rules from {}: {}; keeping current rules",
@@ -1144,8 +1137,11 @@ mod tests {
 
     #[test]
     fn test_custom_model_rules_parsing_and_discovery() {
+        assert!(ModelRules::bundled().version >= 1);
+
         let rules = ModelRules::parse(
             r#"
+            version = 2
             non_core_keywords = ["-preview", "-blocked"]
             default_efforts = ["medium", "low"]
             future_top_level_key = true
@@ -1163,6 +1159,7 @@ mod tests {
             "#,
         )
         .unwrap();
+        assert_eq!(rules.version, 2);
 
         assert!(ModelRules::parse("").is_err());
         assert!(ModelRules::parse("unrelated = 123\n").is_err());
